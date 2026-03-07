@@ -73,15 +73,14 @@ async def lifespan(app):
 
 app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
 
-# Global exception handler — always return JSON, never bare 500 HTML
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    import traceback
-    print(f"Unhandled error on {request.url}: {exc}\n{traceback.format_exc()}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": f"Server error: {str(exc)[:200]}"}
-    )
+# CORS must be added BEFORE any exception handlers or routers
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Mount outreach router
 try:
@@ -91,13 +90,6 @@ try:
 except Exception as e:
     print(f"Outreach router failed to load: {e}")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
