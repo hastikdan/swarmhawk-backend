@@ -57,7 +57,27 @@ def get_db() -> Client:
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="SwarmHawk API", version="2.0.0")
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app):
+    # Start daily outreach scan scheduler on startup
+    try:
+        from outreach import start_scheduler
+        _scheduler = start_scheduler()
+    except Exception as e:
+        print(f"Scheduler init failed: {e}")
+    yield
+
+app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
+
+# Mount outreach router
+try:
+    from outreach import router as outreach_router
+    app.include_router(outreach_router)
+    print("Outreach router mounted at /outreach")
+except Exception as e:
+    print(f"Outreach router failed to load: {e}")
 
 app.add_middleware(
     CORSMiddleware,
