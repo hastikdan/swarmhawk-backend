@@ -57,3 +57,11 @@ create index if not exists idx_domains_user     on domains(user_id);
 create index if not exists idx_scans_domain     on scans(domain_id);
 create index if not exists idx_purchases_domain on purchases(domain_id);
 create index if not exists idx_sessions_token   on sessions(token);
+
+-- Disable RLS so the anon/service key can read/write all rows.
+-- The backend handles its own auth via session tokens.
+alter table users     disable row level security;
+alter table sessions  disable row level security;
+alter table domains   disable row level security;
+alter table scans     disable row level security;
+alter table purchases disable row level security;
