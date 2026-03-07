@@ -44,6 +44,9 @@ STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stri
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "396286675021-tqhadhbp3jqc1jrqo5krk3j5njdss0cg.apps.googleusercontent.com")
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
+RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
+SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-scanner")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -197,6 +200,50 @@ def require_admin(authorization: str) -> str:
         raise HTTPException(status_code=403, detail="Admin access required")
     return user["sub"]
 
+# ── Email confirmation helper ─────────────────────────────────────────────────
+
+def send_confirmation_email(to_email: str, name: str, token: str):
+    """Send signup confirmation email via Resend."""
+    if not RESEND_API_KEY:
+        print(f"[auth] RESEND_API_KEY not set — skipping confirmation email to {to_email}")
+        return
+    confirm_url = f"{SITE_URL}?confirm={token}"
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
+      <div style="margin-bottom:28px">
+        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+      </div>
+      <h2 style="color:#fff;margin-bottom:8px">Confirm your email</h2>
+      <p style="color:#888;line-height:1.6;margin-bottom:24px">
+        Hi {name}, welcome to SwarmHawk. Click below to confirm your email address and activate your account.
+      </p>
+      <a href="{confirm_url}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 28px;border-radius:5px;text-decoration:none">
+        CONFIRM EMAIL →
+      </a>
+      <p style="color:#555;font-size:12px;margin-top:28px;line-height:1.5">
+        This link expires in 24 hours. If you didn't create an account, ignore this email.<br>
+        SwarmHawk · CEE Cybersecurity Intelligence
+      </p>
+    </div>
+    """
+    try:
+        import httpx as _httpx
+        _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    f"SwarmHawk <{FROM_EMAIL}>",
+                "to":      [to_email],
+                "subject": "Confirm your SwarmHawk account",
+                "html":    html,
+            },
+            timeout=10,
+        )
+        print(f"[auth] Confirmation email sent to {to_email}")
+    except Exception as e:
+        print(f"[auth] Failed to send confirmation email: {e}")
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -283,13 +330,13 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
 
     db = get_db()
 
-    try:
-        # Check email not already registered
-        existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
-        if existing.data:
-            raise HTTPException(409, "Email already registered — please sign in")
+    # Check email not already registered
+    existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
+    if existing.data:
+        raise HTTPException(409, "Email already registered — please sign in")
 
-        # Create user
+    # Create user
+    try:
         result = db.table("users").insert({
             "google_id":     f"email:{body.email.lower()}",
             "email":         body.email.lower(),
@@ -299,13 +346,11 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
             "created_at":    datetime.now(timezone.utc).isoformat(),
             "last_login":    datetime.now(timezone.utc).isoformat(),
         }).execute()
-    except HTTPException:
-        raise
     except Exception as e:
         err = str(e)
         if "password_hash" in err or "auth_type" in err or "column" in err.lower():
             raise HTTPException(500,
-                "Database schema needs migration. Run in Supabase SQL Editor: "
+                "Database schema missing columns. Run in Supabase SQL Editor: "
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text; "
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_type text DEFAULT 'google';"
             )
@@ -313,6 +358,19 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
 
     user = result.data[0]
     session_token = make_session(user["id"])
+
+    # Generate verification token and send confirmation email
+    verification_token = secrets.token_urlsafe(32)
+    try:
+        db.table("users").update({
+            "verification_token": verification_token,
+            "email_verified":     False,
+        }).eq("id", user["id"]).execute()
+    except Exception:
+        pass  # columns may not exist yet — email still works, just unverified
+    background_tasks.add_task(
+        send_confirmation_email, body.email.lower(), body.username.strip(), verification_token
+    )
 
     # Add first domain if provided
     first_domain = None
@@ -345,11 +403,7 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
 async def login_email(body: LoginRequest):
     """Sign in with email + password."""
     db = get_db()
-    try:
-        result = db.table("users").select("*").eq("email", body.email.lower()).execute()
-    except Exception as e:
-        raise HTTPException(500, f"Database error: {str(e)[:200]}")
-
+    result = db.table("users").select("*").eq("email", body.email.lower()).execute()
     if not result.data:
         raise HTTPException(401, "No account found with that email")
 
@@ -358,12 +412,9 @@ async def login_email(body: LoginRequest):
         raise HTTPException(401, "Incorrect password")
 
     # Update last login
-    try:
-        db.table("users").update({
-            "last_login": datetime.now(timezone.utc).isoformat()
-        }).eq("id", user["id"]).execute()
-    except Exception:
-        pass  # non-critical
+    db.table("users").update({
+        "last_login": datetime.now(timezone.utc).isoformat()
+    }).eq("id", user["id"]).execute()
 
     session_token = make_session(user["id"])
     return {
@@ -379,6 +430,25 @@ async def login_email(body: LoginRequest):
 
 
 # ── Admin endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/auth/verify-email")
+def verify_email(token: str):
+    """Confirm email address from link in confirmation email."""
+    if not token:
+        raise HTTPException(400, "Missing token")
+    db = get_db()
+    result = db.table("users")        .select("id,email,name")        .eq("verification_token", token)        .execute()
+    if not result.data:
+        raise HTTPException(400, "Invalid or expired confirmation link")
+    user = result.data[0]
+    db.table("users").update({
+        "email_verified":     True,
+        "verification_token": None,
+    }).eq("id", user["id"]).execute()
+    # Redirect to site with success flag
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"{SITE_URL}?verified=1", status_code=302)
+
 
 @app.get("/admin/users")
 def admin_users(
@@ -762,9 +832,10 @@ async def stripe_webhook(request: Request):
 def run_scan_background(domain_id: str, domain: str):
     """Run scanner in background and save results to DB."""
     if not SCANNER_AVAILABLE:
-        print(f"[scan] Skipped for {domain}: cee_scanner not available")
+        print(f"Scan skipped for {domain}: cee_scanner not installed on this server")
         return
-    print(f"[scan] Starting scan for {domain} (id={domain_id})")
+    if not SCANNER_AVAILABLE:
+        raise HTTPException(503, "Scanner not available on this server — deploy cee_scanner/ into backend repo root")
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
@@ -778,25 +849,10 @@ def run_scan_background(domain_id: str, domain: str):
             "checks":     result["checks"],
             "scanned_at": result["scanned_at"],
         }).execute()
-        print(f"[scan] Done for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
+        print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
     except Exception as e:
         import traceback
-        print(f"[scan] FAILED for {domain}: {e}\n{traceback.format_exc()}")
-        # Save error scan so domain doesn't stay stuck at 'pending'
-        try:
-            db = get_db()
-            db.table("scans").insert({
-                "domain_id":  domain_id,
-                "risk_score": -1,
-                "critical":   0,
-                "warnings":   0,
-                "checks":     [{"check": "error", "status": "error",
-                                "title": "Scan failed", "detail": str(e)[:200],
-                                "score_impact": 0}],
-                "scanned_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
-        except Exception:
-            pass
+        print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
 
 
 # ── Passive prospect scan ─────────────────────────────────────────────────────
@@ -998,7 +1054,7 @@ async def public_scan(body: PublicScanRequest):
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "email_security"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "open_ports"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 
