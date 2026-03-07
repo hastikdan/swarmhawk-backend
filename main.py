@@ -580,3 +580,65 @@ async def passive_scan(domain: str, authorization: str = Header(None)):
         "max_cvss":  max_cvss,
         "priority":  priority,
     }
+
+
+# ── Intel endpoint ────────────────────────────────────────────────────────────
+
+class IntelRequest(BaseModel):
+    domains: str = ""
+    date: str = ""
+    prompt: str = ""
+    max_tokens: int = 1000
+
+@app.post("/intel")
+async def intel(body: IntelRequest, authorization: str = Header(None)):
+    """Generate AI threat briefing using server-side ANTHROPIC_API_KEY."""
+    get_user_from_header(authorization)
+
+    AKEY = os.getenv("ANTHROPIC_API_KEY", "")
+    if not AKEY:
+        raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
+
+    # Use custom prompt (outreach) or build briefing prompt (intelligence tab)
+    if body.prompt:
+        user_msg = body.prompt
+        system   = "You are a professional cybersecurity copywriter. Be concise and direct."
+        max_tok  = min(body.max_tokens, 600)
+    else:
+        user_msg = (
+            f"Date: {body.date}. Monitored domains: {body.domains}.\n"
+            "Generate a cybersecurity threat intelligence briefing as JSON:\n"
+            '{"headline":"one sentence","briefing":"3 paragraphs","categories":['
+            '{"title":"Active Threats","body":"2 sentences"},'
+            '{"title":"CEE Regional","body":"2 sentences"},'
+            '{"title":"Vulnerabilities","body":"2 sentences"},'
+            '{"title":"Phishing","body":"2 sentences"},'
+            '{"title":"Compliance","body":"2 sentences"},'
+            '{"title":"Recommendations","body":"3 action items"}]}'
+        )
+        system  = "You are a cybersecurity analyst. Output valid JSON only, no markdown, no backticks."
+        max_tok = 1000
+
+    import httpx
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": AKEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": max_tok,
+                "system": system,
+                "messages": [{"role": "user", "content": user_msg}],
+            },
+        )
+
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Anthropic API error: {r.text[:200]}")
+
+    data = r.json()
+    text = data["content"][0]["text"] if data.get("content") else ""
+    return {"text": text, "briefing": text}
