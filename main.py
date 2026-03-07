@@ -733,8 +733,6 @@ async def stripe_webhook(request: Request):
 
 def run_scan_background(domain_id: str, domain: str):
     """Run scanner in background and save results to DB."""
-    import sys
-    sys.path.insert(0, os.path.dirname(__file__))
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
@@ -942,8 +940,6 @@ async def public_scan(body: PublicScanRequest):
     if not _re.match(r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$', domain):
         raise HTTPException(400, "Invalid domain")
 
-    import sys, os as _os
-    sys.path.insert(0, _os.path.dirname(__file__))
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
