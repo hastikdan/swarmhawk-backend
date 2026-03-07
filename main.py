@@ -21,6 +21,7 @@ import os
 import json
 import hmac
 import hashlib
+import secrets
 import httpx
 import stripe
 from datetime import datetime, timezone
@@ -42,6 +43,7 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
 STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stripe dashboard
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "396286675021-tqhadhbp3jqc1jrqo5krk3j5njdss0cg.apps.googleusercontent.com")
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
+ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "")      # your email — grants super-admin access
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -96,6 +98,16 @@ class AddDomainRequest(BaseModel):
     domain: str
     country: str
 
+class RegisterRequest(BaseModel):
+    username: str
+    email: str
+    password: str
+    domain: str = ""        # optional first domain at signup
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 class CheckoutRequest(BaseModel):
     domain_id: str
     domain: str
@@ -138,6 +150,38 @@ def get_user_from_header(authorization: str) -> dict:
         raise HTTPException(status_code=401, detail="Invalid or expired session token")
     user_id = result.data[0]["user_id"]
     return {"sub": user_id}
+
+
+def hash_password(password: str) -> str:
+    """SHA-256 + salt. Good enough for MVP; swap for bcrypt in production."""
+    salt = hashlib.sha256(os.getenv("SECRET_SALT", "swarmhawk-salt").encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+
+
+def make_session(user_id: str) -> str:
+    token = hashlib.sha256(f"{user_id}:{secrets.token_hex(16)}".encode()).hexdigest()
+    db = get_db()
+    db.table("sessions").insert({
+        "user_id":    user_id,
+        "token":      token,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+    return token
+
+
+def is_admin(user_id: str) -> bool:
+    if not ADMIN_EMAIL:
+        return False
+    db = get_db()
+    r = db.table("users").select("email").eq("id", user_id).execute()
+    return bool(r.data and r.data[0]["email"] == ADMIN_EMAIL)
+
+
+def require_admin(authorization: str) -> str:
+    user = get_user_from_header(authorization)
+    if not is_admin(user["sub"]):
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user["sub"]
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -206,6 +250,251 @@ async def auth_google(body: GoogleAuthRequest):
             "avatar": avatar,
         },
         "session_token": session_token,
+    }
+
+
+# ── Email / password auth ─────────────────────────────────────────────────────
+
+@app.post("/auth/register")
+async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
+    """Create account with username + email + password."""
+    import re as _re
+    if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', body.email):
+        raise HTTPException(400, "Invalid email address")
+    if len(body.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    if not body.username.strip():
+        raise HTTPException(400, "Username required")
+
+    db = get_db()
+
+    # Check email not already registered
+    existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
+    if existing.data:
+        raise HTTPException(409, "Email already registered — please sign in")
+
+    # Create user
+    result = db.table("users").insert({
+        "google_id":  f"email:{body.email.lower()}",   # fake google_id for email users
+        "email":      body.email.lower(),
+        "name":       body.username.strip(),
+        "password_hash": hash_password(body.password),
+        "auth_type":  "email",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "last_login": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    user = result.data[0]
+    session_token = make_session(user["id"])
+
+    # Add first domain if provided
+    first_domain = None
+    if body.domain:
+        domain = body.domain.lower().strip().replace("https://", "").replace("http://", "").split("/")[0]
+        if _re.match(r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$', domain):
+            dom_result = db.table("domains").insert({
+                "user_id":    user["id"],
+                "domain":     domain,
+                "country":    "EU",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            first_domain = dom_result.data[0]
+            background_tasks.add_task(run_scan_background, first_domain["id"], domain)
+
+    return {
+        "user": {
+            "id":       user["id"],
+            "email":    body.email.lower(),
+            "name":     body.username.strip(),
+            "avatar":   "",
+            "is_admin": is_admin(user["id"]),
+        },
+        "session_token": session_token,
+        "first_domain":  first_domain,
+    }
+
+
+@app.post("/auth/login")
+async def login_email(body: LoginRequest):
+    """Sign in with email + password."""
+    db = get_db()
+    result = db.table("users").select("*").eq("email", body.email.lower()).execute()
+    if not result.data:
+        raise HTTPException(401, "No account found with that email")
+
+    user = result.data[0]
+    if user.get("password_hash") != hash_password(body.password):
+        raise HTTPException(401, "Incorrect password")
+
+    # Update last login
+    db.table("users").update({
+        "last_login": datetime.now(timezone.utc).isoformat()
+    }).eq("id", user["id"]).execute()
+
+    session_token = make_session(user["id"])
+    return {
+        "user": {
+            "id":       user["id"],
+            "email":    user["email"],
+            "name":     user["name"] or user["email"],
+            "avatar":   user.get("avatar", ""),
+            "is_admin": is_admin(user["id"]),
+        },
+        "session_token": session_token,
+    }
+
+
+# ── Admin endpoints ───────────────────────────────────────────────────────────
+
+@app.get("/admin/users")
+def admin_users(
+    page: int = 1,
+    per_page: int = 50,
+    authorization: str = Header(None),
+):
+    """Full user list with domain counts and last login. Admin only."""
+    require_admin(authorization)
+    db = get_db()
+
+    offset = (page - 1) * per_page
+    users = db.table("users").select("*").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
+    total = db.table("users").select("id", count="exact").execute()
+
+    rows = []
+    for u in (users.data or []):
+        doms = db.table("domains").select("id", count="exact").eq("user_id", u["id"]).execute()
+        paid = db.table("purchases").select("id", count="exact").eq("user_id", u["id"]).execute()
+        rows.append({
+            "id":           u["id"],
+            "email":        u["email"],
+            "name":         u.get("name", ""),
+            "auth_type":    u.get("auth_type", "google"),
+            "domain_count": doms.count or 0,
+            "paid_domains": paid.count or 0,
+            "created_at":   u.get("created_at", ""),
+            "last_login":   u.get("last_login", ""),
+        })
+
+    return {"users": rows, "total": total.count, "page": page, "per_page": per_page}
+
+
+@app.get("/admin/domains")
+def admin_domains(
+    page: int = 1,
+    per_page: int = 50,
+    authorization: str = Header(None),
+):
+    """All domains across all users with scan status. Admin only."""
+    require_admin(authorization)
+    db = get_db()
+
+    offset = (page - 1) * per_page
+    domains = db.table("domains").select("*, users(email,name)").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
+    total   = db.table("domains").select("id", count="exact").execute()
+
+    rows = []
+    for d in (domains.data or []):
+        # Get latest scan
+        scan = db.table("scans").select("risk_score,scanned_at").eq("domain_id", d["id"]).order("scanned_at", desc=True).limit(1).execute()
+        paid = db.table("purchases").select("id").eq("domain_id", d["id"]).execute()
+        rows.append({
+            "id":          d["id"],
+            "domain":      d["domain"],
+            "country":     d.get("country", ""),
+            "user_email":  d.get("users", {}).get("email", "") if d.get("users") else "",
+            "user_name":   d.get("users", {}).get("name", "") if d.get("users") else "",
+            "risk_score":  scan.data[0]["risk_score"] if scan.data else None,
+            "scanned_at":  scan.data[0]["scanned_at"] if scan.data else None,
+            "paid":        bool(paid.data),
+            "created_at":  d.get("created_at", ""),
+        })
+
+    return {"domains": rows, "total": total.count, "page": page, "per_page": per_page}
+
+
+@app.get("/admin/stats")
+def admin_stats(authorization: str = Header(None)):
+    """Full platform stats. Admin only."""
+    require_admin(authorization)
+    db = get_db()
+
+    users     = db.table("users").select("id,created_at,auth_type").execute()
+    domains   = db.table("domains").select("id,created_at").execute()
+    purchases = db.table("purchases").select("amount_usd,paid_at").execute()
+    scans     = db.table("scans").select("id,scanned_at").execute()
+
+    now = datetime.now(timezone.utc)
+
+    def within_days(rows, field, days):
+        from datetime import timedelta
+        cutoff = (now - timedelta(days=days)).isoformat()
+        return sum(1 for r in rows if r.get(field, "") >= cutoff)
+
+    revenue = sum(p.get("amount_usd", 0) or 0 for p in purchases.data)
+    google_users = sum(1 for u in users.data if u.get("auth_type") != "email")
+    email_users  = sum(1 for u in users.data if u.get("auth_type") == "email")
+
+    return {
+        "users": {
+            "total":      len(users.data),
+            "google":     google_users,
+            "email":      email_users,
+            "new_7d":     within_days(users.data, "created_at", 7),
+            "new_30d":    within_days(users.data, "created_at", 30),
+        },
+        "domains": {
+            "total":      len(domains.data),
+            "new_7d":     within_days(domains.data, "created_at", 7),
+            "new_30d":    within_days(domains.data, "created_at", 30),
+        },
+        "revenue": {
+            "total_eur":  round(revenue, 2),
+            "total_sales": len(purchases.data),
+            "new_7d":     within_days(purchases.data, "paid_at", 7),
+        },
+        "scans": {
+            "total":      len(scans.data),
+            "last_7d":    within_days(scans.data, "scanned_at", 7),
+        },
+    }
+
+
+@app.delete("/admin/users/{user_id}")
+def admin_delete_user(user_id: str, authorization: str = Header(None)):
+    """Delete a user and all their data. Admin only."""
+    require_admin(authorization)
+    db = get_db()
+    db.table("users").delete().eq("id", user_id).execute()
+    return {"deleted": user_id}
+
+
+@app.post("/admin/users/{user_id}/rescan-all")
+def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Force re-scan all domains for a user. Admin only."""
+    require_admin(authorization)
+    db = get_db()
+    doms = db.table("domains").select("id,domain").eq("user_id", user_id).execute()
+    for d in (doms.data or []):
+        background_tasks.add_task(run_scan_background, d["id"], d["domain"])
+    return {"queued": len(doms.data or [])}
+
+
+@app.get("/me")
+def get_me(authorization: str = Header(None)):
+    """Return current user info including is_admin flag."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    result = db.table("users").select("*").eq("id", user["sub"]).execute()
+    if not result.data:
+        raise HTTPException(404, "User not found")
+    u = result.data[0]
+    return {
+        "id":       u["id"],
+        "email":    u["email"],
+        "name":     u.get("name", ""),
+        "avatar":   u.get("avatar", ""),
+        "is_admin": is_admin(u["id"]),
+        "auth_type": u.get("auth_type", "google"),
     }
 
 
@@ -425,23 +714,6 @@ async def stripe_webhook(request: Request):
             }).eq("id", domain_id).execute()
 
     return {"received": True}
-
-
-@app.get("/admin/stats")
-def admin_stats(authorization: str = Header(None)):
-    """Admin overview — total users, domains, revenue."""
-    # In production: check user is admin
-    db = get_db()
-    users    = db.table("users").select("id", count="exact").execute()
-    domains  = db.table("domains").select("id", count="exact").execute()
-    purchases = db.table("purchases").select("amount_usd").execute()
-    revenue  = sum(p["amount_usd"] for p in purchases.data)
-    return {
-        "total_users":   users.count,
-        "total_domains": domains.count,
-        "total_revenue": f"${revenue:.2f}",
-        "total_sales":   len(purchases.data),
-    }
 
 
 # ── Background scan ───────────────────────────────────────────────────────────
