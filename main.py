@@ -283,13 +283,13 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
 
     db = get_db()
 
-    # Check email not already registered
-    existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
-    if existing.data:
-        raise HTTPException(409, "Email already registered — please sign in")
-
-    # Create user
     try:
+        # Check email not already registered
+        existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
+        if existing.data:
+            raise HTTPException(409, "Email already registered — please sign in")
+
+        # Create user
         result = db.table("users").insert({
             "google_id":     f"email:{body.email.lower()}",
             "email":         body.email.lower(),
@@ -299,11 +299,13 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
             "created_at":    datetime.now(timezone.utc).isoformat(),
             "last_login":    datetime.now(timezone.utc).isoformat(),
         }).execute()
+    except HTTPException:
+        raise
     except Exception as e:
         err = str(e)
         if "password_hash" in err or "auth_type" in err or "column" in err.lower():
             raise HTTPException(500,
-                "Database schema missing columns. Run in Supabase SQL Editor: "
+                "Database schema needs migration. Run in Supabase SQL Editor: "
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text; "
                 "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_type text DEFAULT 'google';"
             )
@@ -343,7 +345,11 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
 async def login_email(body: LoginRequest):
     """Sign in with email + password."""
     db = get_db()
-    result = db.table("users").select("*").eq("email", body.email.lower()).execute()
+    try:
+        result = db.table("users").select("*").eq("email", body.email.lower()).execute()
+    except Exception as e:
+        raise HTTPException(500, f"Database error: {str(e)[:200]}")
+
     if not result.data:
         raise HTTPException(401, "No account found with that email")
 
@@ -352,9 +358,12 @@ async def login_email(body: LoginRequest):
         raise HTTPException(401, "Incorrect password")
 
     # Update last login
-    db.table("users").update({
-        "last_login": datetime.now(timezone.utc).isoformat()
-    }).eq("id", user["id"]).execute()
+    try:
+        db.table("users").update({
+            "last_login": datetime.now(timezone.utc).isoformat()
+        }).eq("id", user["id"]).execute()
+    except Exception:
+        pass  # non-critical
 
     session_token = make_session(user["id"])
     return {

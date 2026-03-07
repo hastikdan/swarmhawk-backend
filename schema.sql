@@ -2,14 +2,20 @@
 -- Paste this into Supabase → SQL Editor → Run
 
 create table if not exists users (
-  id          uuid primary key default gen_random_uuid(),
-  google_id   text unique not null,
-  email       text unique not null,
-  name        text,
-  avatar      text,
-  created_at  timestamptz default now(),
-  last_login  timestamptz default now()
+  id            uuid primary key default gen_random_uuid(),
+  google_id     text unique not null,
+  email         text unique not null,
+  name          text,
+  avatar        text,
+  password_hash text,
+  auth_type     text default 'google',
+  created_at    timestamptz default now(),
+  last_login    timestamptz default now()
 );
+
+-- Migration: add columns if table already exists without them
+alter table users add column if not exists password_hash text;
+alter table users add column if not exists auth_type text default 'google';
 
 create table if not exists sessions (
   id         uuid primary key default gen_random_uuid(),
