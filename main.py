@@ -618,7 +618,14 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     if not latest:
         return {"status": "pending", "message": "Scan in progress"}
 
-    checks = latest.get("checks", [])
+    # Safely decode checks — may be a list (jsonb) or string (old bug: json.dumps was used)
+    raw_checks = latest.get("checks", [])
+    if isinstance(raw_checks, str):
+        try:
+            raw_checks = json.loads(raw_checks)
+        except Exception:
+            raw_checks = []
+    checks = raw_checks if isinstance(raw_checks, list) else []
 
     # Free = threat intel checks only (urlhaus, safebrowsing, virustotal, spamhaus, breach, whois, email_security)
     # Paid = all checks including shodan, AI summary, all config checks
@@ -737,16 +744,19 @@ def run_scan_background(domain_id: str, domain: str):
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
         db = get_db()
+        # Pass list directly — NOT json.dumps — so supabase stores it as jsonb not a string
         db.table("scans").insert({
             "domain_id":  domain_id,
             "risk_score": result["risk_score"],
             "critical":   result["critical"],
             "warnings":   result["warnings"],
-            "checks":     json.dumps(result["checks"]),
+            "checks":     result["checks"],
             "scanned_at": result["scanned_at"],
         }).execute()
+        print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
     except Exception as e:
-        print(f"Background scan failed for {domain}: {e}")
+        import traceback
+        print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
 
 
 # ── Passive prospect scan ─────────────────────────────────────────────────────
