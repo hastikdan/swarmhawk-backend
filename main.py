@@ -43,7 +43,7 @@ STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
 STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stripe dashboard
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "396286675021-tqhadhbp3jqc1jrqo5krk3j5njdss0cg.apps.googleusercontent.com")
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
-ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "")      # your email — grants super-admin access
+ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -72,6 +72,16 @@ async def lifespan(app):
     yield
 
 app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
+
+# Global exception handler — always return JSON, never bare 500 HTML
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    import traceback
+    print(f"Unhandled error on {request.url}: {exc}\n{traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": f"Server error: {str(exc)[:200]}"}
+    )
 
 # Mount outreach router
 try:
@@ -275,15 +285,25 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
         raise HTTPException(409, "Email already registered — please sign in")
 
     # Create user
-    result = db.table("users").insert({
-        "google_id":  f"email:{body.email.lower()}",   # fake google_id for email users
-        "email":      body.email.lower(),
-        "name":       body.username.strip(),
-        "password_hash": hash_password(body.password),
-        "auth_type":  "email",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "last_login": datetime.now(timezone.utc).isoformat(),
-    }).execute()
+    try:
+        result = db.table("users").insert({
+            "google_id":     f"email:{body.email.lower()}",
+            "email":         body.email.lower(),
+            "name":          body.username.strip(),
+            "password_hash": hash_password(body.password),
+            "auth_type":     "email",
+            "created_at":    datetime.now(timezone.utc).isoformat(),
+            "last_login":    datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        err = str(e)
+        if "password_hash" in err or "auth_type" in err or "column" in err.lower():
+            raise HTTPException(500,
+                "Database schema missing columns. Run in Supabase SQL Editor: "
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash text; "
+                "ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_type text DEFAULT 'google';"
+            )
+        raise HTTPException(500, f"Could not create user: {err[:200]}")
 
     user = result.data[0]
     session_token = make_session(user["id"])
