@@ -136,12 +136,12 @@ def _query_nvd(product: str, version: str, api_key: str = "") -> list[dict]:
 
     try:
         # NVD rate limit: 5 req/30s without key, 50/30s with key
-        time.sleep(0.7)
+        time.sleep(0.4)
         r = requests.get(NVD_API, params=params, headers=hdrs, timeout=12)
 
         if r.status_code == 429:
-            logger.warning("NVD rate limit hit — sleeping 35s")
-            time.sleep(35)
+            logger.warning("NVD rate limit hit — sleeping 6s then retrying once")
+            time.sleep(6)
             r = requests.get(NVD_API, params=params, headers=hdrs, timeout=12)
 
         if r.status_code != 200:
@@ -367,7 +367,7 @@ def check_cve(domain: str) -> "CheckResult":
     all_cves: list[dict] = []
     software_list: list[str] = []
 
-    for product, version in all_software:
+    for product, version in all_software[:3]:   # cap at 3 to keep scan fast
         software_list.append(f"{product} {version}")
 
         if version == "unknown":

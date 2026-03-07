@@ -740,6 +740,7 @@ async def stripe_webhook(request: Request):
 
 def run_scan_background(domain_id: str, domain: str):
     """Run scanner in background and save results to DB."""
+    print(f"[scan] Starting scan for {domain} (id={domain_id})")
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
@@ -753,10 +754,25 @@ def run_scan_background(domain_id: str, domain: str):
             "checks":     result["checks"],
             "scanned_at": result["scanned_at"],
         }).execute()
-        print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
+        print(f"[scan] Done for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
     except Exception as e:
         import traceback
-        print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
+        print(f"[scan] FAILED for {domain}: {e}\n{traceback.format_exc()}")
+        # Save a failed scan record so the domain doesn't stay stuck at 'pending'
+        try:
+            db = get_db()
+            db.table("scans").insert({
+                "domain_id":  domain_id,
+                "risk_score": -1,
+                "critical":   0,
+                "warnings":   0,
+                "checks":     [{"check": "error", "status": "error",
+                                "title": "Scan failed", "detail": str(e)[:200],
+                                "score_impact": 0}],
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception:
+            pass
 
 
 # ── Passive prospect scan ─────────────────────────────────────────────────────
@@ -956,7 +972,7 @@ async def public_scan(body: PublicScanRequest):
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "open_ports"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "email_security"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 
