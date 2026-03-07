@@ -444,3 +444,119 @@ def run_scan_background(domain_id: str, domain: str):
         }).execute()
     except Exception as e:
         print(f"Background scan failed for {domain}: {e}")
+
+
+# ── Passive prospect scan ─────────────────────────────────────────────────────
+
+@app.get("/scan/passive")
+async def passive_scan(domain: str, authorization: str = Header(None)):
+    """
+    Fast passive scan for Prospects tab — detects software versions and CVEs.
+    Returns lightweight result without saving to DB. No payment required.
+    """
+    get_user_from_header(authorization)   # must be logged in
+
+    import re, time
+    import requests as req
+
+    TIMEOUT = 8
+    UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
+
+    HEADER_PATTERNS = [
+        (r"nginx/(\d+\.\d+(?:\.\d+)?)",         "nginx"),
+        (r"Apache/(\d+\.\d+(?:\.\d+)?)",         "Apache"),
+        (r"Microsoft-IIS/(\d+\.\d+)",            "IIS"),
+        (r"PHP/(\d+\.\d+(?:\.\d+)?)",            "PHP"),
+        (r"WordPress/(\d+\.\d+(?:\.\d+)?)",      "WordPress"),
+        (r"Drupal (\d+(?:\.\d+)*)",              "Drupal"),
+    ]
+    VERSION_PROBES = [
+        ("/wp-json/",      r'"version":"(\d+\.\d+\.\d+)"',  "WordPress"),
+        ("/wp-login.php",  r'ver=(\d+\.\d+\.\d+)',           "WordPress"),
+        ("/",              r'content="WordPress (\d+\.\d+)', "WordPress"),
+    ]
+
+    software = []
+    try:
+        r = req.get(f"https://{domain}", timeout=TIMEOUT, headers=UA,
+                    allow_redirects=True, verify=False)
+        raw_headers = " ".join(f"{k}: {v}" for k, v in r.headers.items())
+        for pattern, product in HEADER_PATTERNS:
+            m = re.search(pattern, raw_headers, re.IGNORECASE)
+            if m:
+                ver = m.group(1)
+                if not any(s["product"] == product for s in software):
+                    software.append({"product": product, "version": ver})
+        body = r.text[:3000]
+        for path, pattern, product in VERSION_PROBES:
+            if path == "/":
+                m = re.search(pattern, body, re.IGNORECASE)
+                if m and not any(s["product"] == product for s in software):
+                    software.append({"product": product, "version": m.group(1)})
+    except Exception:
+        pass
+
+    for path, pattern, product in VERSION_PROBES:
+        if path == "/": continue
+        try:
+            r2 = req.get(f"https://{domain}{path}", timeout=TIMEOUT, headers=UA, verify=False)
+            if r2.status_code == 200:
+                m = re.search(pattern, r2.text[:2000], re.IGNORECASE)
+                if m and not any(s["product"] == product for s in software):
+                    software.append({"product": product, "version": m.group(1)})
+        except Exception:
+            pass
+
+    # NVD CVE lookup
+    cve_hits = []
+    NVD = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    NVD_KEYWORDS = {
+        "nginx": "nginx", "Apache": "apache http server",
+        "PHP": "php", "WordPress": "wordpress",
+        "Drupal": "drupal", "IIS": "microsoft iis",
+    }
+    for sw in software:
+        if not sw["version"] or sw["version"] == "unknown":
+            continue
+        kw = NVD_KEYWORDS.get(sw["product"], sw["product"].lower())
+        try:
+            time.sleep(0.4)
+            nresp = req.get(NVD, params={
+                "keywordSearch": f"{kw} {sw['version']}",
+                "cvssV3SeverityMin": "HIGH",
+                "resultsPerPage": 5,
+            }, timeout=10)
+            if nresp.status_code == 200:
+                vulns = nresp.json().get("vulnerabilities", [])
+                best_score, best_id = 0, None
+                for item in vulns:
+                    cve = item.get("cve", {})
+                    metrics = cve.get("metrics", {})
+                    score = None
+                    if "cvssMetricV31" in metrics:
+                        score = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
+                    elif "cvssMetricV30" in metrics:
+                        score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
+                    if score and score > best_score:
+                        best_score, best_id = score, cve["id"]
+                if best_id:
+                    cve_hits.append({
+                        "product":    sw["product"],
+                        "version":    sw["version"],
+                        "top_cve":    best_id,
+                        "top_cvss":   best_score,
+                        "cve_count":  len(vulns),
+                    })
+        except Exception:
+            pass
+
+    max_cvss = max((h["top_cvss"] for h in cve_hits), default=0)
+    priority  = "CRITICAL" if max_cvss >= 9 else "HIGH" if max_cvss >= 7 else "MEDIUM" if max_cvss >= 4 else "LOW"
+
+    return {
+        "domain":    domain,
+        "software":  software,
+        "cve_hits":  cve_hits,
+        "max_cvss":  max_cvss,
+        "priority":  priority,
+    }
