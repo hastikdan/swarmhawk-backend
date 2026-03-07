@@ -83,8 +83,8 @@ except Exception as e:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL, "http://localhost:3000", "http://localhost:8080"],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -244,10 +244,11 @@ async def auth_google(body: GoogleAuthRequest):
 
     return {
         "user": {
-            "id":     user["id"],
-            "email":  email,
-            "name":   name,
-            "avatar": avatar,
+            "id":       user["id"],
+            "email":    email,
+            "name":     name,
+            "avatar":   avatar,
+            "is_admin": is_admin(user["id"]),
         },
         "session_token": session_token,
     }
