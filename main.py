@@ -57,12 +57,7 @@ db: Client = None
 def get_db() -> Client:
     global db
     if db is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise HTTPException(503, "Database not configured — set SUPABASE_URL and SUPABASE_KEY env vars on Render")
-        try:
-            db = create_client(SUPABASE_URL, SUPABASE_KEY)
-        except Exception as e:
-            raise HTTPException(503, f"Database connection failed: {str(e)[:200]}")
+        db = create_client(SUPABASE_URL, SUPABASE_KEY)
     return db
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -166,13 +161,8 @@ def get_user_from_header(authorization: str) -> dict:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing authorization header")
     token = authorization.split(" ")[1]
-    try:
-        db = get_db()
-        result = db.table("sessions").select("user_id").eq("token", token).execute()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Database error: {str(e)[:200]}")
+    db = get_db()
+    result = db.table("sessions").select("user_id").eq("token", token).execute()
     if not result.data:
         raise HTTPException(status_code=401, detail="Invalid or expired session token")
     user_id = result.data[0]["user_id"]
@@ -338,17 +328,10 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
     if not body.username.strip():
         raise HTTPException(400, "Username required")
 
-    try:
-        db = get_db()
-    except HTTPException:
-        raise
+    db = get_db()
 
-    try:
-        # Check email not already registered
-        existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
-    except Exception as e:
-        raise HTTPException(500, f"Database error: {str(e)[:200]}")
-
+    # Check email not already registered
+    existing = db.table("users").select("id").eq("email", body.email.lower()).execute()
     if existing.data:
         raise HTTPException(409, "Email already registered — please sign in")
 
@@ -419,14 +402,8 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
 @app.post("/auth/login")
 async def login_email(body: LoginRequest):
     """Sign in with email + password."""
-    try:
-        db = get_db()
-        result = db.table("users").select("*").eq("email", body.email.lower()).execute()
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, f"Database error: {str(e)[:200]}")
-
+    db = get_db()
+    result = db.table("users").select("*").eq("email", body.email.lower()).execute()
     if not result.data:
         raise HTTPException(401, "No account found with that email")
 
@@ -435,12 +412,9 @@ async def login_email(body: LoginRequest):
         raise HTTPException(401, "Incorrect password")
 
     # Update last login
-    try:
-        db.table("users").update({
-            "last_login": datetime.now(timezone.utc).isoformat()
-        }).eq("id", user["id"]).execute()
-    except Exception:
-        pass  # non-critical
+    db.table("users").update({
+        "last_login": datetime.now(timezone.utc).isoformat()
+    }).eq("id", user["id"]).execute()
 
     session_token = make_session(user["id"])
     return {
