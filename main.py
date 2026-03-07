@@ -61,8 +61,20 @@ def get_db() -> Client:
 
 from contextlib import asynccontextmanager
 
+SCANNER_AVAILABLE = False  # set True at startup if cee_scanner imports OK
+
 @asynccontextmanager
 async def lifespan(app):
+    global SCANNER_AVAILABLE
+    # Check scanner is importable
+    try:
+        from cee_scanner.checks import scan_domain
+        SCANNER_AVAILABLE = True
+        print("✓ cee_scanner loaded OK")
+    except Exception as e:
+        SCANNER_AVAILABLE = False
+        print(f"✗ cee_scanner NOT available: {e}")
+        print("  → Deploy cee_scanner/ directory into backend repo root")
     # Start daily outreach scan scheduler on startup
     try:
         from outreach import start_scheduler
@@ -189,7 +201,7 @@ def require_admin(authorization: str) -> str:
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0.0"}
+    return {"status": "ok", "version": "2.0.0", "scanner": SCANNER_AVAILABLE}
 
 
 @app.post("/auth/google")
@@ -740,7 +752,11 @@ async def stripe_webhook(request: Request):
 
 def run_scan_background(domain_id: str, domain: str):
     """Run scanner in background and save results to DB."""
-    print(f"[scan] Starting scan for {domain} (id={domain_id})")
+    if not SCANNER_AVAILABLE:
+        print(f"Scan skipped for {domain}: cee_scanner not installed on this server")
+        return
+    if not SCANNER_AVAILABLE:
+        raise HTTPException(503, "Scanner not available on this server — deploy cee_scanner/ into backend repo root")
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
@@ -754,25 +770,10 @@ def run_scan_background(domain_id: str, domain: str):
             "checks":     result["checks"],
             "scanned_at": result["scanned_at"],
         }).execute()
-        print(f"[scan] Done for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
+        print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
     except Exception as e:
         import traceback
-        print(f"[scan] FAILED for {domain}: {e}\n{traceback.format_exc()}")
-        # Save a failed scan record so the domain doesn't stay stuck at 'pending'
-        try:
-            db = get_db()
-            db.table("scans").insert({
-                "domain_id":  domain_id,
-                "risk_score": -1,
-                "critical":   0,
-                "warnings":   0,
-                "checks":     [{"check": "error", "status": "error",
-                                "title": "Scan failed", "detail": str(e)[:200],
-                                "score_impact": 0}],
-                "scanned_at": datetime.now(timezone.utc).isoformat(),
-            }).execute()
-        except Exception:
-            pass
+        print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
 
 
 # ── Passive prospect scan ─────────────────────────────────────────────────────
@@ -966,13 +967,15 @@ async def public_scan(body: PublicScanRequest):
     if not _re.match(r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$', domain):
         raise HTTPException(400, "Invalid domain")
 
+    if not SCANNER_AVAILABLE:
+        raise HTTPException(503, "Scanner not available on this server — deploy cee_scanner/ into backend repo root")
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "email_security"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "open_ports"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 

@@ -635,129 +635,6 @@ def check_spamhaus(domain: str) -> CheckResult:
 
 # ── Run all checks for a domain ───────────────────────────────────────────────
 
-def check_email_security(domain: str) -> CheckResult:
-    """Check SPF, DMARC, and DKIM email authentication records."""
-    result = CheckResult("email_security", domain)
-    issues = []
-    found = []
-
-    try:
-        import subprocess
-
-        # Check SPF
-        try:
-            spf = subprocess.run(
-                ["dig", "+short", "TXT", domain],
-                capture_output=True, text=True, timeout=5
-            )
-            if spf.returncode == 0 and "v=spf1" in spf.stdout:
-                found.append("SPF")
-            else:
-                issues.append("No SPF record (email spoofing risk)")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Check DMARC
-        try:
-            dmarc = subprocess.run(
-                ["dig", "+short", "TXT", f"_dmarc.{domain}"],
-                capture_output=True, text=True, timeout=5
-            )
-            if dmarc.returncode == 0 and "v=DMARC1" in dmarc.stdout:
-                found.append("DMARC")
-                if "p=none" in dmarc.stdout:
-                    issues.append("DMARC policy is 'none' (monitoring only, no enforcement)")
-            else:
-                issues.append("No DMARC record (emails can be spoofed)")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        # Check DKIM (common selectors)
-        for selector in ["default", "google", "mail", "dkim", "k1"]:
-            try:
-                dkim = subprocess.run(
-                    ["dig", "+short", "TXT", f"{selector}._domainkey.{domain}"],
-                    capture_output=True, text=True, timeout=3
-                )
-                if dkim.returncode == 0 and "v=DKIM1" in dkim.stdout:
-                    found.append("DKIM")
-                    break
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                break
-
-        if not issues:
-            return result.ok(
-                "Email security configured",
-                f"Records present: {', '.join(found)}"
-            )
-        return result.warn(
-            f"{len(issues)} email security issue(s)",
-            " | ".join(issues),
-            impact=min(len(issues) * 7, 15)
-        )
-
-    except Exception as e:
-        return result.error("Email security check failed", str(e)[:80])
-
-
-def check_whois(domain: str) -> CheckResult:
-    """Check domain registration age and expiry via RDAP."""
-    result = CheckResult("whois", domain)
-    try:
-        r = requests.get(
-            f"https://rdap.org/domain/{domain}",
-            headers={**HEADERS, "Accept": "application/rdap+json"},
-            timeout=8, allow_redirects=True
-        )
-        if r.status_code != 200:
-            return result.ok("WHOIS: domain registered (RDAP unavailable)")
-
-        data = r.json()
-        events = {e["eventAction"]: e["eventDate"] for e in data.get("events", [])}
-
-        now = datetime.now(timezone.utc)
-        issues = []
-        details = []
-
-        reg_date_str = events.get("registration")
-        exp_date_str = events.get("expiration")
-
-        if reg_date_str:
-            try:
-                reg_date = datetime.fromisoformat(reg_date_str.replace("Z", "+00:00"))
-                age_days = (now - reg_date).days
-                details.append(f"Registered {reg_date.strftime('%Y-%m-%d')} ({age_days}d ago)")
-                if age_days < 30:
-                    issues.append(f"Very new domain — only {age_days} days old (phishing pattern)")
-                elif age_days < 180:
-                    issues.append(f"Relatively new domain — {age_days} days old")
-            except ValueError:
-                pass
-
-        if exp_date_str:
-            try:
-                exp_date = datetime.fromisoformat(exp_date_str.replace("Z", "+00:00"))
-                days_left = (exp_date - now).days
-                details.append(f"Expires {exp_date.strftime('%Y-%m-%d')}")
-                if days_left < 0:
-                    issues.append("Domain registration EXPIRED")
-                elif days_left < 30:
-                    issues.append(f"Domain expires in {days_left} days")
-            except ValueError:
-                pass
-
-        detail_str = " | ".join(details) if details else "WHOIS data retrieved"
-
-        if not issues:
-            return result.ok("Domain WHOIS looks normal", detail_str)
-        if any("expired" in i.lower() or "very new" in i.lower() for i in issues):
-            return result.critical(issues[0], detail_str, impact=15)
-        return result.warn(issues[0], detail_str, impact=5)
-
-    except Exception as e:
-        return result.error("WHOIS check failed", str(e)[:80])
-
-
 def check_cve(domain: str) -> CheckResult:
     """CVE Enrichment Skill — detects software versions and looks up real CVEs."""
     from cee_scanner.skills.cve import check_cve as _check_cve
@@ -772,8 +649,6 @@ ALL_CHECKS = [
     check_breach,
     check_typosquat,
     check_response_time,
-    check_email_security,       # SPF, DMARC, DKIM
-    check_whois,                # domain age and expiry via RDAP
     # ── Real-time threat intelligence ──
     check_urlhaus,              # free, no key
     check_spamhaus,             # free, no key (DNS-based)
