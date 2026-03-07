@@ -927,3 +927,47 @@ async def intel(body: IntelRequest, authorization: str = Header(None)):
     data = r.json()
     text = data["content"][0]["text"] if data.get("content") else ""
     return {"text": text, "briefing": text}
+
+
+# ── Public scan (no auth, for landing page report) ───────────────────────────
+
+class PublicScanRequest(BaseModel):
+    domain: str
+
+@app.post("/public-scan")
+async def public_scan(body: PublicScanRequest):
+    """Run a real scan for the landing page — no auth required, results not saved."""
+    import re as _re
+    domain = body.domain.lower().strip().replace("https://","").replace("http://","").split("/")[0]
+    if not _re.match(r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$', domain):
+        raise HTTPException(400, "Invalid domain")
+
+    import sys, os as _os
+    sys.path.insert(0, _os.path.dirname(__file__))
+    try:
+        from cee_scanner.checks import scan_domain
+        result = scan_domain(domain)
+
+        # Free tier: only show first 5 checks, lock the rest
+        checks = result.get("checks", [])
+        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "open_ports"}
+        free   = [c for c in checks if c.get("check") in FREE_CHECKS]
+        locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
+
+        # Mark locked checks
+        for c in locked:
+            c["status"]  = "locked"
+            c["title"]   = "Upgrade to unlock"
+            c["detail"]  = "Subscribe for €50/year to see this check"
+
+        return {
+            "domain":       domain,
+            "risk_score":   result.get("risk_score", 0),
+            "critical":     result.get("critical", 0),
+            "warnings":     result.get("warnings", 0),
+            "checks":       free + locked,
+            "locked_count": len(locked),
+            "scanned_at":   result.get("scanned_at", ""),
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Scan failed: {str(e)[:200]}")
