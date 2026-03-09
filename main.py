@@ -619,12 +619,24 @@ def list_domains(authorization: str = Header(None)):
     for d in domains.data:
         latest_scan = max(d.get("scans", []), key=lambda s: s["scanned_at"], default=None)
         is_paid = any(p.get("paid_at") for p in d.get("purchases", []))
+        # "scanning" if added within last 10 min and no scan yet
+        created_at = d.get("created_at", "")
+        is_new = False
+        if created_at and not latest_scan:
+            try:
+                from dateutil import parser as dtparse
+                age = (datetime.now(timezone.utc) - dtparse.parse(created_at)).total_seconds()
+                is_new = age < 600
+            except Exception:
+                pass
+        status = "scanning" if is_new else ("active" if latest_scan else "pending")
+
         result.append({
             "id":          d["id"],
             "domain":      d["domain"],
             "country":     d["country"],
             "added":       d["created_at"],
-            "status":      "active" if latest_scan else "pending",
+            "status":      status,
             "paid":        is_paid,
             "risk_score":  latest_scan["risk_score"] if latest_scan else None,
             "scanned_at":  latest_scan["scanned_at"] if latest_scan else None,
@@ -951,6 +963,21 @@ def run_scan_background(domain_id: str, domain: str):
     except Exception as e:
         import traceback
         print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
+        # Save a minimal error record so the domain shows "scanned" not "pending" forever
+        try:
+            db = get_db()
+            db.table("scans").insert({
+                "domain_id":  domain_id,
+                "risk_score": 0,
+                "critical":   0,
+                "warnings":   0,
+                "checks":     [{"check": "error", "status": "error",
+                                "title": "Scan failed", "detail": str(e)[:200],
+                                "score_impact": 0}],
+                "scanned_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception:
+            pass
 
 
 # ── Passive prospect scan ─────────────────────────────────────────────────────
