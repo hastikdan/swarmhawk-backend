@@ -761,6 +761,30 @@ def check_cve(domain: str) -> CheckResult:
     return _check_cve(domain)
 
 
+def check_sast(domain: str) -> CheckResult:
+    """SAST Exposure — detect leaked source code, .env files, and debug endpoints."""
+    from cee_scanner.skills.sast import check_sast as _check_sast
+    return _check_sast(domain)
+
+
+def check_sca(domain: str) -> CheckResult:
+    """SCA — find exposed dependency manifests and CVEs in declared packages."""
+    from cee_scanner.skills.sca import check_sca as _check_sca
+    return _check_sca(domain)
+
+
+def check_dast(domain: str) -> CheckResult:
+    """DAST — probe for exposed admin panels, API docs, and misconfigurations."""
+    from cee_scanner.skills.dast import check_dast as _check_dast
+    return _check_dast(domain)
+
+
+def check_iac(domain: str) -> CheckResult:
+    """IaC Security — detect exposed Terraform, Kubernetes, and cloud config files."""
+    from cee_scanner.skills.iac import check_iac as _check_iac
+    return _check_iac(domain)
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -776,8 +800,13 @@ ALL_CHECKS = [
     check_spamhaus,             # free, no key (DNS-based)
     check_google_safebrowsing,  # free key: console.cloud.google.com
     check_virustotal,           # free key: virustotal.com
-    # ── CVE Enrichment Skill ──
+    # ── CVE Enrichment ──
     check_cve,                  # free (NVD API); set NVD_API_KEY for higher rate limits
+    # ── AppSec checks ──
+    check_sast,                 # exposed source code, .env, debug pages
+    check_sca,                  # exposed dependency manifests + NVD CVEs
+    check_dast,                 # admin panels, API docs, open redirects
+    check_iac,                  # Terraform state, K8s configs, CI/CD files
 ]
 
 

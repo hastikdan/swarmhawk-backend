@@ -658,10 +658,10 @@ def get_report(domain_id: str, authorization: str = Header(None)):
             raw_checks = []
     checks = raw_checks if isinstance(raw_checks, list) else []
 
-    # Free = threat intel checks only (urlhaus, safebrowsing, virustotal, spamhaus, breach, whois, email_security)
-    # Paid = all checks including shodan, AI summary, all config checks
+    # Free = core checks visible; paid = all checks including AI summary
     FREE_CHECKS = {"urlhaus", "safebrowsing", "virustotal", "spamhaus", "breach",
-                   "whois", "email_security", "ssl", "headers", "dns"}
+                   "whois", "email_security", "ssl", "headers", "dns",
+                   "sast", "sca", "dast", "iac"}
 
     if is_paid:
         visible_checks = checks
@@ -994,7 +994,7 @@ async def public_scan(body: PublicScanRequest):
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "typosquat", "open_ports"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "sast", "sca", "dast", "iac"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 
