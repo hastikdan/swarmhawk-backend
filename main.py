@@ -31,7 +31,6 @@ from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from jose import jwt, JWTError
 from supabase import create_client, Client
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -41,7 +40,6 @@ SUPABASE_KEY        = os.getenv("SUPABASE_KEY", "")        # anon/service key
 STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY", "")   # sk_live_... or sk_test_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
 STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stripe dashboard
-GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "396286675021-tqhadhbp3jqc1jrqo5krk3j5njdss0cg.apps.googleusercontent.com")
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
@@ -113,9 +111,6 @@ except Exception as e:
 
 # ── Models ────────────────────────────────────────────────────────────────────
 
-class GoogleAuthRequest(BaseModel):
-    credential: str   # JWT from Google Sign-In
-
 class AddDomainRequest(BaseModel):
     domain: str
     country: str
@@ -135,31 +130,6 @@ class CheckoutRequest(BaseModel):
     domain: str
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
-
-async def verify_google_token(credential: str) -> dict:
-    """Verify Google JWT and return payload."""
-    try:
-        async with httpx.AsyncClient() as client:
-            # Get Google public keys
-            r = await client.get("https://www.googleapis.com/oauth2/v3/certs")
-            keys = r.json()
-
-        # Decode without verification first to get kid
-        header = jwt.get_unverified_header(credential)
-        key = next((k for k in keys["keys"] if k["kid"] == header["kid"]), None)
-        if not key:
-            raise HTTPException(status_code=401, detail="Invalid Google token key")
-
-        payload = jwt.decode(
-            credential,
-            key,
-            algorithms=["RS256"],
-            audience=GOOGLE_CLIENT_ID,
-        )
-        return payload
-    except JWTError as e:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
-
 
 def get_user_from_header(authorization: str) -> dict:
     """Look up session token in sessions table and return user info."""
@@ -259,70 +229,6 @@ def send_confirmation_email(to_email: str, name: str, token: str):
 @app.get("/health")
 def health():
     return {"status": "ok", "version": "2.0.0", "scanner": SCANNER_AVAILABLE}
-
-
-@app.post("/auth/google")
-async def auth_google(body: GoogleAuthRequest):
-    """
-    Verify Google credential JWT.
-    Creates user in DB if first time, otherwise returns existing user.
-    Returns a session token for subsequent requests.
-    """
-    payload = await verify_google_token(body.credential)
-
-    google_id = payload["sub"]
-    email     = payload["email"]
-    name      = payload.get("name", "")
-    avatar    = payload.get("picture", "")
-
-    db = get_db()
-
-    # Upsert user
-    existing = db.table("users").select("*").eq("google_id", google_id).execute()
-
-    if existing.data:
-        user = existing.data[0]
-        # Update last login
-        db.table("users").update({
-            "last_login": datetime.now(timezone.utc).isoformat(),
-            "name": name,
-            "avatar": avatar,
-        }).eq("id", user["id"]).execute()
-    else:
-        # Create new user
-        result = db.table("users").insert({
-            "google_id": google_id,
-            "email":     email,
-            "name":      name,
-            "avatar":    avatar,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "last_login": datetime.now(timezone.utc).isoformat(),
-        }).execute()
-        user = result.data[0]
-
-    # Create simple session token (in production use Supabase Auth)
-    import hashlib, secrets
-    session_token = hashlib.sha256(
-        f"{user['id']}:{secrets.token_hex(16)}".encode()
-    ).hexdigest()
-
-    # Store session
-    db.table("sessions").upsert({
-        "user_id": user["id"],
-        "token":   session_token,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
-
-    return {
-        "user": {
-            "id":       user["id"],
-            "email":    email,
-            "name":     name,
-            "avatar":   avatar,
-            "is_admin": is_admin(user["id"]),
-        },
-        "session_token": session_token,
-    }
 
 
 # ── Email / password auth ─────────────────────────────────────────────────────
