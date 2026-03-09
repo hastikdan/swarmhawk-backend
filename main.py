@@ -36,6 +36,7 @@ from supabase import create_client, Client
 
 SUPABASE_URL        = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY        = os.getenv("SUPABASE_KEY", "")        # anon/service key
+SUPABASE_SERVICE_KEY= os.getenv("SUPABASE_SERVICE_KEY", "")  # service_role key (bypasses RLS)
 STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY", "")   # sk_live_... or sk_test_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
 STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stripe dashboard
@@ -47,9 +48,10 @@ SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-sca
 
 stripe.api_key = STRIPE_SECRET_KEY
 
-# ── Supabase client ───────────────────────────────────────────────────────────
+# ── Supabase clients ──────────────────────────────────────────────────────────
 
 db: Client = None
+admin_db: Client = None
 
 def get_db() -> Client:
     global db
@@ -62,11 +64,57 @@ def get_db() -> Client:
             raise HTTPException(503, f"Database connection failed: {str(e)[:200]}")
     return db
 
+def get_admin_db() -> Client:
+    """Return a Supabase client using the service_role key to bypass RLS.
+    Falls back to regular key if SUPABASE_SERVICE_KEY is not set."""
+    global admin_db
+    if admin_db is None:
+        key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
+        if not SUPABASE_URL or not key:
+            raise HTTPException(503, "Database not configured")
+        try:
+            admin_db = create_client(SUPABASE_URL, key)
+        except Exception as e:
+            raise HTTPException(503, f"Database connection failed: {str(e)[:200]}")
+    return admin_db
+
 # ── App ───────────────────────────────────────────────────────────────────────
 
 from contextlib import asynccontextmanager
 
 SCANNER_AVAILABLE = False  # set True at startup if cee_scanner imports OK
+
+def _run_monthly_scans():
+    """Daily job: scan any annual subscriber whose last scan is ≥30 days ago, then email PDF."""
+    try:
+        from datetime import timedelta
+        _db = get_admin_db()
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=30)).isoformat()
+
+        purchases = _db.table("purchases").select("domain_id, domain")\
+            .eq("plan", "annual")\
+            .is_("cancelled_at", "null")\
+            .not_.is_("paid_at", "null")\
+            .execute()
+
+        for p in (purchases.data or []):
+            domain_id = p.get("domain_id")
+            domain    = p.get("domain", "")
+            if not domain_id or not domain:
+                continue
+            last = _db.table("scans").select("scanned_at")\
+                .eq("domain_id", domain_id)\
+                .order("scanned_at", desc=True).limit(1).execute()
+            last_at = last.data[0]["scanned_at"] if last.data else None
+            if not last_at or last_at < cutoff:
+                from threading import Thread
+                Thread(target=run_scan_background, args=(domain_id, domain), daemon=True).start()
+                print(f"[monthly-scheduler] Queued scan for {domain}")
+    except Exception as e:
+        import traceback
+        print(f"[monthly-scheduler] Error: {e}\n{traceback.format_exc()}")
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -86,6 +134,15 @@ async def lifespan(app):
         _scheduler = start_scheduler()
     except Exception as e:
         print(f"Scheduler init failed: {e}")
+    # Start monthly scan scheduler for annual subscribers
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler as _BGScheduler
+        _monthly_scheduler = _BGScheduler()
+        _monthly_scheduler.add_job(_run_monthly_scans, "interval", hours=24, id="monthly_subscriber_scans")
+        _monthly_scheduler.start()
+        print("✓ Monthly scan scheduler started")
+    except Exception as e:
+        print(f"Monthly scheduler init failed: {e}")
     yield
 
 app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
@@ -550,7 +607,7 @@ def admin_users(
 ):
     """Full user list with domain counts and last login. Admin only."""
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
 
     offset = (page - 1) * per_page
     users = db.table("users").select("*").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
@@ -582,7 +639,7 @@ def admin_domains(
 ):
     """All domains across all users with scan status. Admin only."""
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
 
     offset = (page - 1) * per_page
     domains = db.table("domains").select("*, users(email,name)").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
@@ -612,7 +669,7 @@ def admin_domains(
 def admin_stats(authorization: str = Header(None)):
     """Full platform stats. Admin only."""
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
 
     from datetime import timedelta
 
@@ -720,7 +777,7 @@ def admin_stats(authorization: str = Header(None)):
 def admin_delete_user(user_id: str, authorization: str = Header(None)):
     """Delete a user and all their data. Admin only."""
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
     db.table("users").delete().eq("id", user_id).execute()
     return {"deleted": user_id}
 
@@ -729,7 +786,7 @@ def admin_delete_user(user_id: str, authorization: str = Header(None)):
 def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Force re-scan all domains for a user. Admin only."""
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
     doms = db.table("domains").select("id,domain").eq("user_id", user_id).execute()
     for d in (doms.data or []):
         background_tasks.add_task(run_scan_background, d["id"], d["domain"])
