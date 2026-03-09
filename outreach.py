@@ -438,6 +438,14 @@ async def skip_prospect(prospect_id: str, authorization: str = Header(None)):
     return {"status": "skipped"}
 
 
+@router.post("/prospects/{prospect_id}/unapprove")
+async def unapprove_prospect(prospect_id: str, authorization: str = Header(None)):
+    require_admin(authorization)
+    db = get_db()
+    db.table("outreach_prospects").update({"status": "pending"}).eq("id", prospect_id).execute()
+    return {"status": "pending"}
+
+
 @router.post("/prospects/bulk-approve")
 async def bulk_approve(body: BulkApprove, authorization: str = Header(None)):
     require_admin(authorization)

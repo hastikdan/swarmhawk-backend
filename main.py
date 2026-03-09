@@ -44,6 +44,7 @@ FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
+GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
 SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-scanner")
 
 stripe.api_key = STRIPE_SECRET_KEY
@@ -599,6 +600,77 @@ def verify_email(token: str):
     return RedirectResponse(url=f"{SITE_URL}?verified=1", status_code=302)
 
 
+class GoogleAuthRequest(BaseModel):
+    credential: str  # Google ID token (JWT)
+
+@app.post("/auth/google")
+async def google_auth(body: GoogleAuthRequest, background_tasks: BackgroundTasks):
+    """Verify Google ID token and return a session JWT. Creates user on first sign-in."""
+    import requests as _req
+    try:
+        r = _req.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": body.credential},
+            timeout=8,
+        )
+        if r.status_code != 200:
+            raise HTTPException(401, "Invalid Google token")
+        info = r.json()
+        if info.get("error"):
+            raise HTTPException(401, info.get("error_description", "Google token error"))
+        if GOOGLE_CLIENT_ID and info.get("aud") != GOOGLE_CLIENT_ID:
+            raise HTTPException(401, "Token audience mismatch")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(401, f"Google verification failed: {e}")
+
+    email  = info.get("email", "").lower()
+    name   = info.get("name") or info.get("given_name") or email.split("@")[0]
+    avatar = info.get("picture", "")
+    g_id   = info.get("sub", "")
+
+    if not email:
+        raise HTTPException(400, "Google account has no email")
+
+    db = get_db()
+    existing = db.table("users").select("*").eq("email", email).execute()
+    if existing.data:
+        user = existing.data[0]
+        db.table("users").update({
+            "last_login": datetime.now(timezone.utc).isoformat(),
+            "avatar":     avatar,
+        }).eq("id", user["id"]).execute()
+    else:
+        import uuid
+        user_id = str(uuid.uuid4())
+        db.table("users").insert({
+            "id":         user_id,
+            "email":      email,
+            "name":       name,
+            "avatar":     avatar,
+            "google_id":  g_id,
+            "auth_type":  "google",
+            "email_verified": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_login": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        user = {"id": user_id, "email": email, "name": name, "avatar": avatar}
+        background_tasks.add_task(send_welcome_email, email, name)
+
+    token = make_session(user["id"])
+    return {
+        "session_token": token,
+        "user": {
+            "id":       user["id"],
+            "email":    email,
+            "name":     name,
+            "avatar":   avatar,
+            "is_admin": is_admin(user["id"]),
+        },
+    }
+
+
 @app.get("/admin/users")
 def admin_users(
     page: int = 1,
@@ -1085,6 +1157,25 @@ def get_report(domain_id: str, authorization: str = Header(None)):
         "warnings":    sum(1 for c in non_ai if c.get("status") == "warning"),
         "locked_count": len(checks) - len(visible_checks) if not is_paid else 0,
     }
+
+
+@app.get("/domains/{domain_id}/history")
+def get_domain_history(domain_id: str, authorization: str = Header(None)):
+    """Return full scan history for a domain (owner only)."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    d = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data:
+        raise HTTPException(404, "Domain not found")
+    if d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not your domain")
+    scans = db.table("scans")\
+        .select("risk_score,critical,warnings,scanned_at")\
+        .eq("domain_id", domain_id)\
+        .order("scanned_at", desc=True)\
+        .limit(50)\
+        .execute()
+    return {"domain": d.data[0]["domain"], "scans": scans.data or []}
 
 
 # ── PDF report generation ──────────────────────────────────────────────────────
