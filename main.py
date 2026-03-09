@@ -4,7 +4,6 @@ SwarmHawk Backend API
 FastAPI backend for the CEE Cyber Intelligence SaaS platform.
 
 Endpoints:
-  POST /auth/google          — verify Google JWT, create/get user
   GET  /domains              — list user's domains
   POST /domains              — add domain (free)
   GET  /domains/{id}/report  — get scan report (free = partial, paid = full)
@@ -13,7 +12,7 @@ Endpoints:
   GET  /admin/stats          — admin overview
 
 Run locally:
-  pip install fastapi uvicorn supabase stripe python-jose httpx
+  pip install fastapi uvicorn supabase stripe httpx
   uvicorn main:app --reload --port 8000
 """
 
