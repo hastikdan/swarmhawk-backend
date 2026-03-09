@@ -462,44 +462,105 @@ def admin_stats(authorization: str = Header(None)):
     require_admin(authorization)
     db = get_db()
 
+    from datetime import timedelta
+
     users     = db.table("users").select("id,created_at,auth_type").execute()
-    domains   = db.table("domains").select("id,created_at").execute()
+    domains   = db.table("domains").select("id,domain,created_at").execute()
     purchases = db.table("purchases").select("amount_usd,paid_at").execute()
-    scans     = db.table("scans").select("id,scanned_at").execute()
+    # Fetch scans with risk data and checks for deeper metrics
+    scans     = db.table("scans").select("id,domain_id,risk_score,critical,warnings,checks,scanned_at").order("scanned_at", desc=True).limit(500).execute()
 
     now = datetime.now(timezone.utc)
 
     def within_days(rows, field, days):
-        from datetime import timedelta
         cutoff = (now - timedelta(days=days)).isoformat()
         return sum(1 for r in rows if r.get(field, "") >= cutoff)
 
-    revenue = sum(p.get("amount_usd", 0) or 0 for p in purchases.data)
-    google_users = sum(1 for u in users.data if u.get("auth_type") != "email")
+    revenue      = sum(p.get("amount_usd", 0) or 0 for p in purchases.data)
     email_users  = sum(1 for u in users.data if u.get("auth_type") == "email")
+
+    # Latest scan per domain
+    domain_latest: dict[str, dict] = {}
+    for s in scans.data:
+        did = s.get("domain_id")
+        if did and did not in domain_latest:
+            domain_latest[did] = s
+
+    scanned_domains = list(domain_latest.values())
+    scores = [s.get("risk_score") or 0 for s in scanned_domains]
+    avg_risk   = round(sum(scores) / len(scores), 1) if scores else 0
+    critical_d = sum(1 for s in scanned_domains if (s.get("risk_score") or 0) >= 70)
+    warning_d  = sum(1 for s in scanned_domains if 30 <= (s.get("risk_score") or 0) < 70)
+    clean_d    = sum(1 for s in scanned_domains if (s.get("risk_score") or 0) < 30)
+
+    # Check-type firing frequency across latest scans
+    check_counts: dict[str, dict] = {}
+    for s in scanned_domains:
+        raw = s.get("checks", []) or []
+        if isinstance(raw, str):
+            try: raw = json.loads(raw)
+            except: raw = []
+        for c in (raw if isinstance(raw, list) else []):
+            name = c.get("check", "unknown")
+            st   = c.get("status", "ok")
+            if name not in check_counts:
+                check_counts[name] = {"critical": 0, "warning": 0, "ok": 0, "error": 0}
+            check_counts[name][st] = check_counts[name].get(st, 0) + 1
+
+    # Top 10 riskiest domains
+    domain_map = {d["id"]: d["domain"] for d in domains.data}
+    top_risky = sorted(
+        [{"domain": domain_map.get(s["domain_id"], "?"), "risk_score": s.get("risk_score") or 0,
+          "critical": s.get("critical") or 0, "warnings": s.get("warnings") or 0,
+          "scanned_at": s.get("scanned_at", "")}
+         for s in scanned_domains],
+        key=lambda x: x["risk_score"], reverse=True
+    )[:10]
+
+    # Recent 20 scans for activity feed
+    recent_scans = []
+    for s in scans.data[:20]:
+        recent_scans.append({
+            "domain":     domain_map.get(s.get("domain_id", ""), "?"),
+            "risk_score": s.get("risk_score") or 0,
+            "critical":   s.get("critical") or 0,
+            "warnings":   s.get("warnings") or 0,
+            "scanned_at": s.get("scanned_at", ""),
+        })
 
     return {
         "users": {
             "total":      len(users.data),
-            "google":     google_users,
+            "google":     len(users.data) - email_users,
             "email":      email_users,
             "new_7d":     within_days(users.data, "created_at", 7),
             "new_30d":    within_days(users.data, "created_at", 30),
         },
         "domains": {
             "total":      len(domains.data),
+            "scanned":    len(scanned_domains),
             "new_7d":     within_days(domains.data, "created_at", 7),
             "new_30d":    within_days(domains.data, "created_at", 30),
         },
         "revenue": {
-            "total_eur":  round(revenue, 2),
+            "total_eur":   round(revenue, 2),
             "total_sales": len(purchases.data),
-            "new_7d":     within_days(purchases.data, "paid_at", 7),
+            "new_7d":      within_days(purchases.data, "paid_at", 7),
         },
         "scans": {
-            "total":      len(scans.data),
-            "last_7d":    within_days(scans.data, "scanned_at", 7),
+            "total":       len(scans.data),
+            "last_7d":     within_days(scans.data, "scanned_at", 7),
+            "last_24h":    within_days(scans.data, "scanned_at", 1),
         },
+        "risk": {
+            "avg_score":   avg_risk,
+            "critical":    critical_d,
+            "warning":     warning_d,
+            "clean":       clean_d,
+        },
+        "check_breakdown": check_counts,
+        "top_risky":       top_risky,
+        "recent_scans":    recent_scans,
     }
 
 
