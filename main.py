@@ -603,6 +603,91 @@ def get_me(authorization: str = Header(None)):
     }
 
 
+class UpdateProfileRequest(BaseModel):
+    name:             str | None = None
+    email:            str | None = None
+    current_password: str | None = None
+    new_password:     str | None = None
+
+
+@app.patch("/me")
+def update_profile(body: UpdateProfileRequest, authorization: str = Header(None)):
+    """Update current user's name, email, and/or password."""
+    import re as _re
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    row = db.table("users").select("*").eq("id", user["sub"]).execute()
+    if not row.data:
+        raise HTTPException(404, "User not found")
+    u = row.data[0]
+
+    updates: dict = {}
+
+    # ── Name ────────────────────────────────────────────────────────────────
+    if body.name is not None:
+        name = body.name.strip()
+        if not name:
+            raise HTTPException(400, "Name cannot be empty")
+        updates["name"] = name
+
+    # ── Email ────────────────────────────────────────────────────────────────
+    if body.email is not None:
+        email = body.email.strip().lower()
+        if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+            raise HTTPException(400, "Invalid email address")
+        if email != u["email"]:
+            taken = db.table("users").select("id").eq("email", email).execute()
+            if taken.data:
+                raise HTTPException(409, "Email already in use by another account")
+            updates["email"] = email
+
+    # ── Password ─────────────────────────────────────────────────────────────
+    if body.new_password is not None:
+        if len(body.new_password) < 6:
+            raise HTTPException(400, "New password must be at least 6 characters")
+        # Require current password to set a new one
+        if not body.current_password:
+            raise HTTPException(400, "Current password required to set a new password")
+        if u.get("password_hash") != hash_password(body.current_password):
+            raise HTTPException(401, "Current password is incorrect")
+        updates["password_hash"] = hash_password(body.new_password)
+
+    if not updates:
+        raise HTTPException(400, "Nothing to update")
+
+    db.table("users").update(updates).eq("id", user["sub"]).execute()
+
+    # Return fresh user record
+    fresh = db.table("users").select("id,email,name,avatar,auth_type,created_at").eq("id", user["sub"]).execute()
+    u2 = fresh.data[0]
+    return {
+        "id":       u2["id"],
+        "email":    u2["email"],
+        "name":     u2.get("name", ""),
+        "avatar":   u2.get("avatar", ""),
+        "auth_type": u2.get("auth_type", ""),
+        "created_at": u2.get("created_at", ""),
+    }
+
+
+@app.delete("/me")
+def delete_account(authorization: str = Header(None)):
+    """Delete the current user's account and all associated data."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    uid  = user["sub"]
+    # Delete all user data in order (domains cascade to scans/purchases via FK)
+    domains = db.table("domains").select("id").eq("user_id", uid).execute()
+    for d in (domains.data or []):
+        db.table("scans").delete().eq("domain_id", d["id"]).execute()
+        db.table("purchases").delete().eq("domain_id", d["id"]).execute()
+    db.table("domains").delete().eq("user_id", uid).execute()
+    db.table("sessions").delete().eq("user_id", uid).execute()
+    db.table("users").delete().eq("id", uid).execute()
+    return {"deleted": True}
+
+
 @app.get("/domains")
 def list_domains(authorization: str = Header(None)):
     """List all domains for the logged-in user."""
