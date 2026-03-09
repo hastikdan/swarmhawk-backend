@@ -620,6 +620,31 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
     }
 
 
+@app.delete("/domains/{domain_id}")
+def delete_domain(domain_id: str, authorization: str = Header(None)):
+    """Delete a domain and all its scans."""
+    user = get_user_from_header(authorization)
+    db = get_db()
+    domain = db.table("domains").select("id").eq("id", domain_id).eq("user_id", user["sub"]).execute()
+    if not domain.data:
+        raise HTTPException(404, "Domain not found")
+    db.table("domains").delete().eq("id", domain_id).execute()
+    return {"deleted": domain_id}
+
+
+@app.post("/domains/{domain_id}/rescan")
+def rescan_domain(domain_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Trigger a fresh scan for an existing domain."""
+    user = get_user_from_header(authorization)
+    db = get_db()
+    domain = db.table("domains").select("id,domain").eq("id", domain_id).eq("user_id", user["sub"]).execute()
+    if not domain.data:
+        raise HTTPException(404, "Domain not found")
+    d = domain.data[0]
+    background_tasks.add_task(run_scan_background, d["id"], d["domain"])
+    return {"status": "scanning", "message": f"Rescan started for {d['domain']}"}
+
+
 @app.get("/domains/{domain_id}/report")
 def get_report(domain_id: str, authorization: str = Header(None)):
     """
