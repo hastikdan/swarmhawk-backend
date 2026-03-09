@@ -127,6 +127,7 @@ class LoginRequest(BaseModel):
 class CheckoutRequest(BaseModel):
     domain_id: str
     domain: str
+    plan: str = "one_time"   # "one_time" ($10) | "annual" ($50/year subscription)
 
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
@@ -1109,89 +1110,173 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
 
 @app.post("/checkout")
 def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
-    """Create Stripe checkout session for full report ($10)."""
+    """
+    Create a Stripe Checkout session.
+    plan=one_time  → $10 one-time payment, unlocks full report permanently.
+    plan=annual    → $50/year subscription, monthly auto-scans + reports.
+    """
     user = get_user_from_header(authorization)
-    db = get_db()
+    db   = get_db()
 
-    # Verify domain belongs to user
-    domain = db.table("domains")\
+    if body.plan not in ("one_time", "annual"):
+        raise HTTPException(400, "plan must be 'one_time' or 'annual'")
+
+    domain_row = db.table("domains")\
         .select("id, domain")\
         .eq("id", body.domain_id)\
         .eq("user_id", user["sub"])\
         .single()\
         .execute()
 
-    if not domain.data:
-        raise HTTPException(status_code=404, detail="Domain not found")
+    if not domain_row.data:
+        raise HTTPException(404, "Domain not found")
+
+    meta = {
+        "user_id":   str(user["sub"]),
+        "domain_id": str(body.domain_id),
+        "domain":    body.domain,
+        "plan":      body.plan,
+    }
 
     try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{
-                "price_data": {
-                    "currency": "usd",
-                    "unit_amount": 1000,  # $10.00
-                    "product_data": {
-                        "name": f"Full Security Report — {body.domain}",
-                        "description": "15-check threat intelligence report + 1 year weekly monitoring",
+        if body.plan == "one_time":
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="payment",
+                line_items=[{
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": 1000,        # $10.00
+                        "product_data": {
+                            "name": f"Security Report — {body.domain}",
+                            "description": "Full 19-check security report with AI threat analysis. One-time purchase.",
+                        },
                     },
-                },
-                "quantity": 1,
-            }],
-            mode="payment",
-            success_url=f"{FRONTEND_URL}?payment=success&domain_id={body.domain_id}",
-            cancel_url=f"{FRONTEND_URL}?payment=cancelled",
-            metadata={
-                "user_id":   str(user["sub"]),
-                "domain_id": str(body.domain_id),
-                "domain":    body.domain,
-            },
-            customer_email=user.get("email", ""),
-        )
-        return {"checkout_url": session.url, "session_id": session.id}
+                    "quantity": 1,
+                }],
+                success_url=f"{FRONTEND_URL}?payment=success&domain_id={body.domain_id}",
+                cancel_url=f"{FRONTEND_URL}?payment=cancelled",
+                metadata=meta,
+                customer_email=user.get("email", ""),
+            )
+        else:  # annual subscription
+            # Use a pre-created Price ID if set, otherwise create dynamically
+            annual_price_id = os.getenv("STRIPE_ANNUAL_PRICE_ID", "")
+            if annual_price_id:
+                line_items = [{"price": annual_price_id, "quantity": 1}]
+            else:
+                # Dynamic price — works without pre-creating a product in dashboard
+                line_items = [{
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": 5000,        # $50.00
+                        "recurring": {"interval": "year"},
+                        "product_data": {
+                            "name": "SwarmHawk Annual — Security Monitoring",
+                            "description": f"Monthly automated scans + PDF reports for {body.domain}. Cancel anytime.",
+                        },
+                    },
+                    "quantity": 1,
+                }]
+
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="subscription",
+                line_items=line_items,
+                success_url=f"{FRONTEND_URL}?payment=success&domain_id={body.domain_id}",
+                cancel_url=f"{FRONTEND_URL}?payment=cancelled",
+                metadata=meta,
+                customer_email=user.get("email", ""),
+                subscription_data={"metadata": meta},
+            )
+
+        return {"checkout_url": session.url, "session_id": session.id, "plan": body.plan}
+
     except stripe.error.StripeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(400, str(e))
+
+
+def _record_purchase(db, user_id: str, domain_id: str, domain: str,
+                     session_id: str, amount_cents: int, plan: str,
+                     subscription_id: str | None = None):
+    """Insert/upsert a purchase record and queue a rescan."""
+    now = datetime.now(timezone.utc).isoformat()
+    db.table("purchases").insert({
+        "user_id":           user_id,
+        "domain_id":         domain_id,
+        "stripe_session_id": session_id,
+        "stripe_sub_id":     subscription_id,
+        "amount_usd":        amount_cents / 100,
+        "plan":              plan,
+        "paid_at":           now,
+    }).execute()
+    # Queue a full scan
+    db.table("domains").update({"full_scan_enabled": True}).eq("id", domain_id).execute()
+    print(f"[stripe] Purchase recorded: plan={plan} domain={domain} amount=${amount_cents/100:.2f}")
 
 
 @app.post("/webhook")
 async def stripe_webhook(request: Request):
     """
-    Stripe webhook — called automatically after successful payment.
-    Marks domain as paid in the database.
+    Stripe webhook endpoint.
+    Handles:
+      checkout.session.completed    — both one-time and initial subscription payment
+      invoice.payment_succeeded     — subscription renewal (trigger monthly rescan)
+      customer.subscription.deleted — subscription cancelled, downgrade to free
     """
-    payload = await request.body()
+    payload    = await request.body()
     sig_header = request.headers.get("stripe-signature", "")
 
     try:
-        event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
-        )
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Invalid webhook signature")
+        raise HTTPException(400, "Invalid webhook signature")
 
+    db = get_db()
+
+    # ── Initial payment (one-time or first subscription payment) ───────────────
     if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        metadata = session.get("metadata", {})
-
-        user_id   = metadata.get("user_id")
-        domain_id = metadata.get("domain_id")
-        domain    = metadata.get("domain")
+        session  = event["data"]["object"]
+        meta     = session.get("metadata", {})
+        user_id  = meta.get("user_id")
+        domain_id= meta.get("domain_id")
+        domain   = meta.get("domain", "")
+        plan     = meta.get("plan", "one_time")
 
         if user_id and domain_id:
-            db = get_db()
-            # Record purchase
-            db.table("purchases").insert({
-                "user_id":          user_id,
-                "domain_id":        domain_id,
-                "stripe_session_id": session["id"],
-                "amount_usd":       session.get("amount_total", 1000) / 100,
-                "paid_at":          datetime.now(timezone.utc).isoformat(),
-            }).execute()
+            sub_id = session.get("subscription")   # None for one-time
+            _record_purchase(
+                db, user_id, domain_id, domain,
+                session["id"],
+                session.get("amount_total") or (1000 if plan == "one_time" else 5000),
+                plan,
+                subscription_id=sub_id,
+            )
 
-            # Trigger full re-scan with all checks enabled
-            db.table("domains").update({
-                "full_scan_enabled": True
-            }).eq("id", domain_id).execute()
+    # ── Subscription renewal — queue a fresh scan each billing period ──────────
+    elif event["type"] == "invoice.payment_succeeded":
+        invoice = event["data"]["object"]
+        sub_id  = invoice.get("subscription")
+        # Only act on renewals (billing_reason = subscription_cycle), not first invoice
+        if invoice.get("billing_reason") == "subscription_cycle" and sub_id:
+            # Find the domain linked to this subscription
+            purchases = db.table("purchases").select("domain_id, domain, user_id")\
+                .eq("stripe_sub_id", sub_id).limit(1).execute()
+            if purchases.data:
+                p = purchases.data[0]
+                db.table("domains").update({"full_scan_enabled": True}).eq("id", p["domain_id"]).execute()
+                from threading import Thread
+                Thread(target=run_scan_background, args=(p["domain_id"], p.get("domain", "")), daemon=True).start()
+                print(f"[stripe] Subscription renewal scan queued for {p.get('domain')}")
+
+    # ── Subscription cancelled ────────────────────────────────────────────────
+    elif event["type"] == "customer.subscription.deleted":
+        sub = event["data"]["object"]
+        sub_id = sub.get("id")
+        if sub_id:
+            db.table("purchases").update({"cancelled_at": datetime.now(timezone.utc).isoformat()})\
+                .eq("stripe_sub_id", sub_id).execute()
+            print(f"[stripe] Subscription cancelled: {sub_id}")
 
     return {"received": True}
 
