@@ -86,6 +86,112 @@ from contextlib import asynccontextmanager
 
 SCANNER_AVAILABLE = False  # set True at startup if cee_scanner imports OK
 
+def _send_breach_monday():
+    """Every Monday: email each user a digest of new threats found across their domains."""
+    if not RESEND_API_KEY:
+        return
+    try:
+        from datetime import timedelta
+        import httpx as _hx
+        _db = get_admin_db()
+        now     = datetime.now(timezone.utc)
+        week_ago = (now - timedelta(days=7)).isoformat()
+
+        users = _db.table("users").select("id,email,name").execute()
+        sent  = 0
+        for u in (users.data or []):
+            uid   = u["id"]
+            email = u.get("email", "")
+            name  = u.get("name") or "there"
+            if not email:
+                continue
+            # Get all domains
+            domains = _db.table("domains").select("id,domain").eq("user_id", uid).execute()
+            if not domains.data:
+                continue
+            digest_rows = []
+            for d in domains.data:
+                # Latest scan vs scan from a week ago
+                scans = _db.table("scans").select("risk_score,critical,warnings,checks,scanned_at")\
+                    .eq("domain_id", d["id"]).order("scanned_at", desc=True).limit(2).execute()
+                if not scans.data:
+                    continue
+                latest = scans.data[0]
+                prev   = scans.data[1] if len(scans.data) > 1 else None
+                score  = latest.get("risk_score") or 0
+                prev_score = (prev.get("risk_score") or 0) if prev else score
+                delta  = score - prev_score
+
+                # Find new critical checks since last week
+                raw = latest.get("checks", []) or []
+                if isinstance(raw, str):
+                    try: raw = json.loads(raw)
+                    except: raw = []
+                new_crits = [c["title"] for c in raw
+                             if c.get("status") == "critical" and c.get("check") != "ai_summary"][:3]
+                if new_crits or abs(delta) >= 10 or score >= 50:
+                    digest_rows.append({
+                        "domain": d["domain"], "score": score,
+                        "delta": delta, "crits": new_crits,
+                    })
+
+            if not digest_rows:
+                continue
+
+            # Build email HTML
+            rows_html = ""
+            for r in sorted(digest_rows, key=lambda x: x["score"], reverse=True):
+                sc = r["score"]
+                c  = "#C0392B" if sc >= 70 else "#D4850A" if sc >= 40 else "#2ECC71"
+                delta_str = (f'<span style="color:#C0392B">▲+{r["delta"]}</span>' if r["delta"] > 0
+                             else f'<span style="color:#2ECC71">▼{r["delta"]}</span>' if r["delta"] < 0
+                             else '<span style="color:#888">±0</span>')
+                crits_html = ("".join(f"<li style='font-size:11px;color:#ccc'>{c}</li>"
+                                       for c in r["crits"]) if r["crits"] else "")
+                rows_html += f"""<tr>
+  <td style="padding:10px 12px;font-family:monospace;color:#fff;border-bottom:1px solid #1a1a2e">{r['domain']}</td>
+  <td style="padding:10px 12px;font-weight:700;color:{c};border-bottom:1px solid #1a1a2e">{sc} {delta_str}</td>
+  <td style="padding:10px 12px;border-bottom:1px solid #1a1a2e"><ul style="margin:0;padding-left:14px">{crits_html}</ul></td>
+</tr>"""
+
+            try:
+                _hx.post("https://api.resend.com/emails", headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                }, json={
+                    "from":    f"SwarmHawk <{FROM_EMAIL}>",
+                    "to":      [email],
+                    "subject": f"⚡ Your weekly security digest — {len(digest_rows)} domain{'s' if len(digest_rows)>1 else ''} need attention",
+                    "html":    f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;background:#0e0d12;color:#fff;max-width:600px;margin:0 auto;padding:24px">
+<div style="border-left:3px solid #CBFF00;padding-left:16px;margin-bottom:20px">
+  <strong style="font-family:monospace;font-size:16px;background:#CBFF00;color:#000;padding:4px 10px">SWARMHAWK</strong>
+  <p style="color:#aaa;margin:6px 0 0;font-size:13px">Weekly Security Digest · {now.strftime('%d %b %Y')}</p>
+</div>
+<p style="color:#ccc">Hi {name},</p>
+<p style="color:#ccc">Here's what SwarmHawk detected across your domains this week.</p>
+<table style="width:100%;border-collapse:collapse;background:#13121A;border-radius:8px;overflow:hidden">
+  <tr style="background:rgba(203,255,0,.08)">
+    <th style="padding:8px 12px;text-align:left;font-family:monospace;font-size:10px;color:#CBFF00;letter-spacing:1px">DOMAIN</th>
+    <th style="padding:8px 12px;text-align:left;font-family:monospace;font-size:10px;color:#CBFF00;letter-spacing:1px">RISK SCORE</th>
+    <th style="padding:8px 12px;text-align:left;font-family:monospace;font-size:10px;color:#CBFF00;letter-spacing:1px">NEW THREATS</th>
+  </tr>
+  {rows_html}
+</table>
+<p style="margin-top:20px"><a href="{SITE_URL}" style="background:#CBFF00;color:#000;padding:10px 20px;text-decoration:none;font-family:monospace;font-weight:700;border-radius:6px;font-size:12px">View Full Reports →</a></p>
+<hr style="border:none;border-top:1px solid #1a1a2e;margin:24px 0">
+<p style="font-size:11px;color:#555">SwarmHawk Security Intelligence · swarmhawk.eu · Unsubscribe by replying "unsubscribe"</p>
+</body></html>""",
+                }, timeout=15)
+                sent += 1
+            except Exception as e:
+                print(f"[breach-monday] Failed to email {email}: {e}")
+
+        print(f"[breach-monday] Sent weekly digest to {sent} users")
+    except Exception as e:
+        import traceback
+        print(f"[breach-monday] Error: {e}\n{traceback.format_exc()}")
+
+
 def _run_monthly_scans():
     """Daily job: scan any annual subscriber whose last scan is ≥30 days ago, then email PDF."""
     try:
@@ -145,6 +251,16 @@ async def lifespan(app):
         print("✓ Monthly scan scheduler started")
     except Exception as e:
         print(f"Monthly scheduler init failed: {e}")
+    # Weekly "Breach Monday" digest — every Monday 08:00 Prague
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler as _BGS2
+        _weekly_scheduler = _BGS2(timezone="Europe/Prague")
+        _weekly_scheduler.add_job(_send_breach_monday, "cron", day_of_week="mon",
+                                   hour=8, minute=0, id="breach_monday")
+        _weekly_scheduler.start()
+        print("✓ Breach Monday scheduler started")
+    except Exception as e:
+        print(f"Breach Monday scheduler init failed: {e}")
     yield
 
 app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
@@ -2406,3 +2522,291 @@ async def checkout_msp(body: MSPCheckoutRequest, authorization: str = Header(Non
         return {"url": session.url}
     except stripe.error.StripeError as e:
         raise HTTPException(400, str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DOMAIN DEATH PREDICTOR
+# Heuristic risk model → "73% chance of incident in 90 days"
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/domains/{domain_id}/death-predictor")
+def domain_death_predictor(domain_id: str, authorization: str = Header(None)):
+    """
+    Predict probability of security incident in next 90 days.
+    Model inputs: cert age, DNS age, risk trend, breach history, CVE exposure.
+    """
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    d = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found or not your domain")
+
+    scans = db.table("scans").select("risk_score,critical,warnings,checks,scanned_at")\
+        .eq("domain_id", domain_id).order("scanned_at", desc=True).limit(6).execute()
+    if not scans.data:
+        raise HTTPException(404, "No scan data yet — run a scan first")
+
+    latest    = scans.data[0]
+    risk      = latest.get("risk_score") or 0
+    criticals = latest.get("critical") or 0
+    warnings  = latest.get("warnings") or 0
+    raw       = latest.get("checks", []) or []
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except: raw = []
+    check_map = {c.get("check"): c for c in raw}
+
+    # Score factors (each adds to probability)
+    factors = []
+    prob    = 0.0
+
+    # 1. Risk trend (worsening = higher risk)
+    if len(scans.data) >= 2:
+        oldest = scans.data[-1].get("risk_score") or 0
+        trend  = risk - oldest
+        if trend > 20:
+            prob += 25; factors.append(("Risk trending up +{:.0f} pts over last {} scans".format(trend, len(scans.data)), 25))
+        elif trend > 10:
+            prob += 12; factors.append(("Risk trending up moderately".format(trend), 12))
+
+    # 2. Active CVEs
+    if check_map.get("cve", {}).get("status") == "critical":
+        prob += 20; factors.append(("Active CVEs detected on exposed services", 20))
+
+    # 3. Blocklist / malware
+    for chk, label in [("urlhaus","URLhaus malware listing"), ("spamhaus","Spamhaus DBL listing"),
+                        ("safebrowsing","Google Safe Browsing flag"), ("virustotal","VirusTotal detections")]:
+        if check_map.get(chk, {}).get("status") == "critical":
+            prob += 15; factors.append((label, 15))
+
+    # 4. SSL issues
+    ssl_status = check_map.get("ssl", {}).get("status", "ok")
+    if ssl_status == "critical":
+        prob += 18; factors.append(("SSL certificate expired or invalid", 18))
+    elif ssl_status == "warning":
+        prob += 8; factors.append(("SSL certificate expiring soon", 8))
+
+    # 5. Data breach exposure
+    if check_map.get("breach", {}).get("status") in ("critical", "warning"):
+        prob += 12; factors.append(("Credentials found in data breaches", 12))
+
+    # 6. High risk score baseline
+    if risk >= 70:
+        prob += 20; factors.append(("Overall risk score in critical range (≥70)", 20))
+    elif risk >= 50:
+        prob += 10; factors.append(("Overall risk score elevated (50-69)", 10))
+
+    # 7. Port exposure
+    if check_map.get("ip_intel", {}).get("status") in ("critical", "warning"):
+        prob += 8; factors.append(("Risky ports or blocklisted IPs detected", 8))
+
+    # Clamp to 95% max (never 100% certain)
+    prob = min(round(prob), 95)
+
+    # Category
+    if prob >= 70:
+        verdict = "VERY HIGH RISK"
+        color   = "#C0392B"
+        action  = "Immediate remediation required. Breach or outage highly likely within 90 days."
+    elif prob >= 45:
+        verdict = "ELEVATED RISK"
+        color   = "#D4850A"
+        action  = "Multiple unresolved vulnerabilities. Recommend addressing within 2-4 weeks."
+    elif prob >= 20:
+        verdict = "MODERATE RISK"
+        color   = "#D4850A"
+        action  = "Some exposure detected. Monitor closely and address warnings."
+    else:
+        verdict = "LOW RISK"
+        color   = "#2ECC71"
+        action  = "Domain is well-secured. Continue monitoring."
+
+    return {
+        "domain":      d.data[0]["domain"],
+        "probability": prob,
+        "verdict":     verdict,
+        "color":       color,
+        "action":      action,
+        "factors":     factors,
+        "horizon_days": 90,
+        "model_note":  "Heuristic model based on scan findings. Not a guarantee of security outcomes.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# LIVE ATTACK MAP — public endpoint for global threat map
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/map/data")
+def attack_map_data():
+    """
+    Public endpoint: returns anonymised threat counts per country for the live map.
+    No auth required. Aggregates scan data for the public map page.
+    """
+    db = get_admin_db()
+    try:
+        domains = db.table("domains").select("id,country").execute()
+        country_domain_ids: dict = {}
+        for d in (domains.data or []):
+            cc = (d.get("country") or "??").upper()[:2]
+            if cc not in country_domain_ids:
+                country_domain_ids[cc] = []
+            country_domain_ids[cc].append(d["id"])
+
+        # Get latest scans for risk breakdown per country
+        scans = db.table("scans").select("domain_id,risk_score,critical,scanned_at")\
+            .order("scanned_at", desc=True).limit(2000).execute()
+
+        # Map domain_id → latest scan
+        seen = set()
+        domain_scan: dict = {}
+        for s in (scans.data or []):
+            did = s.get("domain_id")
+            if did and did not in seen:
+                seen.add(did)
+                domain_scan[did] = s
+
+        # Aggregate per country
+        result = []
+        for cc, dids in country_domain_ids.items():
+            country_scans = [domain_scan[did] for did in dids if did in domain_scan]
+            if not country_scans:
+                continue
+            scores    = [s.get("risk_score") or 0 for s in country_scans]
+            criticals = sum(s.get("critical") or 0 for s in country_scans)
+            result.append({
+                "country":      cc,
+                "domains":      len(dids),
+                "scanned":      len(country_scans),
+                "avg_risk":     round(sum(scores) / len(scores), 1) if scores else 0,
+                "max_risk":     max(scores) if scores else 0,
+                "critical_findings": criticals,
+                "high_risk_domains": sum(1 for s in scores if s >= 70),
+            })
+
+        return {
+            "countries":    sorted(result, key=lambda x: x["avg_risk"], reverse=True),
+            "total_domains": sum(r["domains"] for r in result),
+            "total_scanned": sum(r["scanned"] for r in result),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        return {"countries": [], "error": str(e)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPETITOR INTELLIGENCE — track competitor domains with weekly diff
+# ══════════════════════════════════════════════════════════════════════════════
+
+class CompetitorRequest(BaseModel):
+    domain: str
+    label:  str = ""
+
+@app.post("/competitors")
+def add_competitor(body: CompetitorRequest, background_tasks: BackgroundTasks,
+                    authorization: str = Header(None)):
+    """Add a competitor domain to track. Scanned weekly with diff alerts."""
+    user   = get_user_from_header(authorization)
+    domain = body.domain.strip().lower().replace("https://","").replace("http://","").split("/")[0]
+    if not domain or "." not in domain:
+        raise HTTPException(400, "Invalid domain")
+
+    db = get_db()
+    existing = db.table("competitors").select("id").eq("user_id", user["sub"])\
+        .eq("domain", domain).execute()
+    if existing.data:
+        raise HTTPException(409, "Already tracking this competitor")
+
+    # Max 5 competitors per user (free), 20 paid
+    count = db.table("competitors").select("id", count="exact").eq("user_id", user["sub"]).execute()
+    paid  = db.table("purchases").select("id").eq("user_id", user["sub"])\
+        .is_("cancelled_at", "null").not_.is_("paid_at", "null").execute()
+    limit = 20 if paid.data else 5
+    if (count.count or 0) >= limit:
+        raise HTTPException(403, f"Competitor limit reached ({limit}). Upgrade for more.")
+
+    import uuid
+    cid = str(uuid.uuid4())
+    db.table("competitors").insert({
+        "id":         cid,
+        "user_id":    user["sub"],
+        "domain":     domain,
+        "label":      body.label or domain,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }).execute()
+
+    # Trigger first scan immediately
+    background_tasks.add_task(_scan_competitor, cid, domain)
+    return {"id": cid, "domain": domain, "status": "scanning"}
+
+
+@app.get("/competitors")
+def list_competitors(authorization: str = Header(None)):
+    """List tracked competitor domains with latest scan data."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    rows = db.table("competitors").select("*").eq("user_id", user["sub"])\
+        .order("created_at", desc=True).execute()
+
+    out = []
+    for c in (rows.data or []):
+        # Get last 2 scans for diff
+        scans = db.table("competitor_scans").select("risk_score,critical,warnings,scanned_at")\
+            .eq("competitor_id", c["id"]).order("scanned_at", desc=True).limit(2).execute()
+        latest = scans.data[0] if scans.data else None
+        prev   = scans.data[1] if len(scans.data) > 1 else None
+        out.append({
+            **c,
+            "risk_score":   latest["risk_score"] if latest else None,
+            "critical":     latest["critical"]   if latest else None,
+            "warnings":     latest["warnings"]   if latest else None,
+            "scanned_at":   latest["scanned_at"] if latest else None,
+            "prev_score":   prev["risk_score"]   if prev   else None,
+            "score_delta":  ((latest["risk_score"] or 0) - (prev["risk_score"] or 0)) if (latest and prev) else None,
+        })
+    return {"competitors": out}
+
+
+@app.delete("/competitors/{competitor_id}")
+def remove_competitor(competitor_id: str, authorization: str = Header(None)):
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    db.table("competitors").delete().eq("id", competitor_id).eq("user_id", user["sub"]).execute()
+    return {"deleted": competitor_id}
+
+
+def _scan_competitor(competitor_id: str, domain: str):
+    """Scan a competitor domain and store the result."""
+    if not SCANNER_AVAILABLE:
+        return
+    try:
+        from cee_scanner.checks import scan_domain
+        result = scan_domain(domain)
+        db = get_db()
+        import uuid
+        db.table("competitor_scans").insert({
+            "id":            str(uuid.uuid4()),
+            "competitor_id": competitor_id,
+            "risk_score":    result["risk_score"],
+            "critical":      result["critical"],
+            "warnings":      result["warnings"],
+            "checks":        result["checks"],
+            "scanned_at":    result["scanned_at"],
+        }).execute()
+        print(f"[competitor] Scanned {domain}: score={result['risk_score']}")
+    except Exception as e:
+        print(f"[competitor] Scan failed for {domain}: {e}")
+
+
+@app.get("/competitors/{competitor_id}/history")
+def competitor_history(competitor_id: str, authorization: str = Header(None)):
+    """Return scan history for a competitor domain."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    # Verify ownership
+    c = db.table("competitors").select("id,user_id,domain,label").eq("id", competitor_id).execute()
+    if not c.data or c.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found")
+    scans = db.table("competitor_scans").select("risk_score,critical,warnings,scanned_at")\
+        .eq("competitor_id", competitor_id).order("scanned_at", desc=True).limit(52).execute()
+    return {"competitor": c.data[0], "history": scans.data or []}
