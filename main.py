@@ -754,12 +754,15 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     else:
         visible_checks = [c for c in checks if c.get("check") in FREE_CHECKS]
 
+    non_ai = [c for c in visible_checks if c.get("check") != "ai_summary"]
     return {
         "domain":      d["domain"],
         "risk_score":  latest["risk_score"],
         "scanned_at":  latest["scanned_at"],
         "paid":        is_paid,
         "checks":      visible_checks,
+        "critical":    sum(1 for c in non_ai if c.get("status") == "critical"),
+        "warnings":    sum(1 for c in non_ai if c.get("status") == "warning"),
         "locked_count": len(checks) - len(visible_checks) if not is_paid else 0,
     }
 
