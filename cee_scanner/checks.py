@@ -785,6 +785,12 @@ def check_iac(domain: str) -> CheckResult:
     return _check_iac(domain)
 
 
+def check_ip_intel(domain: str) -> CheckResult:
+    """IP Intelligence — resolve domain to IPs and check reputation, blocklists, Shodan, AbuseIPDB."""
+    from cee_scanner.skills.ip_intel import check_ip_intel as _check_ip_intel
+    return _check_ip_intel(domain)
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -807,6 +813,8 @@ ALL_CHECKS = [
     check_sca,                  # exposed dependency manifests + NVD CVEs
     check_dast,                 # admin panels, API docs, open redirects
     check_iac,                  # Terraform state, K8s configs, CI/CD files
+    # ── IP Intelligence ──
+    check_ip_intel,             # IP reputation, blocklists, Shodan, AbuseIPDB, co-hosted domains
 ]
 
 
