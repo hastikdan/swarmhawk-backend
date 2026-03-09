@@ -779,6 +779,249 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     }
 
 
+# ── PDF report generation ──────────────────────────────────────────────────────
+
+def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -> bytes:
+    """Build a PDF security report and return raw bytes."""
+    from fpdf import FPDF
+
+    STATUS_EMOJI = {"critical": "CRITICAL", "warning": "WARNING", "ok": "OK", "error": "ERROR"}
+    STATUS_COLOR = {
+        "critical": (192, 57,  43),
+        "warning":  (212, 133, 10),
+        "ok":       (26,  122, 74),
+        "error":    (100, 100, 100),
+    }
+
+    non_ai = [c for c in checks if c.get("check") != "ai_summary"]
+    criticals = sum(1 for c in non_ai if c.get("status") == "critical")
+    warnings  = sum(1 for c in non_ai if c.get("status") == "warning")
+
+    try:
+        from dateutil import parser as _dtp
+        scan_date = _dtp.parse(scanned_at).strftime("%d %b %Y, %H:%M UTC")
+    except Exception:
+        scan_date = scanned_at[:10] if scanned_at else "—"
+
+    pdf = FPDF()
+    pdf.set_margins(20, 20, 20)
+    pdf.add_page()
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    pdf.set_fill_color(10, 10, 15)
+    pdf.rect(0, 0, 210, 35, style="F")
+    pdf.set_xy(20, 10)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(203, 255, 0)
+    pdf.cell(0, 8, "SWARMHAWK — Security Report", ln=True)
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 5, f"Generated {scan_date}  |  CEE Cybersecurity Intelligence", ln=True)
+
+    pdf.set_y(40)
+
+    # ── Domain + score ──────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 20)
+    score_col = (192, 57, 43) if risk_score >= 60 else (212, 133, 10) if risk_score >= 30 else (26, 122, 74)
+    pdf.set_text_color(*score_col)
+    pdf.cell(0, 10, f"Risk Score: {risk_score}/100", ln=True)
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.set_text_color(30, 30, 30)
+    pdf.cell(0, 8, domain, ln=True)
+    pdf.ln(2)
+
+    # ── Summary pills ───────────────────────────────────────────────────────
+    pdf.set_font("Helvetica", "", 10)
+    pdf.set_text_color(80, 80, 80)
+    pdf.cell(0, 6, f"Findings: {criticals} Critical  |  {warnings} Warnings  |  {len(non_ai)} Checks Total", ln=True)
+    pdf.ln(4)
+
+    # ── Horizontal rule ─────────────────────────────────────────────────────
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(20, pdf.get_y(), 190, pdf.get_y())
+    pdf.ln(4)
+
+    # ── Checks table ────────────────────────────────────────────────────────
+    CHECK_LABELS = {
+        "ssl": "SSL/TLS", "headers": "Security Headers", "dns": "DNS",
+        "http_redirect": "HTTPS Redirect", "breach": "Breach Exposure",
+        "typosquat": "Typosquat", "response_time": "Response Time",
+        "email_security": "Email Security", "whois": "WHOIS / RDAP",
+        "urlhaus": "URLhaus Malware", "spamhaus": "Spamhaus DBL",
+        "safebrowsing": "Safe Browsing", "virustotal": "VirusTotal",
+        "cve": "CVE Scan", "sast": "SAST — Source Exposure",
+        "sca": "SCA — Dependency CVEs", "dast": "DAST — App Testing",
+        "iac": "IaC — Config Exposure", "ip_intel": "IP Intelligence",
+    }
+
+    for c in non_ai:
+        status = c.get("status", "ok")
+        label  = CHECK_LABELS.get(c.get("check", ""), c.get("check", "").replace("_", " ").upper())
+        title  = c.get("title", "")
+        detail = c.get("detail", "")
+
+        color = STATUS_COLOR.get(status, (100, 100, 100))
+
+        # Status badge
+        pdf.set_fill_color(*color)
+        pdf.set_text_color(255, 255, 255)
+        pdf.set_font("Helvetica", "B", 7)
+        badge = STATUS_EMOJI.get(status, status.upper())
+        pdf.cell(18, 6, badge, fill=True, align="C")
+        pdf.set_x(pdf.get_x() + 2)
+
+        # Check name
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.cell(60, 6, label[:30])
+
+        # Title
+        pdf.set_font("Helvetica", "", 9)
+        pdf.set_text_color(60, 60, 60)
+        pdf.multi_cell(0, 6, title[:120], ln=True)
+
+        # Detail (for critical/warning only — skip ok to keep PDF short)
+        if detail and status in ("critical", "warning"):
+            pdf.set_x(22)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(100, 100, 100)
+            # Limit detail to 3 lines
+            short_detail = detail.replace("\n", " ")[:300]
+            pdf.multi_cell(168, 5, short_detail, ln=True)
+
+        pdf.ln(1)
+        if pdf.get_y() > 270:   # page break guard
+            pdf.add_page()
+
+    # ── Footer ──────────────────────────────────────────────────────────────
+    pdf.ln(6)
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(20, pdf.get_y(), 190, pdf.get_y())
+    pdf.ln(3)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(150, 150, 150)
+    pdf.cell(0, 5, "SwarmHawk · CEE Cybersecurity Intelligence · www.swarmhawk.com", ln=True, align="C")
+    pdf.cell(0, 5, "This report is confidential and intended for the named recipient only.", ln=True, align="C")
+
+    return bytes(pdf.output())
+
+
+class SendReportRequest(BaseModel):
+    domain_id: str
+    email: str
+
+
+@app.post("/send-report")
+def send_report_email(body: SendReportRequest, authorization: str = Header(None)):
+    """Generate PDF report for a domain and email it to the requested address."""
+    import re as _re
+    import base64
+
+    user = get_user_from_header(authorization)
+
+    if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', body.email):
+        raise HTTPException(400, "Invalid email address")
+
+    if not RESEND_API_KEY:
+        raise HTTPException(503, "Email service not configured (RESEND_API_KEY missing)")
+
+    db = get_db()
+
+    # Fetch domain + latest scan (user must own the domain)
+    domain_row = db.table("domains")\
+        .select("*, scans(*), purchases(*)")\
+        .eq("id", body.domain_id)\
+        .eq("user_id", user["sub"])\
+        .single()\
+        .execute()
+
+    if not domain_row.data:
+        raise HTTPException(404, "Domain not found")
+
+    d = domain_row.data
+    scans = sorted(d.get("scans", []), key=lambda s: s["scanned_at"], reverse=True)
+    if not scans:
+        raise HTTPException(400, "No scan results yet — run a scan first")
+
+    latest = scans[0]
+    raw_checks = latest.get("checks", [])
+    if isinstance(raw_checks, str):
+        try:
+            raw_checks = json.loads(raw_checks)
+        except Exception:
+            raw_checks = []
+    checks = raw_checks if isinstance(raw_checks, list) else []
+
+    risk_score = latest.get("risk_score") or 0
+    scanned_at = latest.get("scanned_at", "")
+
+    # Generate PDF
+    try:
+        pdf_bytes = _generate_pdf(d["domain"], risk_score, scanned_at, checks)
+    except Exception as e:
+        raise HTTPException(500, f"PDF generation failed: {e}")
+
+    pdf_b64 = base64.b64encode(pdf_bytes).decode()
+    filename = f"swarmhawk-report-{d['domain']}-{scanned_at[:10]}.pdf"
+
+    score_label = "HIGH RISK" if risk_score >= 60 else "MEDIUM RISK" if risk_score >= 30 else "LOW RISK"
+    non_ai = [c for c in checks if c.get("check") != "ai_summary"]
+    criticals = sum(1 for c in non_ai if c.get("status") == "critical")
+    warnings  = sum(1 for c in non_ai if c.get("status") == "warning")
+
+    email_html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
+      <div style="margin-bottom:28px">
+        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+      </div>
+      <h2 style="color:#fff;margin-bottom:4px">Security Report: {d['domain']}</h2>
+      <p style="color:#888;font-size:13px;margin-bottom:24px">Scanned {scanned_at[:10]}</p>
+      <div style="background:#111;border:1px solid #222;border-radius:8px;padding:20px;margin-bottom:24px;display:flex;gap:24px">
+        <div style="text-align:center">
+          <div style="font-size:32px;font-weight:700;color:{'#c0392b' if risk_score>=60 else '#d4850a' if risk_score>=30 else '#1a7a4a'}">{risk_score}</div>
+          <div style="font-size:11px;color:#888;font-family:monospace">{score_label}</div>
+        </div>
+        <div style="border-left:1px solid #222;padding-left:24px">
+          <div style="color:#c0392b;font-weight:700">{criticals} Critical</div>
+          <div style="color:#d4850a;font-weight:700">{warnings} Warnings</div>
+          <div style="color:#888;font-size:12px;margin-top:4px">{len(non_ai)} checks run</div>
+        </div>
+      </div>
+      <p style="color:#aaa;font-size:13px;line-height:1.6">
+        Your full security report for <strong style="color:#fff">{d['domain']}</strong> is attached as a PDF.
+        It includes all check results, findings, and remediation recommendations.
+      </p>
+      <p style="color:#555;font-size:11px;margin-top:32px">
+        SwarmHawk · CEE Cybersecurity Intelligence<br>
+        This report is confidential and intended for the named recipient only.
+      </p>
+    </div>
+    """
+
+    try:
+        import httpx as _httpx
+        resp = _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    f"SwarmHawk Reports <{FROM_EMAIL}>",
+                "to":      [body.email],
+                "subject": f"Security Report: {d['domain']} — {score_label} ({risk_score}/100)",
+                "html":    email_html,
+                "attachments": [{"filename": filename, "content": pdf_b64}],
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(502, f"Email send failed: {resp.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Email delivery failed: {e}")
+
+    return {"sent": True, "to": body.email, "domain": d["domain"]}
+
+
 @app.post("/checkout")
 def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     """Create Stripe checkout session for full report ($10)."""

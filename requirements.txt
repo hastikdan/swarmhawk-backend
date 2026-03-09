@@ -9,3 +9,5 @@ requests==2.31.0
 apscheduler==3.10.4
 resend==0.8.0
 anthropic>=0.25.0
+fpdf2>=2.7.0
+python-dateutil>=2.8.0
