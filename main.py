@@ -224,6 +224,156 @@ def send_confirmation_email(to_email: str, name: str, token: str):
         print(f"[auth] Failed to send confirmation email: {e}")
 
 
+def send_welcome_email(to_email: str, name: str):
+    """Send welcome email after successful registration."""
+    if not RESEND_API_KEY:
+        return
+    dashboard_url = SITE_URL
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
+      <div style="margin-bottom:24px">
+        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+      </div>
+      <h2 style="color:#fff;margin-bottom:8px">Welcome, {name} 👋</h2>
+      <p style="color:#888;line-height:1.7;margin-bottom:20px">
+        Your SwarmHawk account is active. Here's what happens next:
+      </p>
+      <div style="background:#111;border-radius:8px;padding:20px;margin-bottom:24px">
+        <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">1. Add your domain</span><br>
+          <span style="color:#888;font-size:13px">Go to your dashboard → Domains → Add Domain. We'll run 19 security checks automatically.</span></div>
+        <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">2. Get your free report</span><br>
+          <span style="color:#888;font-size:13px">Your free scan includes SSL, DNS, breach detection, malware checks, and more.</span></div>
+        <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">3. Upgrade for full intelligence</span><br>
+          <span style="color:#888;font-size:13px">Full 19-check report with AI threat analysis for <strong style="color:#fff">$10 one-time</strong>, or monthly scans + PDF reports for <strong style="color:#fff">$50/year</strong>.</span></div>
+        <div><span style="color:#cbff00;font-weight:700">4. NIS2 compliance</span><br>
+          <span style="color:#888;font-size:13px">Your reports serve as documented evidence of regular security monitoring required under NIS2.</span></div>
+      </div>
+      <a href="{dashboard_url}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 28px;border-radius:5px;text-decoration:none">
+        Open Dashboard →
+      </a>
+      <p style="color:#555;font-size:12px;margin-top:28px">SwarmHawk · CEE Cybersecurity Intelligence · swarmhawk.com</p>
+    </div>
+    """
+    try:
+        import httpx as _httpx
+        _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": f"SwarmHawk <{FROM_EMAIL}>", "to": [to_email],
+                  "subject": f"Welcome to SwarmHawk, {name}! 🔒", "html": html},
+            timeout=10,
+        )
+        print(f"[auth] Welcome email sent to {to_email}")
+    except Exception as e:
+        print(f"[auth] Failed to send welcome email: {e}")
+
+
+def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
+                     new_threats: list[str]):
+    """Send risk-change or new-threat alert email."""
+    if not RESEND_API_KEY:
+        return
+    delta = new_score - old_score
+    subject = f"⚠ Alert: {domain} risk {'increased' if delta > 0 else 'changed'} → {new_score}/100"
+    threat_rows = "".join(
+        f'<li style="color:#E74C3C;margin-bottom:4px">{t}</li>' for t in new_threats
+    )
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
+      <div style="margin-bottom:20px">
+        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+      </div>
+      <h2 style="color:#E74C3C;margin-bottom:6px">Security Alert</h2>
+      <h3 style="color:#fff;font-weight:400;margin-bottom:20px">{domain}</h3>
+      <div style="background:#1a0a0a;border:1px solid rgba(192,57,43,.4);border-radius:8px;padding:20px;margin-bottom:20px">
+        <div style="display:flex;gap:24px;align-items:center;margin-bottom:{'16px' if new_threats else '0'}">
+          <div style="text-align:center">
+            <div style="font-size:28px;font-weight:700;color:#888">{old_score}</div>
+            <div style="font-size:10px;color:#555;font-family:monospace">PREVIOUS</div>
+          </div>
+          <div style="font-size:24px;color:#E74C3C">→</div>
+          <div style="text-align:center">
+            <div style="font-size:28px;font-weight:700;color:#E74C3C">{new_score}</div>
+            <div style="font-size:10px;color:#555;font-family:monospace">NOW</div>
+          </div>
+        </div>
+        {f'<ul style="margin:0;padding-left:18px">{threat_rows}</ul>' if new_threats else ""}
+      </div>
+      <p style="color:#888;font-size:13px;margin-bottom:20px">
+        Log in to your dashboard to view the full report and remediation recommendations.
+      </p>
+      <a href="{SITE_URL}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">
+        View Full Report →
+      </a>
+      <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · CEE Cybersecurity Intelligence</p>
+    </div>
+    """
+    try:
+        import httpx as _httpx
+        _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": f"SwarmHawk <{FROM_EMAIL}>", "to": [to_email],
+                  "subject": subject, "html": html},
+            timeout=10,
+        )
+        print(f"[alert] Alert sent to {to_email} for {domain}: {old_score}→{new_score}")
+    except Exception as e:
+        print(f"[alert] Failed to send alert: {e}")
+
+
+def send_monthly_pdf_email(to_email: str, domain: str, risk_score: int,
+                           scanned_at: str, checks: list):
+    """Send monthly PDF report email to subscriber."""
+    if not RESEND_API_KEY:
+        return
+    try:
+        import base64
+        pdf_bytes = _generate_pdf(domain, risk_score, scanned_at, checks)
+        pdf_b64   = base64.b64encode(pdf_bytes).decode()
+        filename  = f"swarmhawk-monthly-{domain}-{scanned_at[:10]}.pdf"
+        score_col = "#C0392B" if risk_score >= 60 else "#D4850A" if risk_score >= 30 else "#1A7A4A"
+        non_ai    = [c for c in checks if c.get("check") != "ai_summary"]
+        crits     = sum(1 for c in non_ai if c.get("status") == "critical")
+        warns     = sum(1 for c in non_ai if c.get("status") == "warning")
+        html = f"""
+        <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
+          <div style="margin-bottom:20px">
+            <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+          </div>
+          <h2 style="color:#fff;margin-bottom:4px">Monthly Security Report</h2>
+          <p style="color:#888;font-size:13px;margin-bottom:20px">{domain} · {scanned_at[:10]}</p>
+          <div style="background:#111;border-radius:8px;padding:20px;margin-bottom:20px;display:flex;gap:24px">
+            <div style="text-align:center">
+              <div style="font-size:32px;font-weight:700;color:{score_col}">{risk_score}</div>
+              <div style="font-size:10px;color:#555;font-family:monospace">RISK SCORE</div>
+            </div>
+            <div style="border-left:1px solid #222;padding-left:20px">
+              <div style="color:#C0392B;font-weight:700">{crits} Critical</div>
+              <div style="color:#D4850A;font-weight:700">{warns} Warnings</div>
+              <div style="color:#888;font-size:12px;margin-top:4px">{len(non_ai)} checks run</div>
+            </div>
+          </div>
+          <p style="color:#aaa;font-size:13px;margin-bottom:20px">Your monthly security report is attached. It includes all check results and remediation recommendations.</p>
+          <a href="{SITE_URL}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">Open Dashboard →</a>
+          <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · CEE Cybersecurity Intelligence · Cancel anytime at swarmhawk.com</p>
+        </div>
+        """
+        import httpx as _httpx
+        _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={"from": f"SwarmHawk Reports <{FROM_EMAIL}>", "to": [to_email],
+                  "subject": f"Monthly Security Report: {domain} — {scanned_at[:10]}",
+                  "html": html,
+                  "attachments": [{"filename": filename, "content": pdf_b64}]},
+            timeout=20,
+        )
+        print(f"[monthly] PDF report sent to {to_email} for {domain}")
+    except Exception as e:
+        print(f"[monthly] Failed to send monthly PDF: {e}")
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -306,6 +456,7 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(
         send_confirmation_email, body.email.lower(), body.username.strip(), verification_token
     )
+    background_tasks.add_task(send_welcome_email, body.email.lower(), body.username.strip())
 
     # Add first domain if provided
     first_domain = None
@@ -758,6 +909,20 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
     if existing.data:
         raise HTTPException(status_code=409, detail="Domain already added")
 
+    # Free tier: 1 domain max unless user has an active paid plan
+    domain_count = db.table("domains").select("id", count="exact").eq("user_id", user["sub"]).execute()
+    if (domain_count.count or 0) >= 1:
+        paid = db.table("purchases").select("id")\
+            .eq("user_id", user["sub"])\
+            .is_("cancelled_at", "null")\
+            .not_.is_("paid_at", "null")\
+            .execute()
+        if not paid.data:
+            raise HTTPException(
+                status_code=403,
+                detail="Free accounts are limited to 1 domain. Upgrade to Annual ($50/year) to monitor unlimited domains."
+            )
+
     # Insert domain
     result = db.table("domains").insert({
         "user_id":    user["sub"],
@@ -1108,6 +1273,35 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
     return {"sent": True, "to": body.email, "domain": d["domain"]}
 
 
+@app.get("/billing-portal")
+def billing_portal(authorization: str = Header(None)):
+    """Return a Stripe Customer Portal URL so users can manage subscriptions and payment methods."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured")
+
+    # Find a Stripe session belonging to this user
+    purchases = db.table("purchases").select("stripe_session_id")\
+        .eq("user_id", user["sub"]).not_.is_("stripe_session_id", "null").limit(1).execute()
+
+    if not purchases.data:
+        raise HTTPException(400, "No billing history found — purchase a plan first")
+
+    try:
+        session    = stripe.checkout.Session.retrieve(purchases.data[0]["stripe_session_id"])
+        customer   = session.customer
+        if not customer:
+            raise HTTPException(400, "No Stripe customer record found")
+        portal = stripe.billing_portal.Session.create(
+            customer=customer, return_url=FRONTEND_URL
+        )
+        return {"url": portal.url}
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/checkout")
 def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     """
@@ -1373,6 +1567,49 @@ def run_scan_background(domain_id: str, domain: str):
             "scanned_at": result["scanned_at"],
         }).execute()
         print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}, ai={'yes' if ai_text else 'no'}")
+
+        # Look up domain owner
+        domain_row = db.table("domains").select("user_id").eq("id", domain_id).execute()
+        user_id    = domain_row.data[0]["user_id"] if domain_row.data else None
+        user_row   = db.table("users").select("email").eq("id", user_id).execute() if user_id else None
+        user_email = user_row.data[0]["email"] if (user_row and user_row.data) else None
+
+        if user_email:
+            # ── Alert: risk spike or new critical threats ────────────────────
+            prev_scans = db.table("scans").select("risk_score,checks")\
+                .eq("domain_id", domain_id).order("scanned_at", desc=True).limit(2).execute()
+            if len(prev_scans.data) >= 2:
+                prev       = prev_scans.data[1]  # second-most-recent
+                prev_score = prev.get("risk_score") or 0
+                new_score  = result["risk_score"]
+                prev_raw   = prev.get("checks", [])
+                if isinstance(prev_raw, str):
+                    try: prev_raw = json.loads(prev_raw)
+                    except: prev_raw = []
+                prev_checks = {c["check"]: c["status"] for c in prev_raw}
+                THREAT_CHECKS = {"urlhaus", "spamhaus", "virustotal", "safebrowsing"}
+                new_threats = [
+                    c["title"] for c in result["checks"]
+                    if c.get("check") in THREAT_CHECKS
+                    and c.get("status") == "critical"
+                    and prev_checks.get(c.get("check")) != "critical"
+                ]
+                if new_score - prev_score >= 15 or new_threats:
+                    from threading import Thread
+                    Thread(target=send_alert_email,
+                           args=(user_email, domain, prev_score, new_score, new_threats),
+                           daemon=True).start()
+
+            # ── Monthly PDF: send to annual subscribers ──────────────────────
+            active_sub = db.table("purchases").select("id")\
+                .eq("user_id", user_id).eq("plan", "annual")\
+                .is_("cancelled_at", "null").not_.is_("paid_at", "null").execute()
+            if active_sub.data:
+                from threading import Thread
+                Thread(target=send_monthly_pdf_email,
+                       args=(user_email, domain, result["risk_score"],
+                             result["scanned_at"], result["checks"]),
+                       daemon=True).start()
     except Exception as e:
         import traceback
         print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
