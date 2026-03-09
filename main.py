@@ -858,16 +858,85 @@ async def stripe_webhook(request: Request):
 
 # ── Background scan ───────────────────────────────────────────────────────────
 
+def _generate_ai_summary(domain: str, result: dict) -> str | None:
+    """Call Anthropic to generate a 5-section Intelligence Report for the scan."""
+    AKEY = os.getenv("ANTHROPIC_API_KEY", "")
+    if not AKEY:
+        return None
+    checks = result.get("checks", [])
+    critical = [c for c in checks if c.get("status") == "critical"]
+    warnings = [c for c in checks if c.get("status") == "warning"]
+
+    def fmt(items):
+        return "\n".join(f"  - {c['check']}: {c['title']}" for c in items[:6])
+
+    prompt = (
+        f"Domain: {domain}\n"
+        f"Risk score: {result['risk_score']}/100\n"
+        f"Critical findings ({len(critical)}):\n{fmt(critical) or '  none'}\n"
+        f"Warnings ({len(warnings)}):\n{fmt(warnings) or '  none'}\n\n"
+        "Write a cybersecurity Intelligence Report with exactly these 5 sections. "
+        "Use ONLY the following format — do not add any other text:\n\n"
+        "1. Executive Summary\n\n"
+        "<2-3 sentence overview of overall risk level and top concern>\n\n"
+        "2. Critical Findings\n\n"
+        "- <finding 1>\n- <finding 2>\n- <finding 3>\n\n"
+        "3. Threat Scenarios\n\n"
+        "- <realistic attack scenario 1>\n- <realistic attack scenario 2>\n- <realistic attack scenario 3>\n\n"
+        "4. Recommendations\n\n"
+        "- <specific action 1 with concrete detail>\n"
+        "- <specific action 2 with concrete detail>\n"
+        "- <specific action 3 with concrete detail>\n"
+        "- <specific action 4 with concrete detail>\n"
+        "- <specific action 5 with concrete detail>\n\n"
+        "5. Intelligence Notes\n\n"
+        "<1-2 sentences about hosting, CDN, architecture, or NIS2 compliance context>"
+    )
+    try:
+        import requests as req
+        r = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": AKEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 700,
+                "system": "You are a cybersecurity analyst. Output only the report text in the exact format requested. No markdown, no backticks, no extra commentary.",
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=25,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return data["content"][0]["text"] if data.get("content") else None
+    except Exception as e:
+        print(f"AI summary generation failed for {domain}: {e}")
+    return None
+
+
 def run_scan_background(domain_id: str, domain: str):
     """Run scanner in background and save results to DB."""
     if not SCANNER_AVAILABLE:
         print(f"Scan skipped for {domain}: cee_scanner not installed on this server")
         return
-    if not SCANNER_AVAILABLE:
-        raise HTTPException(503, "Scanner not available on this server — deploy cee_scanner/ into backend repo root")
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
+
+        # Generate AI Intelligence Report (requires ANTHROPIC_API_KEY env var)
+        ai_text = _generate_ai_summary(domain, result)
+        if ai_text:
+            result["checks"].append({
+                "check": "ai_summary",
+                "status": "ok",
+                "title": "AI Intelligence Report",
+                "detail": ai_text,
+                "score_impact": 0,
+            })
+
         db = get_db()
         # Pass list directly — NOT json.dumps — so supabase stores it as jsonb not a string
         db.table("scans").insert({
@@ -878,7 +947,7 @@ def run_scan_background(domain_id: str, domain: str):
             "checks":     result["checks"],
             "scanned_at": result["scanned_at"],
         }).execute()
-        print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}")
+        print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}, ai={'yes' if ai_text else 'no'}")
     except Exception as e:
         import traceback
         print(f"Background scan failed for {domain}: {e}\n{traceback.format_exc()}")
