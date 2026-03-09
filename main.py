@@ -40,6 +40,7 @@ SUPABASE_SERVICE_KEY= os.getenv("SUPABASE_SERVICE_KEY", "")  # service_role key 
 STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY", "")   # sk_live_... or sk_test_...
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
 STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stripe dashboard
+STRIPE_MSP_PRICE_ID = os.getenv("STRIPE_MSP_PRICE_ID", "")  # $200/yr — 10-domain MSP plan
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
@@ -1998,3 +1999,410 @@ async def public_scan(body: PublicScanRequest):
         }
     except Exception as e:
         raise HTTPException(500, f"Scan failed: {str(e)[:200]}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVELOPER API  — /api/v1/*
+# Rate: 10 free scans/month per key. Paid: unlimited via annual plan.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _resolve_api_key(api_key: str) -> dict:
+    """Return user row for a valid API key. Raises 401/429 on failure."""
+    if not api_key:
+        raise HTTPException(401, "Missing X-API-Key header")
+    db = get_db()
+    row = db.table("api_keys").select("user_id, calls_this_month, limit_per_month, active")\
+        .eq("key", api_key).execute()
+    if not row.data:
+        raise HTTPException(401, "Invalid API key")
+    r = row.data[0]
+    if not r.get("active", True):
+        raise HTTPException(403, "API key disabled")
+    limit = r.get("limit_per_month") or 10
+    used  = r.get("calls_this_month") or 0
+    if used >= limit:
+        raise HTTPException(429, f"Monthly API limit reached ({limit} calls). Upgrade at swarmhawk.eu")
+    return r
+
+
+@app.post("/api/v1/scan")
+async def api_scan(request: Request, background_tasks: BackgroundTasks):
+    """
+    Developer API: trigger a full domain scan and return results.
+    Pass API key via X-API-Key header.
+
+    Body: { "domain": "example.com" }
+    Returns: { "domain", "risk_score", "critical", "warnings", "checks", "scanned_at" }
+    """
+    api_key = request.headers.get("X-API-Key", "")
+    user    = _resolve_api_key(api_key)
+    body    = await request.json()
+    domain  = (body.get("domain") or "").strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
+    if not domain or "." not in domain:
+        raise HTTPException(400, "Invalid domain")
+
+    if not SCANNER_AVAILABLE:
+        raise HTTPException(503, "Scanner not available on this instance")
+
+    # Increment usage counter
+    db = get_db()
+    db.table("api_keys").update({"calls_this_month": (user.get("calls_this_month") or 0) + 1})\
+        .eq("key", api_key).execute()
+
+    try:
+        from cee_scanner.checks import scan_domain
+        result = scan_domain(domain)
+        ai_text = _generate_ai_summary(domain, result)
+        if ai_text:
+            result["checks"].append({
+                "check": "ai_summary", "status": "ok",
+                "title": "AI Intelligence Report", "detail": ai_text, "score_impact": 0,
+            })
+        return {
+            "domain":     domain,
+            "risk_score": result["risk_score"],
+            "critical":   result["critical"],
+            "warnings":   result["warnings"],
+            "checks":     result["checks"],
+            "scanned_at": result["scanned_at"],
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Scan failed: {str(e)[:200]}")
+
+
+@app.post("/api/v1/keys")
+def create_api_key(authorization: str = Header(None)):
+    """Generate a new API key for the authenticated user."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    existing = db.table("api_keys").select("key,calls_this_month,limit_per_month,created_at")\
+        .eq("user_id", user["sub"]).execute()
+    if existing.data:
+        return {"keys": existing.data}
+    new_key = "swh_" + secrets.token_hex(24)
+    db.table("api_keys").insert({
+        "key":              new_key,
+        "user_id":          user["sub"],
+        "calls_this_month": 0,
+        "limit_per_month":  10,
+        "active":           True,
+        "created_at":       datetime.now(timezone.utc).isoformat(),
+    }).execute()
+    return {"keys": [{"key": new_key, "calls_this_month": 0, "limit_per_month": 10}]}
+
+
+@app.get("/api/v1/keys")
+def list_api_keys(authorization: str = Header(None)):
+    """List API keys and usage for the current user."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    rows = db.table("api_keys").select("key,calls_this_month,limit_per_month,active,created_at")\
+        .eq("user_id", user["sub"]).execute()
+    return {"keys": rows.data or []}
+
+
+@app.delete("/api/v1/keys/{key}")
+def revoke_api_key(key: str, authorization: str = Header(None)):
+    """Revoke an API key."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    db.table("api_keys").update({"active": False}).eq("key", key).eq("user_id", user["sub"]).execute()
+    return {"revoked": key}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NIS2 COMPLIANCE MODULE
+# Maps existing check results → EU NIS2 Article 21 compliance score
+# ══════════════════════════════════════════════════════════════════════════════
+
+NIS2_MAPPING = {
+    # check_name → (article, requirement, weight)
+    "ssl":            ("Art.21(2)(i)", "Encryption & TLS security",        3),
+    "headers":        ("Art.21(2)(i)", "Transport security controls",       2),
+    "email_security": ("Art.21(2)(i)", "Email authentication (SPF/DKIM)",   2),
+    "dmarc":          ("Art.21(2)(i)", "Email anti-spoofing (DMARC)",       2),
+    "dnssec":         ("Art.21(2)(h)", "DNS security extensions",           2),
+    "open_ports":     ("Art.21(2)(e)", "Network access control",            3),
+    "shodan":         ("Art.21(2)(e)", "Attack surface management",         2),
+    "virustotal":     ("Art.21(2)(b)", "Incident detection & response",     3),
+    "urlhaus":        ("Art.21(2)(b)", "Malware & threat detection",        3),
+    "spamhaus":       ("Art.21(2)(b)", "Threat intelligence",               2),
+    "safebrowsing":   ("Art.21(2)(b)", "Phishing protection",               2),
+    "typosquat":      ("Art.21(2)(f)", "Brand & supply chain protection",   2),
+    "ip_intel":       ("Art.21(2)(e)", "Network security monitoring",       2),
+    "leaks":          ("Art.21(2)(g)", "Data protection & breach prevent.", 3),
+    "cms_version":    ("Art.21(2)(e)", "Software vulnerability management", 2),
+    "dast":           ("Art.21(2)(e)", "Application security testing",      2),
+}
+
+
+@app.get("/domains/{domain_id}/nis2")
+def get_nis2_compliance(domain_id: str, authorization: str = Header(None)):
+    """
+    Return a NIS2 Article 21 compliance score for a domain.
+    Maps each security check to the relevant NIS2 requirement.
+    """
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    d = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found or not your domain")
+
+    scan = db.table("scans").select("checks,risk_score,scanned_at")\
+        .eq("domain_id", domain_id).order("scanned_at", desc=True).limit(1).execute()
+    if not scan.data:
+        raise HTTPException(404, "No scan data yet")
+
+    raw = scan.data[0].get("checks", []) or []
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except: raw = []
+
+    check_map = {c.get("check"): c for c in raw}
+    findings  = []
+    total_weight = 0
+    pass_weight  = 0
+
+    for check_name, (article, requirement, weight) in NIS2_MAPPING.items():
+        c = check_map.get(check_name)
+        status = c.get("status", "unknown") if c else "unknown"
+        passed = status in ("ok", "info")
+        total_weight += weight
+        if passed:
+            pass_weight += weight
+        findings.append({
+            "check":       check_name,
+            "article":     article,
+            "requirement": requirement,
+            "status":      status,
+            "passed":      passed,
+            "weight":      weight,
+        })
+
+    compliance_pct = round(pass_weight / total_weight * 100) if total_weight else 0
+    rating = "COMPLIANT" if compliance_pct >= 80 else "PARTIAL" if compliance_pct >= 50 else "NON-COMPLIANT"
+
+    return {
+        "domain":         d.data[0]["domain"],
+        "compliance_pct": compliance_pct,
+        "rating":         rating,
+        "pass_weight":    pass_weight,
+        "total_weight":   total_weight,
+        "findings":       sorted(findings, key=lambda x: (x["passed"], -x["weight"])),
+        "scanned_at":     scan.data[0]["scanned_at"],
+        "note": "Based on NIS2 Directive (EU) 2022/2555 Article 21 security requirements. "
+                "This assessment is informational and does not constitute legal compliance certification.",
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUPPLY CHAIN MONITOR  — upload vendor list, batch scan, weekly digest
+# ══════════════════════════════════════════════════════════════════════════════
+
+class SupplyChainRequest(BaseModel):
+    domains: list[str]    # up to 50 vendor domains
+    label:   str = ""     # e.g. "Q1 2025 Vendor Review"
+
+
+@app.post("/supply-chain/scan")
+async def supply_chain_scan(body: SupplyChainRequest, background_tasks: BackgroundTasks,
+                             authorization: str = Header(None)):
+    """
+    Submit up to 50 vendor domains for batch scanning.
+    Results stored and retrievable via GET /supply-chain/results.
+    """
+    user = get_user_from_header(authorization)
+    if len(body.domains) > 50:
+        raise HTTPException(400, "Maximum 50 domains per supply chain scan")
+
+    # Check paid plan
+    db = get_db()
+    paid = db.table("purchases").select("id").eq("user_id", user["sub"])\
+        .is_("cancelled_at", "null").not_.is_("paid_at", "null").execute()
+    if not paid.data and not is_admin(user["sub"]):
+        raise HTTPException(403, "Supply chain monitoring requires an active plan")
+
+    import uuid
+    batch_id = str(uuid.uuid4())
+    now      = datetime.now(timezone.utc).isoformat()
+    domains  = [d.strip().lower().replace("https://","").replace("http://","").split("/")[0]
+                for d in body.domains if d.strip() and "." in d]
+
+    db.table("supply_chain_batches").insert({
+        "id":       batch_id,
+        "user_id":  user["sub"],
+        "label":    body.label or f"Batch {now[:10]}",
+        "domains":  json.dumps(domains),
+        "status":   "scanning",
+        "created_at": now,
+    }).execute()
+
+    background_tasks.add_task(_run_supply_chain_scan, batch_id, domains, user["sub"])
+    return {"batch_id": batch_id, "domains": len(domains), "status": "scanning"}
+
+
+def _run_supply_chain_scan(batch_id: str, domains: list[str], user_id: str):
+    if not SCANNER_AVAILABLE:
+        return
+    try:
+        from cee_scanner.checks import scan_domain
+        from threading import Thread
+        db = get_db()
+        results = []
+        for domain in domains:
+            try:
+                r = scan_domain(domain)
+                results.append({
+                    "domain":     domain,
+                    "risk_score": r["risk_score"],
+                    "critical":   r["critical"],
+                    "warnings":   r["warnings"],
+                    "scanned_at": r["scanned_at"],
+                })
+            except Exception as e:
+                results.append({"domain": domain, "risk_score": None, "error": str(e)})
+
+        high_risk = [r for r in results if (r.get("risk_score") or 0) >= 50]
+        db.table("supply_chain_batches").update({
+            "status":     "complete",
+            "results":    json.dumps(results),
+            "high_risk":  len(high_risk),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", batch_id).execute()
+
+        # Email digest if high-risk vendors found
+        if high_risk:
+            user_row = db.table("users").select("email,name").eq("id", user_id).execute()
+            if user_row.data:
+                _send_supply_chain_digest(user_row.data[0]["email"], user_row.data[0].get("name",""),
+                                          high_risk, batch_id)
+    except Exception as e:
+        import traceback
+        print(f"[supply-chain] Batch {batch_id} failed: {e}\n{traceback.format_exc()}")
+        try:
+            get_db().table("supply_chain_batches").update({"status": "error"}).eq("id", batch_id).execute()
+        except Exception:
+            pass
+
+
+def _send_supply_chain_digest(to_email: str, name: str, high_risk: list, batch_id: str):
+    if not RESEND_API_KEY:
+        return
+    rows = "".join(
+        f"<tr><td style='padding:8px 12px;border-bottom:1px solid #eee;font-family:monospace'>{r['domain']}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;color:{'#C0392B' if r['risk_score']>=70 else '#D4850A'};font-weight:700'>{r['risk_score']}</td>"
+        f"<td style='padding:8px 12px;border-bottom:1px solid #eee;color:#C0392B'>{r.get('critical',0)} critical</td></tr>"
+        for r in sorted(high_risk, key=lambda x: x.get("risk_score") or 0, reverse=True)
+    )
+    try:
+        import httpx as _hx
+        _hx.post("https://api.resend.com/emails", headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        }, json={
+            "from":    f"SwarmHawk <{FROM_EMAIL}>",
+            "to":      [to_email],
+            "subject": f"⚠️ Supply Chain Alert — {len(high_risk)} high-risk vendors detected",
+            "html":    f"""<!DOCTYPE html><html><body style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;padding:24px">
+<div style="border-left:3px solid #CBFF00;padding-left:16px;margin-bottom:24px">
+  <strong style="font-family:monospace;font-size:16px;background:#CBFF00;padding:4px 10px">SWARMHAWK</strong>
+  <p style="margin:8px 0 0;color:#555">Supply Chain Security Digest</p>
+</div>
+<p>Hi {name or 'there'},</p>
+<p>{len(high_risk)} of your vendor domains scored HIGH RISK (≥50). Immediate review recommended.</p>
+<table style="width:100%;border-collapse:collapse;font-size:13px">
+  <tr style="background:#f5f5f5"><th style="padding:8px 12px;text-align:left">Domain</th>
+    <th style="padding:8px 12px;text-align:left">Risk Score</th>
+    <th style="padding:8px 12px;text-align:left">Findings</th></tr>
+  {rows}
+</table>
+<p style="margin-top:24px">View full reports at <a href="{SITE_URL}">swarmhawk.eu</a></p>
+<hr style="border:none;border-top:1px solid #eee;margin:24px 0">
+<p style="font-size:11px;color:#999">SwarmHawk Security Intelligence · swarmhawk.eu</p>
+</body></html>""",
+        }, timeout=15)
+    except Exception as e:
+        print(f"[supply-chain] digest email failed: {e}")
+
+
+@app.get("/supply-chain/results")
+def supply_chain_results(authorization: str = Header(None)):
+    """List all supply chain scan batches for the current user."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    rows = db.table("supply_chain_batches").select(
+        "id,label,status,high_risk,created_at,completed_at,results"
+    ).eq("user_id", user["sub"]).order("created_at", desc=True).limit(20).execute()
+
+    out = []
+    for r in (rows.data or []):
+        results = r.get("results")
+        if isinstance(results, str):
+            try: results = json.loads(results)
+            except: results = []
+        out.append({**r, "results": results or []})
+    return {"batches": out}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MSP PLAN — $200/yr for 10 domains, white-label coming
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MSPCheckoutRequest(BaseModel):
+    domain_ids: list[str]   # up to 10 domain IDs to cover under MSP plan
+
+
+@app.post("/checkout/msp")
+async def checkout_msp(body: MSPCheckoutRequest, authorization: str = Header(None)):
+    """Create Stripe checkout for MSP plan — $200/yr covers 10 domains."""
+    user = get_user_from_header(authorization)
+    if len(body.domain_ids) > 10:
+        raise HTTPException(400, "MSP plan covers up to 10 domains")
+
+    db     = get_db()
+    u_row  = db.table("users").select("email").eq("id", user["sub"]).execute()
+    email  = u_row.data[0]["email"] if u_row.data else ""
+
+    price_id = STRIPE_MSP_PRICE_ID
+    if not price_id:
+        # Create inline price if no env var set
+        price_data = {
+            "currency": "usd",
+            "unit_amount": 20000,   # $200.00
+            "recurring": {"interval": "year"},
+        }
+    else:
+        price_data = None
+
+    try:
+        create_kwargs: dict = {
+            "payment_method_types": ["card"],
+            "mode": "subscription",
+            "customer_email": email,
+            "success_url": f"{FRONTEND_URL}?payment=success&plan=msp",
+            "cancel_url":  f"{FRONTEND_URL}?payment=cancel",
+            "metadata": {
+                "user_id":    user["sub"],
+                "plan":       "msp",
+                "domain_ids": json.dumps(body.domain_ids),
+            },
+        }
+        if price_id:
+            create_kwargs["line_items"] = [{"price": price_id, "quantity": 1}]
+        else:
+            create_kwargs["line_items"] = [{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": 20000,
+                    "recurring": {"interval": "year"},
+                    "product_data": {
+                        "name": "SwarmHawk MSP Plan",
+                        "description": "10 domains · monthly auto-scans · PDF reports · supply chain monitoring",
+                    },
+                },
+                "quantity": 1,
+            }]
+        session = stripe.checkout.Session.create(**create_kwargs)
+        return {"url": session.url}
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e))
