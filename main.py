@@ -230,6 +230,21 @@ def health():
     return {"status": "ok", "version": "2.0.0", "scanner": SCANNER_AVAILABLE}
 
 
+@app.get("/debug-config")
+def debug_config():
+    """Temporary: show env var config (no secrets exposed)."""
+    url = SUPABASE_URL or ""
+    key = SUPABASE_KEY or ""
+    return {
+        "url_set": bool(url),
+        "url_preview": url[:30] if url else "",
+        "key_set": bool(key),
+        "key_length": len(key),
+        "key_preview": key[:10] if key else "",
+        "key_suffix": key[-6:] if len(key) > 6 else "",
+    }
+
+
 # ── Email / password auth ─────────────────────────────────────────────────────
 
 @app.post("/auth/register")
