@@ -236,13 +236,8 @@ def _get_cloudflare_domains(country_code: str, limit: int) -> list[str]:
 
 def fetch_country_domains(country_code: str, limit: int = 500) -> list[str]:
     """Return up to `limit` top domains for a country.
-    Priority: Cloudflare Radar → Tranco TLD filter → hardcoded fallback."""
-    # 1. Cloudflare Radar (country-aware, best quality)
-    domains = _get_cloudflare_domains(country_code, limit)
-    if len(domains) >= 50:
-        return domains[:limit]
-
-    # 2. Tranco list filtered by country TLD
+    Priority: Tranco TLD filter → hardcoded fallback."""
+    # 1. Tranco list filtered by country TLD
     tld = COUNTRY_TLDS.get(country_code, "")
     if tld:
         domains = _get_tranco_domains(tld, limit)
@@ -250,7 +245,7 @@ def fetch_country_domains(country_code: str, limit: int = 500) -> list[str]:
             print(f"[tranco] {country_code}{tld}: {len(domains)} domains")
             return domains
 
-    # 3. Hardcoded fallback
+    # 2. Hardcoded fallback
     fallback = PROSPECT_DOMAINS.get(country_code, [])
     print(f"[fallback] {country_code}: {len(fallback)} domains (hardcoded)")
     return fallback[:limit]
