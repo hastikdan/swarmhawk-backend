@@ -73,12 +73,8 @@ CREATE INDEX IF NOT EXISTS idx_comp_scans_time ON competitor_scans(scanned_at DE
 -- No RLS needed — access controlled via competitor ownership check in API
 
 -- ── Outreach contact_email column (if missing) ───────────────────────────────
-ALTER TABLE prospects
+ALTER TABLE outreach_prospects
     ADD COLUMN IF NOT EXISTS contact_email TEXT;
-
--- ── Breach Monday: track last digest sent per user ───────────────────────────
-ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS breach_monday_sent_at TIMESTAMPTZ;
 
 -- Done!
 SELECT 'Migration 001 complete' AS status;
