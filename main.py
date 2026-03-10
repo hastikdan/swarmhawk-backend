@@ -2754,6 +2754,25 @@ def attack_map_data():
         return {"countries": [], "error": str(e)}
 
 
+@app.get("/map/country/{code}")
+def map_country_top_domains(code: str):
+    """
+    Public: top 100 domains for a given ISO country code, sourced from Tranco top-1M.
+    Used by the live map side panel. No auth required.
+    """
+    code = code.upper()
+    try:
+        from outreach import COUNTRY_TLDS, _get_tranco_domains
+        tld = COUNTRY_TLDS.get(code, "")
+        if tld:
+            domains = _get_tranco_domains(tld, 100)
+        else:
+            domains = []
+    except Exception as e:
+        domains = []
+    return {"country": code, "domains": domains, "total": len(domains)}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # COMPETITOR INTELLIGENCE — track competitor domains with weekly diff
 # ══════════════════════════════════════════════════════════════════════════════
