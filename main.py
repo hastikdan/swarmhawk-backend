@@ -283,11 +283,40 @@ except Exception as e:
     print(f"Outreach router failed to load: {e}")
 
 
+# ── TLD → ISO country resolver ────────────────────────────────────────────────
+
+_TLD_COUNTRY: dict = {
+    # Europe
+    "cz":"CZ","pl":"PL","sk":"SK","hu":"HU","ro":"RO","at":"AT","de":"DE",
+    "fr":"FR","gb":"GB","uk":"GB","it":"IT","es":"ES","nl":"NL","be":"BE",
+    "se":"SE","no":"NO","dk":"DK","fi":"FI","ch":"CH","pt":"PT","gr":"GR",
+    "ua":"UA","ru":"RU","tr":"TR","lt":"LT","lv":"LV","ee":"EE","hr":"HR",
+    "si":"SI","bg":"BG","rs":"RS","ba":"BA","mk":"MK","md":"MD","al":"AL",
+    "me":"ME","lu":"LU","ie":"IE","is":"IS","mt":"MT","cy":"CY","xk":"XK",
+    # Americas
+    "us":"US","ca":"CA","br":"BR","mx":"MX","ar":"AR","cl":"CL","co":"CO",
+    # Asia-Pacific
+    "au":"AU","nz":"NZ","jp":"JP","kr":"KR","cn":"CN","in":"IN","sg":"SG",
+    "id":"ID","th":"TH","ph":"PH","my":"MY","vn":"VN","hk":"HK","tw":"TW",
+    # Middle East / Africa
+    "il":"IL","ae":"AE","sa":"SA","eg":"EG","ng":"NG","ke":"KE","za":"ZA",
+    "pk":"PK","bd":"BD",
+    # Generic gTLDs → US (global/English default)
+    "com":"US","net":"US","org":"US","io":"US","co":"US","app":"US",
+    "dev":"US","tech":"US","ai":"US","cloud":"US","online":"US","site":"US",
+    "info":"US","biz":"US",
+}
+
+def tld_to_country(domain: str) -> str:
+    """Infer ISO country code from the rightmost label of a domain."""
+    tld = domain.lower().rstrip(".").rsplit(".", 1)[-1]
+    return _TLD_COUNTRY.get(tld, "US")   # default US for unknown gTLDs
+
 # ── Models ────────────────────────────────────────────────────────────────────
 
 class AddDomainRequest(BaseModel):
     domain: str
-    country: str
+    country: str = ""   # optional — derived from TLD if blank or "EU"
 
 class RegisterRequest(BaseModel):
     username: str
@@ -641,7 +670,7 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
             dom_result = db.table("domains").insert({
                 "user_id":    user["id"],
                 "domain":     domain,
-                "country":    "EU",
+                "country":    tld_to_country(domain),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
             first_domain = dom_result.data[0]
@@ -1169,11 +1198,16 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
                 detail="Free accounts are limited to 1 domain. Upgrade to Annual ($50/year) to monitor unlimited domains."
             )
 
+    # Resolve country — use provided value only when it's a real ISO code
+    resolved_country = body.country.upper().strip() if body.country else ""
+    if not resolved_country or resolved_country in ("EU", "??", ""):
+        resolved_country = tld_to_country(body.domain.lower())
+
     # Insert domain
     result = db.table("domains").insert({
         "user_id":    user["sub"],
         "domain":     body.domain.lower(),
-        "country":    body.country,
+        "country":    resolved_country,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }).execute()
 
@@ -2667,10 +2701,14 @@ def attack_map_data():
     """
     db = get_admin_db()
     try:
-        domains = db.table("domains").select("id,country").execute()
+        domains = db.table("domains").select("id,domain,country").execute()
         country_domain_ids: dict = {}
         for d in (domains.data or []):
-            cc = (d.get("country") or "??").upper()[:2]
+            stored = (d.get("country") or "").upper().strip()
+            # Fall back to TLD resolver for legacy "EU" or missing codes
+            if not stored or stored in ("EU", "??"):
+                stored = tld_to_country(d.get("domain", "unknown.com"))
+            cc = stored
             if cc not in country_domain_ids:
                 country_domain_ids[cc] = []
             country_domain_ids[cc].append(d["id"])
