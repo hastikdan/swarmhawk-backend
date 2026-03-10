@@ -1584,7 +1584,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
         .select("id, domain")\
         .eq("id", body.domain_id)\
         .eq("user_id", user["sub"])\
-        .single()\
+        .limit(1)\
         .execute()
 
     if not domain_row.data:
@@ -1649,7 +1649,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                 subscription_data={"metadata": meta},
             )
 
-        return {"checkout_url": session.url, "session_id": session.id, "plan": body.plan}
+        return {"url": session.url, "session_id": session.id, "plan": body.plan}
 
     except stripe.error.StripeError as e:
         raise HTTPException(400, str(e))
