@@ -1595,6 +1595,10 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     user = get_user_from_header(authorization)
     db   = get_db()
 
+    # Fetch email from users table (get_user_from_header only returns sub/id)
+    u_row = db.table("users").select("email").eq("id", user["sub"]).execute()
+    user_email = u_row.data[0]["email"] if u_row.data else ""
+
     if body.plan not in ("one_time", "annual"):
         raise HTTPException(400, "plan must be 'one_time' or 'annual'")
 
@@ -1634,7 +1638,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                 success_url=f"{FRONTEND_URL}?payment=success&domain_id={body.domain_id}",
                 cancel_url=f"{FRONTEND_URL}?payment=cancelled",
                 metadata=meta,
-                customer_email=user.get("email", ""),
+                customer_email=user_email,
             )
         else:  # annual subscription
             # Use a pre-created Price ID if set, otherwise create dynamically
@@ -1663,7 +1667,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                 success_url=f"{FRONTEND_URL}?payment=success&domain_id={body.domain_id}",
                 cancel_url=f"{FRONTEND_URL}?payment=cancelled",
                 metadata=meta,
-                customer_email=user.get("email", ""),
+                customer_email=user_email,
                 subscription_data={"metadata": meta},
             )
 
