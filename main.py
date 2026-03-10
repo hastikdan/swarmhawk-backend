@@ -827,26 +827,45 @@ def admin_users(
     require_admin(authorization)
     db = get_admin_db()
 
+    # 1. Fetch paginated users
     offset = (page - 1) * per_page
-    users = db.table("users").select("*").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
-    total = db.table("users").select("id", count="exact").execute()
+    users_res = db.table("users").select("id,email,name,auth_type,created_at,last_login") \
+        .order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
+    total_res = db.table("users").select("id", count="exact").execute()
+
+    user_ids = [u["id"] for u in (users_res.data or [])]
+    if not user_ids:
+        return {"users": [], "total": total_res.count or 0, "page": page, "per_page": per_page}
+
+    # 2. Fetch domain counts for these users in one query
+    domains_res = db.table("domains").select("user_id").in_("user_id", user_ids).execute()
+    domain_counts: dict = {}
+    for d in (domains_res.data or []):
+        uid = d["user_id"]
+        domain_counts[uid] = domain_counts.get(uid, 0) + 1
+
+    # 3. Fetch purchase counts in one query
+    paid_res = db.table("purchases").select("user_id").in_("user_id", user_ids).execute()
+    paid_counts: dict = {}
+    for p in (paid_res.data or []):
+        uid = p["user_id"]
+        paid_counts[uid] = paid_counts.get(uid, 0) + 1
 
     rows = []
-    for u in (users.data or []):
-        doms = db.table("domains").select("id", count="exact").eq("user_id", u["id"]).execute()
-        paid = db.table("purchases").select("id", count="exact").eq("user_id", u["id"]).execute()
+    for u in (users_res.data or []):
+        uid = u["id"]
         rows.append({
-            "id":           u["id"],
-            "email":        u["email"],
+            "id":           uid,
+            "email":        u.get("email", ""),
             "name":         u.get("name", ""),
             "auth_type":    u.get("auth_type", "google"),
-            "domain_count": doms.count or 0,
-            "paid_domains": paid.count or 0,
+            "domain_count": domain_counts.get(uid, 0),
+            "paid_domains": paid_counts.get(uid, 0),
             "created_at":   u.get("created_at", ""),
             "last_login":   u.get("last_login", ""),
         })
 
-    return {"users": rows, "total": total.count, "page": page, "per_page": per_page}
+    return {"users": rows, "total": total_res.count or 0, "page": page, "per_page": per_page}
 
 
 @app.get("/admin/domains")
