@@ -815,10 +815,10 @@ def start_scheduler():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler(timezone="Europe/Prague")
-        scheduler.add_job(_run_scan_job, "cron", hour=6, minute=0, id="daily_prospect_scan")
+        scheduler.add_job(_run_scan_job, "cron", hour=8, minute=0, id="daily_prospect_scan")
         scheduler.start()
         source = "Cloudflare Radar" if CLOUDFLARE_TOKEN else "Tranco+fallback"
-        print(f"[outreach] Daily scan scheduler started — 06:00 Prague, {len(COUNTRY_TLDS)} countries × {SCAN_LIMIT} domains ({source})")
+        print(f"[outreach] Daily scan scheduler started — 08:00 Prague, {len(COUNTRY_TLDS)} countries × {SCAN_LIMIT} domains ({source})")
         return scheduler
     except ImportError:
         print("[outreach] APScheduler not installed — add apscheduler to requirements.txt")
