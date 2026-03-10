@@ -544,11 +544,10 @@ def require_admin(authorization: str):
     result = db.table("sessions").select("user_id").eq("token", token).execute()
     if not result.data:
         raise HTTPException(401, "Invalid session")
-    admin_email = os.getenv("ADMIN_EMAIL", "")
-    if admin_email:
-        user = db.table("users").select("email").eq("id", result.data[0]["user_id"]).execute()
-        if not user.data or user.data[0]["email"] != admin_email:
-            raise HTTPException(403, "Admin only")
+    admin_email = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")
+    user = db.table("users").select("email").eq("id", result.data[0]["user_id"]).execute()
+    if not user.data or user.data[0]["email"] != admin_email:
+        raise HTTPException(403, "Admin only")
 
 
 @router.post("/run-scan")
