@@ -43,6 +43,7 @@ STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stri
 STRIPE_MSP_PRICE_ID = os.getenv("STRIPE_MSP_PRICE_ID", "")  # $200/yr — 10-domain MSP plan
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
+PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -1030,6 +1031,125 @@ def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authoriza
     return {"queued": len(doms.data or [])}
 
 
+@app.get("/admin/llm-stats")
+async def admin_llm_stats(authorization: str = Header(None)):
+    """Fetch LLM usage, cost, and per-user breakdown from Portkey Analytics."""
+    require_admin(authorization)
+
+    if not PORTKEY_API_KEY:
+        return {
+            "configured": False,
+            "message": "PORTKEY_API_KEY not set — add it to Render env vars to enable LLM observability",
+        }
+
+    pk_headers = {
+        "x-portkey-api-key": PORTKEY_API_KEY,
+        "Content-Type": "application/json",
+    }
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    try:
+        import httpx
+        async with httpx.AsyncClient(timeout=20) as client:
+            # 1. Aggregate analytics for current month
+            analytics_r = await client.get(
+                "https://api.portkey.ai/v1/analytics",
+                headers=pk_headers,
+                params={
+                    "filters[time_of_generation][gt]": month_start,
+                },
+            )
+            analytics = analytics_r.json() if analytics_r.status_code == 200 else {}
+
+            # 2. Recent logs for per-user and per-type breakdown (last 200)
+            logs_r = await client.get(
+                "https://api.portkey.ai/v1/logs",
+                headers=pk_headers,
+                params={"page_size": 200, "page": 0},
+            )
+            logs_data = logs_r.json() if logs_r.status_code == 200 else {}
+
+    except Exception as e:
+        raise HTTPException(502, f"Portkey API error: {e}")
+
+    # Parse analytics totals
+    totals = analytics.get("total", analytics)  # shape varies by Portkey version
+    total_cost     = totals.get("cost", totals.get("total_cost", 0)) or 0
+    total_tokens   = totals.get("tokens", totals.get("total_tokens", 0)) or 0
+    total_requests = totals.get("requests", totals.get("total_requests", 0)) or 0
+    prompt_tokens  = totals.get("prompt_tokens", 0) or 0
+    completion_tokens = totals.get("completion_tokens", 0) or 0
+
+    # Parse logs for breakdowns
+    logs = logs_data.get("data", logs_data.get("logs", []))
+    user_map   = {}   # user_id -> {cost, tokens, requests}
+    type_map   = {}   # report_type -> {cost, tokens, requests}
+
+    for log in logs:
+        meta    = log.get("metadata") or {}
+        if isinstance(meta, str):
+            try:
+                import json as _j; meta = _j.loads(meta)
+            except Exception:
+                meta = {}
+        uid  = meta.get("_user", "anonymous")
+        rtype = meta.get("report_type", "unknown")
+        cost  = float(log.get("cost", 0) or 0)
+        toks  = int(log.get("total_tokens", 0) or 0)
+
+        for key, val, mp in [("cost", cost, user_map), ("tokens", toks, user_map)]:
+            pass  # avoid repeated traversal
+
+        # user breakdown
+        if uid not in user_map:
+            user_map[uid] = {"user_id": uid, "cost": 0, "tokens": 0, "requests": 0}
+        user_map[uid]["cost"]     += cost
+        user_map[uid]["tokens"]   += toks
+        user_map[uid]["requests"] += 1
+
+        # type breakdown
+        if rtype not in type_map:
+            type_map[rtype] = {"report_type": rtype, "cost": 0, "tokens": 0, "requests": 0}
+        type_map[rtype]["cost"]     += cost
+        type_map[rtype]["tokens"]   += toks
+        type_map[rtype]["requests"] += 1
+
+    # Enrich user breakdown with emails from DB (best effort)
+    db = get_admin_db()
+    user_ids = [u for u in user_map if u != "anonymous"]
+    email_map = {}
+    if user_ids:
+        try:
+            rows = db.table("users").select("id,email,name").in_("id", user_ids).execute()
+            for row in (rows.data or []):
+                email_map[row["id"]] = row.get("email", "")
+        except Exception:
+            pass
+
+    user_breakdown = sorted(user_map.values(), key=lambda x: x["cost"], reverse=True)
+    for u in user_breakdown:
+        u["email"] = email_map.get(u["user_id"], u["user_id"][:8] + "…")
+        u["cost"]  = round(u["cost"], 6)
+
+    type_breakdown = sorted(type_map.values(), key=lambda x: x["requests"], reverse=True)
+
+    return {
+        "configured": True,
+        "period": "current month",
+        "totals": {
+            "cost":              round(float(total_cost), 6),
+            "tokens":            int(total_tokens),
+            "prompt_tokens":     int(prompt_tokens),
+            "completion_tokens": int(completion_tokens),
+            "requests":          int(total_requests),
+            "avg_cost_per_req":  round(float(total_cost) / max(int(total_requests), 1), 6),
+        },
+        "by_user":        user_breakdown[:50],
+        "by_report_type": type_breakdown,
+    }
+
+
 @app.get("/me")
 def get_me(authorization: str = Header(None)):
     """Return current user info including is_admin flag."""
@@ -1827,6 +1947,56 @@ async def stripe_webhook(request: Request):
     return {"received": True}
 
 
+# ── LLM gateway (Portkey-routed or direct Anthropic) ─────────────────────────
+
+def _build_anthropic_headers(api_key: str, metadata: dict | None = None) -> dict:
+    """Return headers for Anthropic call, optionally routed via Portkey."""
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if PORTKEY_API_KEY:
+        headers["x-portkey-api-key"] = PORTKEY_API_KEY
+        headers["x-portkey-provider"] = "anthropic"
+        if metadata:
+            import json as _json
+            headers["x-portkey-metadata"] = _json.dumps(metadata)
+    return headers
+
+def _anthropic_url() -> str:
+    """Return the correct Anthropic-compatible URL (Portkey gateway or direct)."""
+    if PORTKEY_API_KEY:
+        return "https://api.portkey.ai/v1/messages"
+    return "https://api.anthropic.com/v1/messages"
+
+def _call_claude_sync(api_key: str, model: str, max_tokens: int,
+                      system: str, messages: list, metadata: dict | None = None) -> dict:
+    """Synchronous Claude call via Portkey gateway or direct Anthropic."""
+    import requests as _req
+    r = _req.post(
+        _anthropic_url(),
+        headers=_build_anthropic_headers(api_key, metadata),
+        json={"model": model, "max_tokens": max_tokens, "system": system, "messages": messages},
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.json()
+
+async def _call_claude_async(api_key: str, model: str, max_tokens: int,
+                              system: str, messages: list, metadata: dict | None = None) -> dict:
+    """Async Claude call via Portkey gateway or direct Anthropic."""
+    import httpx
+    async with httpx.AsyncClient(timeout=35) as client:
+        r = await client.post(
+            _anthropic_url(),
+            headers=_build_anthropic_headers(api_key, metadata),
+            json={"model": model, "max_tokens": max_tokens, "system": system, "messages": messages},
+        )
+    r.raise_for_status()
+    return r.json()
+
+
 # ── Background scan ───────────────────────────────────────────────────────────
 
 def _generate_ai_summary(domain: str, result: dict) -> str | None:
@@ -1864,25 +2034,15 @@ def _generate_ai_summary(domain: str, result: dict) -> str | None:
         "<1-2 sentences about hosting, CDN, architecture, or NIS2 compliance context>"
     )
     try:
-        import requests as req
-        r = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": AKEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 700,
-                "system": "You are a cybersecurity analyst. Output only the report text in the exact format requested. No markdown, no backticks, no extra commentary.",
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=25,
+        data = _call_claude_sync(
+            api_key=AKEY,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=700,
+            system="You are a cybersecurity analyst. Output only the report text in the exact format requested. No markdown, no backticks, no extra commentary.",
+            messages=[{"role": "user", "content": prompt}],
+            metadata={"report_type": "domain_scan", "domain": domain},
         )
-        if r.status_code == 200:
-            data = r.json()
-            return data["content"][0]["text"] if data.get("content") else None
+        return data["content"][0]["text"] if data.get("content") else None
     except Exception as e:
         print(f"AI summary generation failed for {domain}: {e}")
     return None
@@ -2109,13 +2269,14 @@ class IntelRequest(BaseModel):
 @app.post("/intel")
 async def intel(body: IntelRequest, authorization: str = Header(None)):
     """Generate AI threat briefing using server-side ANTHROPIC_API_KEY."""
-    get_user_from_header(authorization)
+    user = get_user_from_header(authorization)
 
     AKEY = os.getenv("ANTHROPIC_API_KEY", "")
     if not AKEY:
         raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not configured on server")
 
     # Use custom prompt (outreach) or build briefing prompt (intelligence tab)
+    report_type = "outreach_email" if body.prompt else "intel_briefing"
     if body.prompt:
         user_msg = body.prompt
         system   = "You are a professional cybersecurity copywriter. Be concise and direct."
@@ -2135,27 +2296,18 @@ async def intel(body: IntelRequest, authorization: str = Header(None)):
         system  = "You are a cybersecurity analyst. Output valid JSON only, no markdown, no backticks."
         max_tok = 1000
 
-    import httpx
-    async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": AKEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": max_tok,
-                "system": system,
-                "messages": [{"role": "user", "content": user_msg}],
-            },
+    try:
+        data = await _call_claude_async(
+            api_key=AKEY,
+            model="claude-haiku-4-5-20251001",
+            max_tokens=max_tok,
+            system=system,
+            messages=[{"role": "user", "content": user_msg}],
+            metadata={"report_type": report_type, "_user": user["sub"]},
         )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"LLM error: {str(e)[:200]}")
 
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Anthropic API error: {r.text[:200]}")
-
-    data = r.json()
     text = data["content"][0]["text"] if data.get("content") else ""
     return {"text": text, "briefing": text}
 
