@@ -1162,6 +1162,17 @@ def list_domains(authorization: str = Header(None)):
                 pass
         status = "scanning" if is_new else ("active" if latest_scan else "pending")
 
+        # Decode checks from latest scan (may be jsonb list or legacy json string)
+        latest_checks = []
+        if latest_scan:
+            raw = latest_scan.get("checks", [])
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except Exception:
+                    raw = []
+            latest_checks = raw if isinstance(raw, list) else []
+
         result.append({
             "id":          d["id"],
             "domain":      d["domain"],
@@ -1171,6 +1182,7 @@ def list_domains(authorization: str = Header(None)):
             "paid":        is_paid,
             "risk_score":  latest_scan["risk_score"] if latest_scan else None,
             "scanned_at":  latest_scan["scanned_at"] if latest_scan else None,
+            "checks":      latest_checks,
             "scan_history": [
                 {"date": s["scanned_at"], "risk": s["risk_score"]}
                 for s in sorted(d.get("scans", []), key=lambda s: s["scanned_at"])
