@@ -2,6 +2,19 @@
 -- Paste into Supabase → SQL Editor → Run
 -- (matches existing schema.sql conventions: no RLS, backend handles auth)
 
+-- ── Purchases table: add missing columns ─────────────────────────────────────
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS plan         TEXT DEFAULT 'one_time';
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS domain       TEXT DEFAULT '';
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS stripe_sub_id TEXT;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS cancelled_at TIMESTAMPTZ;
+ALTER TABLE purchases ADD COLUMN IF NOT EXISTS paid_at      TIMESTAMPTZ DEFAULT now();
+
+-- Index for fast subscription lookups
+CREATE INDEX IF NOT EXISTS idx_purchases_user   ON purchases(user_id);
+CREATE INDEX IF NOT EXISTS idx_purchases_domain ON purchases(domain_id);
+
+ALTER TABLE purchases DISABLE ROW LEVEL SECURITY;
+
 -- ── Outreach Prospects ───────────────────────────────────────────────────────
 -- Created by outreach.py; add contact_email if table already exists
 CREATE TABLE IF NOT EXISTS outreach_prospects (

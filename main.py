@@ -1567,6 +1567,21 @@ def billing_portal(authorization: str = Header(None)):
         raise HTTPException(400, str(e))
 
 
+@app.get("/checkout/preflight")
+def checkout_preflight(authorization: str = Header(None)):
+    """Debug: verify all checkout prerequisites without hitting Stripe."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    doms = db.table("domains").select("id,domain").eq("user_id", user["sub"]).execute()
+    return {
+        "auth": "ok",
+        "user_id": user["sub"],
+        "stripe_configured": bool(STRIPE_SECRET_KEY),
+        "frontend_url": FRONTEND_URL,
+        "domains": [{"id": d["id"], "domain": d["domain"]} for d in (doms.data or [])],
+    }
+
+
 @app.post("/checkout")
 def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     """
@@ -1574,6 +1589,9 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     plan=one_time  → $10 one-time payment, unlocks full report permanently.
     plan=annual    → $50/year subscription, monthly auto-scans + reports.
     """
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured — set STRIPE_SECRET_KEY in environment")
+
     user = get_user_from_header(authorization)
     db   = get_db()
 
