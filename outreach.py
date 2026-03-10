@@ -535,6 +535,10 @@ class EmailUpdate(BaseModel):
 class BulkApprove(BaseModel):
     ids: list[str]
 
+class ScheduleRequest(BaseModel):
+    domains: list[str]
+    scheduled_for: str   # ISO date string e.g. "2026-03-15"
+
 
 def require_admin(authorization: str):
     if not authorization or not authorization.startswith("Bearer "):
@@ -678,6 +682,47 @@ async def bulk_approve(body: BulkApprove, authorization: str = Header(None)):
     for pid in body.ids:
         db.table("outreach_prospects").update({"status": "approved"}).eq("id", pid).execute()
     return {"approved": len(body.ids)}
+
+
+@router.post("/prospects/schedule")
+async def schedule_prospects(body: ScheduleRequest, authorization: str = Header(None)):
+    """
+    Admin: mark selected prospect domains as approved and set their outreach date.
+    Upserts into outreach_prospects — creates row if domain not yet scanned,
+    or updates status/approved_at on existing rows.
+    """
+    require_admin(authorization)
+    db = get_db()
+
+    # Validate date
+    try:
+        from datetime import datetime as _dt
+        scheduled_dt = _dt.fromisoformat(body.scheduled_for).isoformat()
+    except ValueError:
+        raise HTTPException(400, "Invalid date format — use YYYY-MM-DD")
+
+    upserted = []
+    for domain in body.domains:
+        domain = domain.lower().strip()
+        if not domain:
+            continue
+        # Check if row exists
+        existing = db.table("outreach_prospects").select("id,status").eq("domain", domain).execute()
+        if existing.data:
+            db.table("outreach_prospects").update({
+                "status":      "approved",
+                "approved_at": scheduled_dt,
+            }).eq("domain", domain).execute()
+        else:
+            db.table("outreach_prospects").insert({
+                "domain":      domain,
+                "status":      "approved",
+                "approved_at": scheduled_dt,
+                "scanned_at":  datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        upserted.append(domain)
+
+    return {"scheduled": len(upserted), "scheduled_for": body.scheduled_for, "domains": upserted}
 
 
 @router.post("/send-approved")
