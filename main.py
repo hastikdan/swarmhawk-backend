@@ -44,6 +44,7 @@ STRIPE_MSP_PRICE_ID = os.getenv("STRIPE_MSP_PRICE_ID", "")  # $200/yr — 10-dom
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
+PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
@@ -3153,6 +3154,279 @@ def map_country_top_domains(code: str):
     except Exception as e:
         domains = []
     return {"country": code, "domains": domains, "total": len(domains)}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PARANOIDLAB — dark-web leak & credential intelligence
+# API docs: https://paranoidlab.com/v1/docs
+# ══════════════════════════════════════════════════════════════════════════════
+
+PARANOIDLAB_BASE = "https://paranoidlab.com/v1"
+
+
+def _pl_headers() -> dict:
+    return {"X-Key": PARANOIDLAB_API_KEY, "Content-Type": "application/json"}
+
+
+def paranoidlab_search(domain: str) -> dict:
+    """
+    Quick public search (no auth required).
+    Returns aggregated leak counts for a domain.
+    """
+    try:
+        resp = requests.post(
+            f"{PARANOIDLAB_BASE}/search",
+            json={"query": domain},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as e:
+        print(f"[paranoidlab] search error: {e}")
+    return {}
+
+
+def paranoidlab_leaks(domain: str, limit: int = 20) -> dict:
+    """
+    Fetch paginated leaks for a domain target using API key.
+    Returns {"total": int, "items": [...], "types": {...}}
+    """
+    if not PARANOIDLAB_API_KEY:
+        return {"error": "No ParanoidLab API key configured"}
+    try:
+        resp = requests.get(
+            f"{PARANOIDLAB_BASE}/leaks",
+            headers=_pl_headers(),
+            params={"data_url": domain, "limit": limit, "offset": 0},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data  = resp.json()
+            items = data.get("items") or data.get("leaks") or []
+            # Aggregate by type
+            types: dict = {}
+            for item in items:
+                t = item.get("type", "unknown")
+                types[t] = types.get(t, 0) + 1
+            return {
+                "total": data.get("total") or len(items),
+                "items": items[:10],   # cap detail rows
+                "types": types,
+            }
+        elif resp.status_code == 401:
+            return {"error": "Invalid ParanoidLab API key"}
+        else:
+            return {"error": f"ParanoidLab API error {resp.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def paranoidlab_telegram(domain: str, limit: int = 20) -> dict:
+    """Search Telegram dark-web posts mentioning the domain."""
+    if not PARANOIDLAB_API_KEY:
+        return {"error": "No ParanoidLab API key configured"}
+    try:
+        resp = requests.get(
+            f"{PARANOIDLAB_BASE}/telegram/posts",
+            headers=_pl_headers(),
+            params={"keyword": domain, "limit": limit},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data  = resp.json()
+            posts = data.get("posts") or data.get("items") or []
+            return {
+                "total":   data.get("total") or len(posts),
+                "posts":   posts[:5],
+                "next":    data.get("next"),
+            }
+        return {"error": f"Telegram API {resp.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def paranoidlab_create_target(domain: str) -> dict:
+    """Register a domain as a ParanoidLab monitoring target."""
+    if not PARANOIDLAB_API_KEY:
+        return {"error": "No ParanoidLab API key configured"}
+    try:
+        resp = requests.post(
+            f"{PARANOIDLAB_BASE}/targets/create",
+            headers=_pl_headers(),
+            json={"type": "domain", "value": domain, "tag": "swarmhawk"},
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            return resp.json()
+        return {"error": f"Create target failed: {resp.status_code}"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def paranoidlab_get_targets(domain: str) -> list:
+    """Return existing ParanoidLab targets matching the domain."""
+    if not PARANOIDLAB_API_KEY:
+        return []
+    try:
+        resp = requests.get(
+            f"{PARANOIDLAB_BASE}/targets",
+            headers=_pl_headers(),
+            params={"type": "domain", "search": domain, "limit": 5},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data.get("items") or data.get("targets") or []
+    except Exception as e:
+        print(f"[paranoidlab] targets error: {e}")
+    return []
+
+
+# ── Risk scoring helper ───────────────────────────────────────────────────────
+def _pl_risk(total: int, types: dict) -> tuple[str, str]:
+    """Return (status, summary) based on leak counts."""
+    passwords = types.get("password", 0)
+    cookies   = types.get("cookie", 0)
+    pii       = types.get("pii", 0)
+    if total == 0:
+        return "ok", "No leaked credentials or PII found in dark-web sources"
+    if passwords >= 10 or pii >= 5 or total >= 25:
+        return "critical", f"{total} leaked records found — {passwords} passwords, {cookies} cookies, {pii} PII records"
+    if total > 0:
+        return "warning", f"{total} leaked records detected — {passwords} passwords, {cookies} cookies, {pii} PII records"
+    return "ok", "No significant leaks detected"
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/domains/{domain_id}/paranoidlab")
+async def paranoidlab_domain_summary(domain_id: str, authorization: str = Header(None)):
+    """
+    ParanoidLab dark-web intelligence summary for a domain.
+    Returns leak counts + Telegram mentions.
+    """
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    d    = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found")
+    domain = d.data[0]["domain"]
+
+    # Run searches in parallel-ish (sequential but fast enough)
+    search_data  = paranoidlab_search(domain)
+    leaks_data   = paranoidlab_leaks(domain, limit=20)
+    telegram_data = paranoidlab_telegram(domain, limit=10)
+
+    total = leaks_data.get("total", 0)
+    types = leaks_data.get("types", {})
+    status, summary = _pl_risk(total, types)
+
+    return {
+        "domain":       domain,
+        "status":       status,
+        "summary":      summary,
+        "total_leaks":  total,
+        "leak_types":   types,
+        "leak_items":   leaks_data.get("items", []),
+        "telegram":     telegram_data,
+        "search_raw":   search_data,
+        "error":        leaks_data.get("error") or telegram_data.get("error"),
+        "powered_by":   "paranoidlab.com",
+    }
+
+
+@app.post("/domains/{domain_id}/paranoidlab/fetch")
+async def paranoidlab_fetch_leaks(domain_id: str, authorization: str = Header(None)):
+    """
+    Register domain as a ParanoidLab target and trigger a full leak fetch.
+    Costs 1 credit per unique source checked.
+    """
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    d    = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found")
+
+    if not PARANOIDLAB_API_KEY:
+        raise HTTPException(503, "ParanoidLab API key not configured")
+
+    domain = d.data[0]["domain"]
+
+    # Find or create target
+    targets = paranoidlab_get_targets(domain)
+    if targets:
+        target_id = targets[0]["id"]
+    else:
+        created = paranoidlab_create_target(domain)
+        if "error" in created:
+            raise HTTPException(502, f"Could not register target: {created['error']}")
+        target_id = created.get("id") or created.get("target", {}).get("id")
+
+    if not target_id:
+        raise HTTPException(502, "Failed to get target ID from ParanoidLab")
+
+    # Trigger fetch (costs credits)
+    try:
+        resp = requests.post(
+            f"{PARANOIDLAB_BASE}/leaks/fetch",
+            headers=_pl_headers(),
+            json={"target_id": target_id, "leak_types": ["password", "cookie", "pii"], "notify": False},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            result = resp.json()
+            return {
+                "domain":     domain,
+                "target_id":  target_id,
+                "request_id": result.get("request_id"),
+                "status":     result.get("status"),
+                "cost":       result.get("cost"),
+            }
+        raise HTTPException(502, f"Fetch failed: {resp.status_code} {resp.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+@app.get("/domains/{domain_id}/paranoidlab/requests")
+async def paranoidlab_fetch_status(domain_id: str, authorization: str = Header(None)):
+    """Check status of pending ParanoidLab leak fetch requests for a domain."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    d    = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found")
+
+    if not PARANOIDLAB_API_KEY:
+        raise HTTPException(503, "ParanoidLab API key not configured")
+
+    domain = d.data[0]["domain"]
+    try:
+        resp = requests.get(
+            f"{PARANOIDLAB_BASE}/leaks/requests",
+            headers=_pl_headers(),
+            params={"target": domain, "limit": 10},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        raise HTTPException(502, f"Error {resp.status_code}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+
+# ── Also expose a /paranoidlab/search endpoint for quick public lookup ────────
+@app.post("/paranoidlab/search")
+async def pl_public_search(body: dict):
+    """Quick no-auth domain search via ParanoidLab public search endpoint."""
+    query = (body.get("query") or "").strip()
+    if not query or "." not in query:
+        raise HTTPException(400, "Invalid query")
+    data = paranoidlab_search(query)
+    return data
 
 
 # ══════════════════════════════════════════════════════════════════════════════
