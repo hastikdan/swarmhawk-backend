@@ -2380,14 +2380,28 @@ def _resolve_api_key(api_key: str) -> dict:
 @app.post("/api/v1/scan")
 async def api_scan(request: Request, background_tasks: BackgroundTasks):
     """
-    Developer API: trigger a full domain scan and return results.
-    Pass API key via X-API-Key header.
+    Full domain scan. Accepts either:
+      - X-API-Key: <key>            (developer API)
+      - Authorization: Bearer <tok> (logged-in dashboard users)
 
     Body: { "domain": "example.com" }
     Returns: { "domain", "risk_score", "critical", "warnings", "checks", "scanned_at" }
     """
-    api_key = request.headers.get("X-API-Key", "")
-    user    = _resolve_api_key(api_key)
+    api_key  = request.headers.get("X-API-Key", "")
+    auth_hdr = request.headers.get("Authorization", "")
+    db = get_db()
+
+    if api_key:
+        # Developer API path — rate-limited by API key
+        user = _resolve_api_key(api_key)
+        db.table("api_keys").update({"calls_this_month": (user.get("calls_this_month") or 0) + 1})\
+            .eq("key", api_key).execute()
+    elif auth_hdr.startswith("Bearer "):
+        # Session-authenticated dashboard user — no API key needed
+        user = get_user_from_header(auth_hdr)
+    else:
+        raise HTTPException(401, "Missing X-API-Key header or Authorization token")
+
     body    = await request.json()
     domain  = (body.get("domain") or "").strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
     if not domain or "." not in domain:
@@ -2395,11 +2409,6 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
 
     if not SCANNER_AVAILABLE:
         raise HTTPException(503, "Scanner not available on this instance")
-
-    # Increment usage counter
-    db = get_db()
-    db.table("api_keys").update({"calls_this_month": (user.get("calls_this_month") or 0) + 1})\
-        .eq("key", api_key).execute()
 
     try:
         from cee_scanner.checks import scan_domain
