@@ -1098,9 +1098,6 @@ async def admin_llm_stats(authorization: str = Header(None)):
         cost  = float(log.get("cost", 0) or 0)
         toks  = int(log.get("total_tokens", 0) or 0)
 
-        for key, val, mp in [("cost", cost, user_map), ("tokens", toks, user_map)]:
-            pass  # avoid repeated traversal
-
         # user breakdown
         if uid not in user_map:
             user_map[uid] = {"user_id": uid, "cost": 0, "tokens": 0, "requests": 0}
@@ -2547,6 +2544,199 @@ def get_nis2_compliance(domain_id: str, authorization: str = Header(None)):
         "scanned_at":     scan.data[0]["scanned_at"],
         "note": "Based on NIS2 Directive (EU) 2022/2555 Article 21 security requirements. "
                 "This assessment is informational and does not constitute legal compliance certification.",
+    }
+
+
+# ── NIS2 Article labels for AI narrative ─────────────────────────────────────
+NIS2_ARTICLE_LABELS = {
+    "Art.21(2)(a)": "Security policies & risk analysis",
+    "Art.21(2)(b)": "Incident handling & threat detection",
+    "Art.21(2)(c)": "Business continuity & recovery",
+    "Art.21(2)(d)": "Supply chain & software security",
+    "Art.21(2)(e)": "Network & information system security",
+    "Art.21(2)(f)": "Vulnerability handling & disclosure",
+    "Art.21(2)(g)": "Cyber hygiene & data protection",
+    "Art.21(2)(h)": "Cryptography & encryption",
+    "Art.21(2)(i)": "Access control & authentication",
+    "Art.23":       "Incident reporting obligations",
+}
+
+
+@app.post("/domains/{domain_id}/nis2/report")
+async def generate_nis2_report(domain_id: str, authorization: str = Header(None)):
+    """
+    AI-generated NIS2 Compliance Autopilot report.
+    Maps scan findings → NIS2 Article 21 requirements → remediation steps.
+    """
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    d = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found or not your domain")
+    domain_name = d.data[0]["domain"]
+
+    scan = db.table("scans").select("checks,risk_score,scanned_at") \
+        .eq("domain_id", domain_id).order("scanned_at", desc=True).limit(1).execute()
+    if not scan.data:
+        raise HTTPException(404, "No scan data yet — run a scan first")
+
+    raw = scan.data[0].get("checks", []) or []
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except: raw = []
+
+    check_map = {c.get("check"): c for c in raw}
+
+    # Build per-article status from findings
+    article_status: dict = {}
+    for check_name, (article, requirement, weight) in NIS2_MAPPING.items():
+        c      = check_map.get(check_name)
+        status = c.get("status", "unknown") if c else "unknown"
+        passed = status in ("ok", "info")
+        detail = c.get("detail", "") if c else ""
+        if article not in article_status:
+            article_status[article] = {
+                "article":     article,
+                "label":       NIS2_ARTICLE_LABELS.get(article, article),
+                "checks":      [],
+                "pass":        0,
+                "fail":        0,
+            }
+        article_status[article]["checks"].append({
+            "check": check_name, "requirement": requirement,
+            "passed": passed, "status": status, "detail": detail[:200],
+        })
+        if passed:
+            article_status[article]["pass"] += 1
+        else:
+            article_status[article]["fail"] += 1
+
+    # Add Art.23 (incident reporting) — inferred from breach/blacklist checks
+    breach_checks = ["virustotal", "urlhaus", "spamhaus", "safebrowsing"]
+    breach_triggered = any(
+        check_map.get(c, {}).get("status") in ("critical", "warning")
+        for c in breach_checks
+    )
+    article_status["Art.23"] = {
+        "article": "Art.23",
+        "label":   NIS2_ARTICLE_LABELS["Art.23"],
+        "checks":  [{"check": "incident_indicators", "requirement": "Incident reporting readiness",
+                     "passed": not breach_triggered,
+                     "status": "warning" if breach_triggered else "ok",
+                     "detail": "Active threat indicators detected — incident reporting procedures should be reviewed" if breach_triggered else "No active incident indicators detected"}],
+        "pass": 0 if breach_triggered else 1,
+        "fail": 1 if breach_triggered else 0,
+    }
+
+    # Build gap list for critical failures
+    gaps = []
+    for art, info in article_status.items():
+        for chk in info["checks"]:
+            if not chk["passed"] and chk["status"] in ("critical", "warning"):
+                gaps.append(f"[{art}] {chk['requirement']}: {chk['status'].upper()}"
+                            + (f" — {chk['detail']}" if chk['detail'] else ""))
+
+    # Compute overall compliance score
+    findings_list = []
+    total_w = pass_w = 0
+    for check_name, (article, requirement, weight) in NIS2_MAPPING.items():
+        c      = check_map.get(check_name)
+        status = c.get("status", "unknown") if c else "unknown"
+        passed = status in ("ok", "info")
+        total_w += weight
+        if passed: pass_w += weight
+        findings_list.append({"check": check_name, "article": article,
+                               "requirement": requirement, "status": status,
+                               "passed": passed, "weight": weight})
+    compliance_pct = round(pass_w / total_w * 100) if total_w else 0
+    rating = "COMPLIANT" if compliance_pct >= 80 else "PARTIAL" if compliance_pct >= 50 else "NON-COMPLIANT"
+
+    # AI narrative
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    ai_narrative = {"executive_summary": "", "article_narratives": {}, "priority_actions": [], "audit_statement": ""}
+
+    if api_key:
+        gap_text = "\n".join(gaps[:15]) if gaps else "No critical gaps found."
+        article_summary = "\n".join(
+            f"{art} ({info['label']}): {info['pass']} passed, {info['fail']} failed"
+            for art, info in article_status.items()
+        )
+        system_prompt = (
+            "You are a EU NIS2 compliance specialist. Analyse a domain's security scan results "
+            "and produce a structured compliance report. Be specific, actionable, and professional. "
+            "Reference exact NIS2 article numbers. Use plain text, no markdown symbols."
+        )
+        user_prompt = (
+            f"Domain: {domain_name}\n"
+            f"Overall NIS2 Compliance: {compliance_pct}% ({rating})\n"
+            f"Risk Score: {scan.data[0].get('risk_score', 0)}/100\n\n"
+            f"Article-by-Article Status:\n{article_summary}\n\n"
+            f"Key Gaps:\n{gap_text}\n\n"
+            f"Generate a NIS2 Compliance Autopilot Report with these exact sections:\n\n"
+            f"1. EXECUTIVE SUMMARY\n"
+            f"2-3 sentences summarising overall compliance posture for {domain_name}.\n\n"
+            f"2. ARTICLE-BY-ARTICLE ASSESSMENT\n"
+            f"For each of the 9 NIS2 articles above, one sentence on status and what action is needed.\n\n"
+            f"3. PRIORITY REMEDIATION ACTIONS\n"
+            f"List exactly 5 numbered concrete remediation steps, each mapped to a NIS2 article number.\n\n"
+            f"4. AUDIT READINESS STATEMENT\n"
+            f"2 sentences suitable for inclusion in a compliance audit report.\n"
+        )
+        try:
+            result = await _call_claude_async(
+                api_key=api_key,
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1200,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                metadata={"report_type": "nis2_report", "_user": user["sub"], "domain": domain_name},
+            )
+            full_text = result.get("content", [{}])[0].get("text", "")
+            # Parse sections
+            sections = {"executive_summary": "", "article_narratives": {}, "priority_actions": [], "audit_statement": ""}
+            current = None
+            for line in full_text.split("\n"):
+                t = line.strip()
+                if not t:
+                    continue
+                if "EXECUTIVE SUMMARY" in t.upper():
+                    current = "exec"; continue
+                if "ARTICLE-BY-ARTICLE" in t.upper():
+                    current = "articles"; continue
+                if "PRIORITY REMEDIATION" in t.upper():
+                    current = "actions"; continue
+                if "AUDIT READINESS" in t.upper():
+                    current = "audit"; continue
+                if current == "exec":
+                    sections["executive_summary"] += t + " "
+                elif current == "articles":
+                    sections["article_narratives"][len(sections["article_narratives"])] = t
+                elif current == "actions":
+                    if t[0].isdigit():
+                        sections["priority_actions"].append(t)
+                elif current == "audit":
+                    sections["audit_statement"] += t + " "
+            ai_narrative = {
+                "executive_summary": sections["executive_summary"].strip(),
+                "article_narratives": list(sections["article_narratives"].values()),
+                "priority_actions": sections["priority_actions"][:5],
+                "audit_statement": sections["audit_statement"].strip(),
+                "raw": full_text,
+            }
+        except Exception as e:
+            ai_narrative["executive_summary"] = f"AI narrative unavailable: {str(e)}"
+
+    return {
+        "domain":         domain_name,
+        "compliance_pct": compliance_pct,
+        "rating":         rating,
+        "scanned_at":     scan.data[0]["scanned_at"],
+        "article_status": list(article_status.values()),
+        "findings":       sorted(findings_list, key=lambda x: (x["passed"], -x["weight"])),
+        "gaps_count":     len(gaps),
+        "ai_narrative":   ai_narrative,
+        "note": "Based on NIS2 Directive (EU) 2022/2555. Informational only — not legal compliance certification.",
     }
 
 
