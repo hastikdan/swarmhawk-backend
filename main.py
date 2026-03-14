@@ -976,6 +976,24 @@ def admin_stats(authorization: str = Header(None)):
             "scanned_at": s.get("scanned_at", ""),
         })
 
+    # API key usage stats
+    try:
+        api_key_rows = db.table("api_keys").select("user_id,calls_this_month,limit_per_month,active,created_at").execute()
+        api_keys_data = api_key_rows.data or []
+    except Exception:
+        api_keys_data = []
+    active_keys    = [k for k in api_keys_data if k.get("active", True)]
+    total_api_calls = sum(k.get("calls_this_month") or 0 for k in api_keys_data)
+    new_keys_7d    = within_days(api_keys_data, "created_at", 7)
+    new_keys_30d   = within_days(api_keys_data, "created_at", 30)
+    # Top 5 API users by calls this month
+    top_api = sorted(
+        [{"user_id": k.get("user_id","?"), "key": (k.get("key") or "")[:12]+"…",
+          "calls": k.get("calls_this_month") or 0, "limit": k.get("limit_per_month") or 10}
+         for k in api_keys_data if k.get("calls_this_month")],
+        key=lambda x: x["calls"], reverse=True
+    )[:5]
+
     return {
         "users": {
             "total":      len(users.data),
@@ -983,6 +1001,14 @@ def admin_stats(authorization: str = Header(None)):
             "email":      email_users,
             "new_7d":     within_days(users.data, "created_at", 7),
             "new_30d":    within_days(users.data, "created_at", 30),
+        },
+        "api_keys": {
+            "total":           len(api_keys_data),
+            "active":          len(active_keys),
+            "calls_this_month": total_api_calls,
+            "new_7d":          new_keys_7d,
+            "new_30d":         new_keys_30d,
+            "top_users":       top_api,
         },
         "domains": {
             "total":      len(domains.data),
