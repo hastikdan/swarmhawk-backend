@@ -26,7 +26,7 @@ import stripe
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -1033,8 +1033,11 @@ def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authoriza
 
 
 @app.get("/admin/llm-stats")
-async def admin_llm_stats(authorization: str = Header(None)):
-    """Fetch LLM usage, cost, and per-user breakdown from Portkey Analytics."""
+async def admin_llm_stats(
+    authorization: str = Header(None),
+    period: str = Query("month"),  # "day" | "month" | "year"
+):
+    """Fetch LLM usage, cost, per-domain, and time-series breakdown from Portkey."""
     require_admin(authorization)
 
     if not PORTKEY_API_KEY:
@@ -1048,74 +1051,106 @@ async def admin_llm_stats(authorization: str = Header(None)):
         "Content-Type": "application/json",
     }
     now = datetime.now(timezone.utc)
-    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+    # Compute period start based on requested granularity
+    if period == "day":
+        period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        period_label = "today"
+        ts_fmt = "%H:00"          # group by hour
+        ts_key = lambda ts: ts[:13]  # "YYYY-MM-DDTHH"
+    elif period == "year":
+        period_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = "this year"
+        ts_fmt = "%b %Y"          # group by month "Jan 2025"
+        ts_key = lambda ts: ts[:7]   # "YYYY-MM"
+    else:  # month (default)
+        period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        period_label = "this month"
+        ts_fmt = "%d %b"          # group by day "01 Mar"
+        ts_key = lambda ts: ts[:10]  # "YYYY-MM-DD"
+
+    period_start_iso = period_start.isoformat()
 
     try:
         import httpx
-        async with httpx.AsyncClient(timeout=20) as client:
-            # 1. Aggregate analytics for current month
+        async with httpx.AsyncClient(timeout=30) as client:
+            # 1. Aggregate analytics for the period
             analytics_r = await client.get(
                 "https://api.portkey.ai/v1/analytics",
                 headers=pk_headers,
-                params={
-                    "filters[time_of_generation][gt]": month_start,
-                },
+                params={"filters[time_of_generation][gt]": period_start_iso},
             )
             analytics = analytics_r.json() if analytics_r.status_code == 200 else {}
 
-            # 2. Recent logs for per-user and per-type breakdown (last 200)
+            # 2. Fetch logs for the period (up to 500 for richer breakdowns)
             logs_r = await client.get(
                 "https://api.portkey.ai/v1/logs",
                 headers=pk_headers,
-                params={"page_size": 200, "page": 0},
+                params={
+                    "page_size": 500,
+                    "page": 0,
+                    "filters[time_of_generation][gt]": period_start_iso,
+                },
             )
             logs_data = logs_r.json() if logs_r.status_code == 200 else {}
 
     except Exception as e:
         raise HTTPException(502, f"Portkey API error: {e}")
 
-    # Parse analytics totals
-    totals = analytics.get("total", analytics)  # shape varies by Portkey version
-    total_cost     = totals.get("cost", totals.get("total_cost", 0)) or 0
-    total_tokens   = totals.get("tokens", totals.get("total_tokens", 0)) or 0
-    total_requests = totals.get("requests", totals.get("total_requests", 0)) or 0
-    prompt_tokens  = totals.get("prompt_tokens", 0) or 0
-    completion_tokens = totals.get("completion_tokens", 0) or 0
+    # Parse analytics totals (Portkey shape varies by version)
+    totals = analytics.get("total", analytics)
+    total_cost        = float(totals.get("cost", totals.get("total_cost", 0)) or 0)
+    total_tokens      = int(totals.get("tokens", totals.get("total_tokens", 0)) or 0)
+    total_requests    = int(totals.get("requests", totals.get("total_requests", 0)) or 0)
+    prompt_tokens     = int(totals.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(totals.get("completion_tokens", 0) or 0)
 
-    # Parse logs for breakdowns
-    logs = logs_data.get("data", logs_data.get("logs", []))
-    user_map   = {}   # user_id -> {cost, tokens, requests}
+    # Parse logs for per-domain, per-user, per-type, and time-series breakdowns
+    logs       = logs_data.get("data", logs_data.get("logs", []))
+    user_map   = {}   # user_id  -> {cost, tokens, requests}
     type_map   = {}   # report_type -> {cost, tokens, requests}
+    domain_map = {}   # domain   -> {cost, tokens, requests}
+    time_map   = {}   # date_key -> {cost, tokens, requests}
 
+    import json as _j
     for log in logs:
-        meta    = log.get("metadata") or {}
+        meta = log.get("metadata") or {}
         if isinstance(meta, str):
             try:
-                import json as _j; meta = _j.loads(meta)
+                meta = _j.loads(meta)
             except Exception:
                 meta = {}
-        uid  = meta.get("_user", "anonymous")
-        rtype = meta.get("report_type", "unknown")
-        cost  = float(log.get("cost", 0) or 0)
-        toks  = int(log.get("total_tokens", 0) or 0)
 
-        # user breakdown
-        if uid not in user_map:
-            user_map[uid] = {"user_id": uid, "cost": 0, "tokens": 0, "requests": 0}
-        user_map[uid]["cost"]     += cost
-        user_map[uid]["tokens"]   += toks
-        user_map[uid]["requests"] += 1
+        uid    = meta.get("_user", "anonymous")
+        rtype  = meta.get("report_type", "unknown")
+        domain = meta.get("domain", "")
+        cost   = float(log.get("cost", 0) or 0)
+        toks   = int(log.get("total_tokens", 0) or 0)
 
-        # type breakdown
-        if rtype not in type_map:
-            type_map[rtype] = {"report_type": rtype, "cost": 0, "tokens": 0, "requests": 0}
-        type_map[rtype]["cost"]     += cost
-        type_map[rtype]["tokens"]   += toks
-        type_map[rtype]["requests"] += 1
+        # ── time key from log timestamp ──────────────────────────────────────
+        ts_raw = log.get("created_at") or log.get("time_of_generation") or ""
+        try:
+            dk = ts_key(ts_raw) if ts_raw else ""
+        except Exception:
+            dk = ""
 
-    # Enrich user breakdown with emails from DB (best effort)
+        def _add(m, key, label_key, label_val):
+            if key not in m:
+                m[key] = {label_key: label_val, "cost": 0.0, "tokens": 0, "requests": 0}
+            m[key]["cost"]     += cost
+            m[key]["tokens"]   += toks
+            m[key]["requests"] += 1
+
+        _add(user_map,   uid,    "user_id",     uid)
+        _add(type_map,   rtype,  "report_type", rtype)
+        if domain:
+            _add(domain_map, domain, "domain",  domain)
+        if dk:
+            _add(time_map,   dk,     "date_key", dk)
+
+    # Enrich user breakdown with emails
     db = get_admin_db()
-    user_ids = [u for u in user_map if u != "anonymous"]
+    user_ids  = [u for u in user_map if u != "anonymous"]
     email_map = {}
     if user_ids:
         try:
@@ -1130,21 +1165,35 @@ async def admin_llm_stats(authorization: str = Header(None)):
         u["email"] = email_map.get(u["user_id"], u["user_id"][:8] + "…")
         u["cost"]  = round(u["cost"], 6)
 
+    domain_breakdown = sorted(domain_map.values(), key=lambda x: x["cost"], reverse=True)
+    for d in domain_breakdown:
+        d["cost"] = round(d["cost"], 6)
+
     type_breakdown = sorted(type_map.values(), key=lambda x: x["requests"], reverse=True)
 
+    # Build sorted time series
+    time_series = sorted(
+        [{"date": k, "cost": round(v["cost"], 6), "tokens": v["tokens"], "requests": v["requests"]}
+         for k, v in time_map.items()],
+        key=lambda x: x["date"],
+    )
+
     return {
-        "configured": True,
-        "period": "current month",
+        "configured":    True,
+        "period":        period_label,
+        "period_key":    period,
         "totals": {
-            "cost":              round(float(total_cost), 6),
-            "tokens":            int(total_tokens),
-            "prompt_tokens":     int(prompt_tokens),
-            "completion_tokens": int(completion_tokens),
-            "requests":          int(total_requests),
-            "avg_cost_per_req":  round(float(total_cost) / max(int(total_requests), 1), 6),
+            "cost":              round(total_cost, 6),
+            "tokens":            total_tokens,
+            "prompt_tokens":     prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "requests":          total_requests,
+            "avg_cost_per_req":  round(total_cost / max(total_requests, 1), 6),
         },
+        "by_domain":      domain_breakdown[:100],
         "by_user":        user_breakdown[:50],
         "by_report_type": type_breakdown,
+        "time_series":    time_series,
     }
 
 
