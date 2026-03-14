@@ -65,3 +65,21 @@ alter table sessions  disable row level security;
 alter table domains   disable row level security;
 alter table scans     disable row level security;
 alter table purchases disable row level security;
+
+
+-- ── Outreach email templates (country-specific AI prompt overrides) ────────────
+create table if not exists outreach_templates (
+  country     varchar(2)   primary key,
+  language    varchar(30)  not null default 'en',
+  prompt      text         not null,
+  updated_at  timestamptz  default now()
+);
+alter table outreach_templates disable row level security;
+
+-- ── Admin settings (key-value store for admin-configurable values) ─────────────
+create table if not exists admin_settings (
+  key        text primary key,
+  value      text not null,
+  updated_at timestamptz default now()
+);
+alter table admin_settings disable row level security;

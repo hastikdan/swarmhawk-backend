@@ -791,6 +791,117 @@ def check_ip_intel(domain: str) -> CheckResult:
     return _check_ip_intel(domain)
 
 
+def check_paranoidlab(domain: str) -> CheckResult:
+    """
+    ParanoidLab — dark-web credential & PII leak intelligence.
+    Public search (no key): aggregated leak counts.
+    With PARANOIDLAB_API_KEY: full leak detail + Telegram dark-web posts.
+    """
+    import os
+    result = CheckResult("paranoidlab", domain)
+    api_key = os.getenv("PARANOIDLAB_API_KEY", "")
+    base = "https://paranoidlab.com/v1"
+
+    # ── Public search (no key required) ──────────────────────────────────────
+    try:
+        r = requests.post(
+            f"{base}/search",
+            json={"query": domain},
+            timeout=10,
+        )
+        search_data = r.json() if r.status_code == 200 else {}
+    except Exception:
+        search_data = {}
+
+    # ── Authenticated leak fetch (key required) ───────────────────────────────
+    total = 0
+    types: dict = {}
+    telegram_total = 0
+    detail_lines = []
+
+    if api_key:
+        try:
+            r = requests.get(
+                f"{base}/leaks",
+                headers={"X-Key": api_key, "Content-Type": "application/json"},
+                params={"data_url": domain, "limit": 20, "offset": 0},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                items = data.get("items") or data.get("leaks") or []
+                total = data.get("total") or len(items)
+                for item in items:
+                    t = item.get("type", "unknown")
+                    types[t] = types.get(t, 0) + 1
+            elif r.status_code == 401:
+                return result.error("ParanoidLab: invalid API key")
+        except Exception as e:
+            return result.error("ParanoidLab leaks fetch failed", str(e)[:80])
+
+        try:
+            r = requests.get(
+                f"{base}/telegram/posts",
+                headers={"X-Key": api_key, "Content-Type": "application/json"},
+                params={"keyword": domain, "limit": 10},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                tdata = r.json()
+                posts = tdata.get("posts") or tdata.get("items") or []
+                telegram_total = tdata.get("total") or len(posts)
+        except Exception:
+            pass
+
+        # Build detail string
+        if total > 0:
+            parts = [f"{v} {k}" for k, v in types.items()]
+            detail_lines.append(f"Leaked records: {total} ({', '.join(parts)})")
+        if telegram_total > 0:
+            detail_lines.append(f"Telegram dark-web mentions: {telegram_total}")
+
+        passwords = types.get("password", 0)
+        pii = types.get("pii", 0)
+
+        if total == 0:
+            return result.ok(
+                "No leaked credentials found in dark-web sources",
+                f"Powered by ParanoidLab | Telegram mentions: {telegram_total}",
+            )
+        elif passwords >= 10 or pii >= 5 or total >= 25:
+            return result.critical(
+                f"DARK WEB LEAK — {total} records exposed",
+                " | ".join(detail_lines),
+                impact=20,
+            )
+        else:
+            return result.warn(
+                f"Dark-web leak detected — {total} records",
+                " | ".join(detail_lines),
+                impact=10,
+            )
+
+    # ── No key: use public search summary only ────────────────────────────────
+    pub_total = search_data.get("total") or search_data.get("count") or 0
+    if pub_total == 0:
+        return result.ok(
+            "No public leak records found",
+            "Set PARANOIDLAB_API_KEY for full dark-web intelligence",
+        )
+    elif pub_total >= 25:
+        return result.critical(
+            f"DARK WEB LEAK — {pub_total} records (public search)",
+            "Set PARANOIDLAB_API_KEY for full credential details",
+            impact=20,
+        )
+    else:
+        return result.warn(
+            f"Dark-web records detected — {pub_total} found",
+            "Set PARANOIDLAB_API_KEY for full credential details",
+            impact=10,
+        )
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -815,6 +926,8 @@ ALL_CHECKS = [
     check_iac,                  # Terraform state, K8s configs, CI/CD files
     # ── IP Intelligence ──
     check_ip_intel,             # IP reputation, blocklists, Shodan, AbuseIPDB, co-hosted domains
+    # ── Dark Web Intelligence ──
+    check_paranoidlab,          # credential & PII leaks + Telegram dark-web posts
 ]
 
 

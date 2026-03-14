@@ -1148,6 +1148,78 @@ async def admin_llm_stats(authorization: str = Header(None)):
     }
 
 
+# ── PDF Report Email Template ─────────────────────────────────────────────────
+# Variables available in both subject and body:
+#   {domain}       – the scanned domain name
+#   {risk_score}   – numeric risk score 0-100
+#   {score_label}  – HIGH RISK / MEDIUM RISK / LOW RISK
+#   {criticals}    – number of critical findings
+#   {warnings}     – number of warning findings
+#   {checks_count} – total checks run
+#   {scanned_at}   – date of scan (YYYY-MM-DD)
+
+_REPORT_EMAIL_DEFAULTS = {
+    "subject": "Security Report: {domain} — {score_label} ({risk_score}/100)",
+    "body":    (
+        "Your full security report for <strong>{domain}</strong> is attached as a PDF.<br>"
+        "It includes all check results, findings, and remediation recommendations."
+    ),
+    "footer":  "SwarmHawk · CEE Cybersecurity Intelligence<br>This report is confidential and intended for the named recipient only.",
+}
+
+_report_email_cache: dict | None = None
+
+
+def _get_report_email_template() -> dict:
+    global _report_email_cache
+    if _report_email_cache is not None:
+        return _report_email_cache
+    try:
+        db = get_db()
+        rows = db.table("admin_settings").select("key,value").in_("key", ["report_subject", "report_body", "report_footer"]).execute()
+        tpl = dict(_REPORT_EMAIL_DEFAULTS)
+        for row in (rows.data or []):
+            k = row["key"].replace("report_", "")
+            tpl[k] = row["value"]
+        _report_email_cache = tpl
+        return tpl
+    except Exception:
+        return dict(_REPORT_EMAIL_DEFAULTS)
+
+
+class ReportEmailTemplate(BaseModel):
+    subject: str
+    body:    str
+    footer:  str = ""
+
+
+@app.get("/admin/report-email-template")
+def get_report_email_template(authorization: str = Header(None)):
+    require_admin(authorization)
+    return {"template": _get_report_email_template(), "defaults": _REPORT_EMAIL_DEFAULTS}
+
+
+@app.put("/admin/report-email-template")
+def save_report_email_template(body: ReportEmailTemplate, authorization: str = Header(None)):
+    global _report_email_cache
+    require_admin(authorization)
+    db = get_db()
+    for key, val in [("report_subject", body.subject), ("report_body", body.body), ("report_footer", body.footer)]:
+        db.table("admin_settings").upsert({"key": key, "value": val, "updated_at": datetime.now(timezone.utc).isoformat()}, on_conflict="key").execute()
+    _report_email_cache = {"subject": body.subject, "body": body.body, "footer": body.footer}
+    return {"saved": True}
+
+
+@app.delete("/admin/report-email-template")
+def reset_report_email_template(authorization: str = Header(None)):
+    global _report_email_cache
+    require_admin(authorization)
+    db = get_db()
+    db.table("admin_settings").delete().in_("key", ["report_subject", "report_body", "report_footer"]).execute()
+    _report_email_cache = None
+    return {"reset": True, "template": _REPORT_EMAIL_DEFAULTS}
+
+
 @app.get("/me")
 def get_me(authorization: str = Header(None)):
     """Return current user info including is_admin flag."""
@@ -1439,7 +1511,7 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     # Free = core checks visible; paid = all checks including AI summary
     FREE_CHECKS = {"urlhaus", "safebrowsing", "virustotal", "spamhaus", "breach",
                    "whois", "email_security", "ssl", "headers", "dns",
-                   "sast", "sca", "dast", "iac"}
+                   "sast", "sca", "dast", "iac", "paranoidlab"}
 
     if is_paid:
         visible_checks = checks
@@ -1551,6 +1623,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
         "cve": "CVE Scan", "sast": "SAST — Source Exposure",
         "sca": "SCA — Dependency CVEs", "dast": "DAST — App Testing",
         "iac": "IaC — Config Exposure", "ip_intel": "IP Intelligence",
+        "paranoidlab": "Dark Web Leaks",
     }
 
     for c in non_ai:
@@ -1668,6 +1741,27 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
     criticals = sum(1 for c in non_ai if c.get("status") == "critical")
     warnings  = sum(1 for c in non_ai if c.get("status") == "warning")
 
+    # Resolve custom or default template
+    tpl = _get_report_email_template()
+    tpl_vars = dict(
+        domain=d['domain'], risk_score=risk_score, score_label=score_label,
+        criticals=criticals, warnings=warnings, checks_count=len(non_ai),
+        scanned_at=scanned_at[:10],
+    )
+    try:
+        subject = tpl["subject"].format(**tpl_vars)
+    except (KeyError, ValueError):
+        subject = f"Security Report: {d['domain']} — {score_label} ({risk_score}/100)"
+    try:
+        body_text = tpl["body"].format(**tpl_vars)
+    except (KeyError, ValueError):
+        body_text = f"Your full security report for <strong>{d['domain']}</strong> is attached as a PDF."
+    try:
+        footer_text = (tpl.get("footer") or _REPORT_EMAIL_DEFAULTS["footer"]).format(**tpl_vars)
+    except (KeyError, ValueError):
+        footer_text = _REPORT_EMAIL_DEFAULTS["footer"]
+
+    score_color = '#c0392b' if risk_score >= 60 else '#d4850a' if risk_score >= 30 else '#1a7a4a'
     email_html = f"""
     <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
       <div style="margin-bottom:28px">
@@ -1677,7 +1771,7 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
       <p style="color:#888;font-size:13px;margin-bottom:24px">Scanned {scanned_at[:10]}</p>
       <div style="background:#111;border:1px solid #222;border-radius:8px;padding:20px;margin-bottom:24px;display:flex;gap:24px">
         <div style="text-align:center">
-          <div style="font-size:32px;font-weight:700;color:{'#c0392b' if risk_score>=60 else '#d4850a' if risk_score>=30 else '#1a7a4a'}">{risk_score}</div>
+          <div style="font-size:32px;font-weight:700;color:{score_color}">{risk_score}</div>
           <div style="font-size:11px;color:#888;font-family:monospace">{score_label}</div>
         </div>
         <div style="border-left:1px solid #222;padding-left:24px">
@@ -1686,14 +1780,8 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
           <div style="color:#888;font-size:12px;margin-top:4px">{len(non_ai)} checks run</div>
         </div>
       </div>
-      <p style="color:#aaa;font-size:13px;line-height:1.6">
-        Your full security report for <strong style="color:#fff">{d['domain']}</strong> is attached as a PDF.
-        It includes all check results, findings, and remediation recommendations.
-      </p>
-      <p style="color:#555;font-size:11px;margin-top:32px">
-        SwarmHawk · CEE Cybersecurity Intelligence<br>
-        This report is confidential and intended for the named recipient only.
-      </p>
+      <p style="color:#aaa;font-size:13px;line-height:1.6">{body_text}</p>
+      <p style="color:#555;font-size:11px;margin-top:32px">{footer_text}</p>
     </div>
     """
 
@@ -1705,7 +1793,7 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
             json={
                 "from":    f"SwarmHawk Reports <{FROM_EMAIL}>",
                 "to":      [body.email],
-                "subject": f"Security Report: {d['domain']} — {score_label} ({risk_score}/100)",
+                "subject": subject,
                 "html":    email_html,
                 "attachments": [{"filename": filename, "content": pdf_b64}],
             },
@@ -2331,7 +2419,7 @@ async def public_scan(body: PublicScanRequest):
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "sast", "sca", "dast", "iac"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "sast", "sca", "dast", "iac", "paranoidlab"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 

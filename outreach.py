@@ -379,26 +379,28 @@ def scan_domain_passive(domain: str, country: str) -> Optional[dict]:
 def generate_email_body(prospect: dict) -> str:
     if not ANTHROPIC_KEY:
         return _fallback_email(prospect)
-    top_cve = prospect["cves"][0]
+    top_cve  = prospect["cves"][0]
     sw_list  = ", ".join(f"{s['product']} {s['version']}" for s in prospect["software"])
     cve_list = ", ".join(f"{c['id']} CVSS {c['cvss']}" for c in prospect["cves"][:3])
-    prompt = (
-        f"Write a short professional cold outreach email (6-8 sentences) "
-        f"from SwarmHawk, a European cybersecurity intelligence company, "
-        f"to the webmaster or IT manager of {prospect['domain']}.\n\n"
-        f"Findings from our passive scan:\n"
-        f"- Exposed software: {sw_list}\n"
-        f"- Live CVEs: {cve_list}\n\n"
-        f"Requirements:\n"
-        f"1. Subject line on first line as: Subject: <subject>\n"
-        f"2. Open with {top_cve['id']} (CVSS {top_cve['cvss']}) as concrete proof\n"
-        f"3. One sentence plain-language risk explanation\n"
-        f"4. Reference NIS2 compliance briefly\n"
-        f"5. Offer a free full security report at swarmhawk.eu\n"
-        f"6. Professional, direct — not alarmist\n"
-        f"7. Sign off: The SwarmHawk Team | swarmhawk.eu\n\n"
-        f"Output ONLY the email. No preamble. No markdown."
-    )
+    country  = prospect.get("country", "")
+    template = _get_country_template(country)
+    try:
+        prompt = template.format(
+            domain=prospect["domain"],
+            sw_list=sw_list,
+            cve_list=cve_list,
+            top_cve_id=top_cve["id"],
+            top_cvss=top_cve["cvss"],
+        )
+    except KeyError:
+        # Template uses unknown variables — fall back to default
+        prompt = DEFAULT_TEMPLATE.format(
+            domain=prospect["domain"],
+            sw_list=sw_list,
+            cve_list=cve_list,
+            top_cve_id=top_cve["id"],
+            top_cvss=top_cve["cvss"],
+        )
     try:
         r = req.post(
             "https://api.anthropic.com/v1/messages",
@@ -806,6 +808,129 @@ def _text_to_html(text: str, domain: str) -> str:
     SwarmHawk Security Intelligence · swarmhawk.eu
   </p>
 </body></html>"""
+
+
+# ── Email template endpoints ──────────────────────────────────────────────────
+
+# Default English prompt template (variables: {domain}, {sw_list}, {cve_list}, {top_cve_id}, {top_cvss})
+DEFAULT_TEMPLATE = (
+    "Write a short professional cold outreach email (6-8 sentences) "
+    "from SwarmHawk, a European cybersecurity intelligence company, "
+    "to the webmaster or IT manager of {domain}.\n\n"
+    "Findings from our passive scan:\n"
+    "- Exposed software: {sw_list}\n"
+    "- Live CVEs: {cve_list}\n\n"
+    "Requirements:\n"
+    "1. Subject line on first line as: Subject: <subject>\n"
+    "2. Open with {top_cve_id} (CVSS {top_cvss}) as concrete proof\n"
+    "3. One sentence plain-language risk explanation\n"
+    "4. Reference NIS2 compliance briefly\n"
+    "5. Offer a free full security report at swarmhawk.eu\n"
+    "6. Professional, direct — not alarmist\n"
+    "7. Sign off: The SwarmHawk Team | swarmhawk.eu\n\n"
+    "Output ONLY the email. No preamble. No markdown."
+)
+
+# In-memory template cache (populated from DB on first access)
+_template_cache: dict = {}
+
+
+def _get_country_template(country: str) -> str:
+    """Return the custom prompt template for a country, or default English."""
+    if country in _template_cache:
+        return _template_cache[country]
+    try:
+        db = get_db()
+        r = db.table("outreach_templates").select("prompt").eq("country", country).execute()
+        if r.data:
+            _template_cache[country] = r.data[0]["prompt"]
+            return _template_cache[country]
+    except Exception:
+        pass
+    return DEFAULT_TEMPLATE
+
+
+class TemplateUpdate(BaseModel):
+    prompt: str
+    language: str = "en"
+
+
+@router.get("/templates")
+async def get_templates(authorization: str = Header(None)):
+    """Get all country email templates (admin only)."""
+    require_admin(authorization)
+    db = get_db()
+    try:
+        r = db.table("outreach_templates").select("*").execute()
+        rows = {row["country"]: row for row in (r.data or [])}
+    except Exception:
+        rows = {}
+    # Return defaults for countries without custom template
+    result = {}
+    for country in list(COUNTRY_TLDS.keys())[:20]:   # first 20 most common
+        result[country] = {
+            "country":  country,
+            "language": rows[country]["language"] if country in rows else "en",
+            "prompt":   rows[country]["prompt"]   if country in rows else DEFAULT_TEMPLATE,
+            "custom":   country in rows,
+        }
+    return {"templates": result, "default_template": DEFAULT_TEMPLATE}
+
+
+@router.put("/templates/{country}")
+async def save_template(country: str, body: TemplateUpdate, authorization: str = Header(None)):
+    """Save a country-specific email prompt template (admin only)."""
+    require_admin(authorization)
+    if country not in COUNTRY_TLDS:
+        raise HTTPException(400, f"Unknown country code: {country}")
+    db = get_db()
+    db.table("outreach_templates").upsert({
+        "country":  country,
+        "language": body.language,
+        "prompt":   body.prompt,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }, on_conflict="country").execute()
+    _template_cache[country] = body.prompt   # update in-memory cache
+    return {"status": "saved", "country": country}
+
+
+@router.delete("/templates/{country}")
+async def reset_template(country: str, authorization: str = Header(None)):
+    """Reset a country template back to default (admin only)."""
+    require_admin(authorization)
+    db = get_db()
+    db.table("outreach_templates").delete().eq("country", country).execute()
+    _template_cache.pop(country, None)
+    return {"status": "reset", "country": country, "prompt": DEFAULT_TEMPLATE}
+
+
+@router.post("/templates/test")
+async def test_template(body: dict, authorization: str = Header(None)):
+    """Generate a test email using a given template + fake domain data (admin only)."""
+    require_admin(authorization)
+    prompt_tpl = body.get("prompt", DEFAULT_TEMPLATE)
+    test_domain = body.get("domain", "example.com")
+    filled = prompt_tpl.format(
+        domain=test_domain,
+        sw_list="WordPress 6.1.1",
+        cve_list="CVE-2023-1234 CVSS 9.8",
+        top_cve_id="CVE-2023-1234",
+        top_cvss="9.8",
+    )
+    if not ANTHROPIC_KEY:
+        return {"email": f"[No ANTHROPIC_API_KEY set]\n\nPrompt that would be sent:\n\n{filled}"}
+    try:
+        r = req.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 500, "messages": [{"role": "user", "content": filled}]},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return {"email": r.json()["content"][0]["text"].strip()}
+    except Exception as e:
+        pass
+    return {"email": "[Generation failed]"}
 
 
 # ── APScheduler daily cron ────────────────────────────────────────────────────
