@@ -35,7 +35,7 @@ router = APIRouter(prefix="/outreach", tags=["outreach"])
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 ANTHROPIC_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")
-FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.com")
 FROM_NAME           = "SwarmHawk Security"
 CVSS_THRESHOLD      = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
 DAILY_SEND_LIMIT    = int(os.getenv("OUTREACH_DAILY_LIMIT", "20"))
@@ -451,9 +451,9 @@ def _fallback_email(p: dict) -> str:
         f"This is a publicly known vulnerability that could expose your organisation "
         f"to data breaches and NIS2 compliance penalties.\n\n"
         f"We have prepared a free full security report for {p['domain']} including "
-        f"exact findings and remediation steps. Visit swarmhawk.eu or reply to this "
+        f"exact findings and remediation steps. Visit swarmhawk.com or reply to this "
         f"email to access it.\n\n"
-        f"The SwarmHawk Team | swarmhawk.eu"
+        f"The SwarmHawk Team | swarmhawk.com"
     )
 
 
@@ -821,7 +821,7 @@ def _text_to_html(text: str, domain: str) -> str:
   <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
   <p style="font-size:11px;color:#999">
     This is an automated security notification. To unsubscribe reply with "unsubscribe".<br>
-    SwarmHawk Security Intelligence · swarmhawk.eu
+    SwarmHawk Security Intelligence · swarmhawk.com
   </p>
 </body></html>"""
 
@@ -841,9 +841,9 @@ DEFAULT_TEMPLATE = (
     "2. Open with {top_cve_id} (CVSS {top_cvss}) as concrete proof\n"
     "3. One sentence plain-language risk explanation\n"
     "4. Reference NIS2 compliance briefly\n"
-    "5. Offer a free full security report at swarmhawk.eu\n"
+    "5. Offer a free full security report at swarmhawk.com\n"
     "6. Professional, direct — not alarmist\n"
-    "7. Sign off: The SwarmHawk Team | swarmhawk.eu\n\n"
+    "7. Sign off: The SwarmHawk Team | swarmhawk.com\n\n"
     "Output ONLY the email. No preamble. No markdown."
 )
 

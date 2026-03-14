@@ -46,7 +46,7 @@ ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-a
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
 PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.com")
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
 SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-scanner")
 
@@ -181,7 +181,7 @@ def _send_breach_monday():
 </table>
 <p style="margin-top:20px"><a href="{SITE_URL}" style="background:#CBFF00;color:#000;padding:10px 20px;text-decoration:none;font-family:monospace;font-weight:700;border-radius:6px;font-size:12px">View Full Reports →</a></p>
 <hr style="border:none;border-top:1px solid #1a1a2e;margin:24px 0">
-<p style="font-size:11px;color:#555">SwarmHawk Security Intelligence · swarmhawk.eu · Unsubscribe by replying "unsubscribe"</p>
+<p style="font-size:11px;color:#555">SwarmHawk Security Intelligence · swarmhawk.com · Unsubscribe by replying "unsubscribe"</p>
 </body></html>""",
                 }, timeout=15)
                 sent += 1
@@ -2530,7 +2530,7 @@ def _resolve_api_key(api_key: str) -> dict:
     limit = r.get("limit_per_month") or 10
     used  = r.get("calls_this_month") or 0
     if used >= limit:
-        raise HTTPException(429, f"Monthly API limit reached ({limit} calls). Upgrade at swarmhawk.eu")
+        raise HTTPException(429, f"Monthly API limit reached ({limit} calls). Upgrade at swarmhawk.com")
     return r
 
 
@@ -3027,9 +3027,9 @@ def _send_supply_chain_digest(to_email: str, name: str, high_risk: list, batch_i
     <th style="padding:8px 12px;text-align:left">Findings</th></tr>
   {rows}
 </table>
-<p style="margin-top:24px">View full reports at <a href="{SITE_URL}">swarmhawk.eu</a></p>
+<p style="margin-top:24px">View full reports at <a href="{SITE_URL}">swarmhawk.com</a></p>
 <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
-<p style="font-size:11px;color:#999">SwarmHawk Security Intelligence · swarmhawk.eu</p>
+<p style="font-size:11px;color:#999">SwarmHawk Security Intelligence · swarmhawk.com</p>
 </body></html>""",
         }, timeout=15)
     except Exception as e:
