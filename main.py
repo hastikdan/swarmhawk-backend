@@ -1601,6 +1601,25 @@ def get_domain_history(domain_id: str, authorization: str = Header(None)):
 
 # ── PDF report generation ──────────────────────────────────────────────────────
 
+def _pdf_safe(text: str) -> str:
+    """Translate common Unicode chars to Latin-1 equivalents so FPDF Helvetica doesn't crash."""
+    if not text:
+        return ""
+    replacements = {
+        "\u2014": "-",  "\u2013": "-",   # em dash, en dash
+        "\u2018": "'",  "\u2019": "'",   # left/right single quotes
+        "\u201c": '"',  "\u201d": '"',   # left/right double quotes
+        "\u2022": "*",  "\u2026": "...", # bullet, ellipsis
+        "\u00b7": ".",  "\u2019": "'",
+        "\u2122": "(TM)", "\u00ae": "(R)", "\u00a9": "(C)",
+        "\u00d7": "x",  "\u00f7": "/",
+    }
+    for src, dst in replacements.items():
+        text = text.replace(src, dst)
+    # Strip any remaining non-Latin-1 characters
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
 def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -> bytes:
     """Build a PDF security report and return raw bytes."""
     from fpdf import FPDF
@@ -1633,10 +1652,10 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.set_xy(20, 10)
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(203, 255, 0)
-    pdf.cell(0, 8, "SWARMHAWK — Security Report", ln=True)
+    pdf.cell(0, 8, "SWARMHAWK - Security Report", ln=True)
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(150, 150, 150)
-    pdf.cell(0, 5, f"Generated {scan_date}  |  CEE Cybersecurity Intelligence", ln=True)
+    pdf.cell(0, 5, _pdf_safe(f"Generated {scan_date}  |  CEE Cybersecurity Intelligence"), ln=True)
 
     pdf.set_y(40)
 
@@ -1647,7 +1666,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.cell(0, 10, f"Risk Score: {risk_score}/100", ln=True)
     pdf.set_font("Helvetica", "B", 14)
     pdf.set_text_color(30, 30, 30)
-    pdf.cell(0, 8, domain, ln=True)
+    pdf.cell(0, 8, _pdf_safe(domain), ln=True)
     pdf.ln(2)
 
     # ── Summary pills ───────────────────────────────────────────────────────
@@ -1677,9 +1696,9 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
 
     for c in non_ai:
         status = c.get("status", "ok")
-        label  = CHECK_LABELS.get(c.get("check", ""), c.get("check", "").replace("_", " ").upper())
-        title  = c.get("title", "")
-        detail = c.get("detail", "")
+        label  = _pdf_safe(CHECK_LABELS.get(c.get("check", ""), c.get("check", "").replace("_", " ").upper()))
+        title  = _pdf_safe(c.get("title", ""))
+        detail = _pdf_safe(c.get("detail", ""))
 
         color = STATUS_COLOR.get(status, (100, 100, 100))
 
@@ -1721,7 +1740,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.ln(3)
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(150, 150, 150)
-    pdf.cell(0, 5, "SwarmHawk · CEE Cybersecurity Intelligence · www.swarmhawk.com", ln=True, align="C")
+    pdf.cell(0, 5, "SwarmHawk - CEE Cybersecurity Intelligence - www.swarmhawk.com", ln=True, align="C")
     pdf.cell(0, 5, "This report is confidential and intended for the named recipient only.", ln=True, align="C")
 
     return bytes(pdf.output())
