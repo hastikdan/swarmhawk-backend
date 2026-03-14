@@ -578,7 +578,6 @@ async def run_scan(background_tasks: BackgroundTasks, authorization: str = Heade
     """Trigger prospect scan manually. Auto-runs at 06:00 daily."""
     require_admin(authorization)
     background_tasks.add_task(_run_scan_job)
-    total = sum(len(fetch_country_domains(c, 1)) for c in COUNTRY_TLDS)  # quick check
     return {
         "status": "scan started",
         "countries": len(COUNTRY_TLDS),
