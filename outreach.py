@@ -34,6 +34,7 @@ router = APIRouter(prefix="/outreach", tags=["outreach"])
 # ── Config ────────────────────────────────────────────────────────────────────
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 ANTHROPIC_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
+PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.eu")
 FROM_NAME           = "SwarmHawk Security"
 CVSS_THRESHOLD      = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
@@ -43,6 +44,26 @@ SCAN_LIMIT          = int(os.getenv("OUTREACH_SCAN_LIMIT", "500"))  # domains pe
 
 TIMEOUT = 10
 UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
+
+
+# ── Portkey-aware Anthropic call helper ───────────────────────────────────────
+
+def _anthropic_url() -> str:
+    return "https://api.portkey.ai/v1/messages" if PORTKEY_API_KEY else "https://api.anthropic.com/v1/messages"
+
+def _anthropic_headers(metadata: dict | None = None) -> dict:
+    h = {
+        "x-api-key": ANTHROPIC_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    if PORTKEY_API_KEY:
+        h["x-portkey-api-key"]  = PORTKEY_API_KEY
+        h["x-portkey-provider"] = "anthropic"
+        if metadata:
+            h["x-portkey-metadata"] = json.dumps(metadata)
+    return h
+
 
 # ── Country → TLD mapping (global — 60+ countries) ───────────────────────────
 COUNTRY_TLDS = {
@@ -403,12 +424,8 @@ def generate_email_body(prospect: dict) -> str:
         )
     try:
         r = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": ANTHROPIC_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
+            _anthropic_url(),
+            headers=_anthropic_headers({"report_type": "outreach_email", "domain": prospect["domain"]}),
             json={
                 "model": "claude-sonnet-4-20250514",
                 "max_tokens": 500,
@@ -921,14 +938,14 @@ async def test_template(body: dict, authorization: str = Header(None)):
         return {"email": f"[No ANTHROPIC_API_KEY set]\n\nPrompt that would be sent:\n\n{filled}"}
     try:
         r = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            _anthropic_url(),
+            headers=_anthropic_headers({"report_type": "outreach_email", "domain": test_domain}),
             json={"model": "claude-sonnet-4-20250514", "max_tokens": 500, "messages": [{"role": "user", "content": filled}]},
             timeout=20,
         )
         if r.status_code == 200:
             return {"email": r.json()["content"][0]["text"].strip()}
-    except Exception as e:
+    except Exception:
         pass
     return {"email": "[Generation failed]"}
 
