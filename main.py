@@ -1210,10 +1210,12 @@ async def admin_llm_stats(
 _REPORT_EMAIL_DEFAULTS = {
     "subject": "Security Report: {domain} — {score_label} ({risk_score}/100)",
     "body":    (
-        "Your full security report for <strong>{domain}</strong> is attached as a PDF.<br>"
-        "It includes all check results, findings, and remediation recommendations."
+        "Your full security report for <strong>{domain}</strong> is attached as a PDF. "
+        "It includes {checks_count} security checks, {criticals} critical findings, and remediation recommendations.<br><br>"
+        "Sign up free at <a href=\"https://www.swarmhawk.com\" style=\"color:#cbff00\">swarmhawk.com</a> "
+        "to monitor this domain continuously, receive alerts on new threats, and access your full interactive dashboard."
     ),
-    "footer":  "SwarmHawk · CEE Cybersecurity Intelligence<br>This report is confidential and intended for the named recipient only.",
+    "footer":  "SwarmHawk · CEE Cybersecurity Intelligence · www.swarmhawk.com<br>This report is confidential and intended for the named recipient only.",
 }
 
 _report_email_cache: dict | None = None
@@ -1831,25 +1833,68 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
 
     score_color = '#c0392b' if risk_score >= 60 else '#d4850a' if risk_score >= 30 else '#1a7a4a'
     email_html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
-      <div style="margin-bottom:28px">
-        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;border-radius:8px;overflow:hidden">
+
+      <!-- Header -->
+      <div style="background:#0e0d12;padding:28px 36px;border-bottom:1px solid #1a1a1a">
+        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">&#9679;SWARMHAWK</span>
+        <span style="font-family:monospace;font-size:11px;color:#444;margin-left:12px">CEE Cybersecurity Intelligence</span>
       </div>
-      <h2 style="color:#fff;margin-bottom:4px">Security Report: {d['domain']}</h2>
-      <p style="color:#888;font-size:13px;margin-bottom:24px">Scanned {scanned_at[:10]}</p>
-      <div style="background:#111;border:1px solid #222;border-radius:8px;padding:20px;margin-bottom:24px;display:flex;gap:24px">
-        <div style="text-align:center">
-          <div style="font-size:32px;font-weight:700;color:{score_color}">{risk_score}</div>
-          <div style="font-size:11px;color:#888;font-family:monospace">{score_label}</div>
+
+      <!-- Body -->
+      <div style="padding:32px 36px">
+        <h2 style="color:#fff;margin:0 0 4px 0;font-size:20px">Security Report: {d['domain']}</h2>
+        <p style="color:#666;font-size:12px;margin:0 0 24px 0;font-family:monospace">Scanned {scanned_at[:10]}</p>
+
+        <!-- Score card -->
+        <div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:28px">
+          <div style="text-align:center;min-width:60px">
+            <div style="font-size:36px;font-weight:800;color:{score_color};line-height:1">{risk_score}</div>
+            <div style="font-size:10px;color:#888;font-family:monospace;margin-top:4px">{score_label}</div>
+          </div>
+          <div style="border-left:1px solid #2a2a2a;padding-left:24px;flex:1">
+            <div style="color:#c0392b;font-weight:700;font-size:14px">{criticals} Critical</div>
+            <div style="color:#d4850a;font-weight:700;font-size:14px">{warnings} Warnings</div>
+            <div style="color:#555;font-size:12px;margin-top:6px">{len(non_ai)} checks run</div>
+          </div>
         </div>
-        <div style="border-left:1px solid #222;padding-left:24px">
-          <div style="color:#c0392b;font-weight:700">{criticals} Critical</div>
-          <div style="color:#d4850a;font-weight:700">{warnings} Warnings</div>
-          <div style="color:#888;font-size:12px;margin-top:4px">{len(non_ai)} checks run</div>
+
+        <!-- PDF attachment notice -->
+        <div style="background:#111;border:1px solid #1e3a1e;border-radius:6px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:12px">
+          <span style="font-size:22px">&#128196;</span>
+          <div>
+            <div style="color:#cbff00;font-family:monospace;font-size:11px;font-weight:700;letter-spacing:1px">PDF REPORT ATTACHED</div>
+            <div style="color:#888;font-size:12px;margin-top:2px">{filename} — full findings, risk breakdown &amp; remediation steps</div>
+          </div>
+        </div>
+
+        <!-- Body message -->
+        <p style="color:#aaa;font-size:13px;line-height:1.7;margin-bottom:28px">{body_text}</p>
+
+        <!-- CTAs -->
+        <div style="margin-bottom:28px">
+          <a href="https://www.swarmhawk.com" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:13px 26px;border-radius:6px;text-decoration:none;margin-right:12px;margin-bottom:10px">Get Free Account &#8594;</a>
+          <a href="https://www.swarmhawk.com/#pricing" style="display:inline-block;background:transparent;color:#cbff00;font-family:monospace;font-weight:700;font-size:13px;padding:12px 26px;border-radius:6px;text-decoration:none;border:1px solid #cbff00;margin-bottom:10px">Full Paid Report &#8594;</a>
+        </div>
+
+        <!-- Feature bullets -->
+        <div style="background:#0d0d0d;border:1px solid #1a1a1a;border-radius:6px;padding:16px 20px;margin-bottom:24px">
+          <div style="font-family:monospace;font-size:10px;color:#555;letter-spacing:1px;text-transform:uppercase;margin-bottom:10px">What you get with SwarmHawk</div>
+          <div style="font-size:12px;color:#888;line-height:2">
+            &#10003; &nbsp;Continuous domain monitoring &amp; re-scans<br>
+            &#10003; &nbsp;Instant alerts on new critical threats<br>
+            &#10003; &nbsp;NIS2 / DORA compliance autopilot<br>
+            &#10003; &nbsp;Monthly PDF reports &amp; audit evidence<br>
+            &#10003; &nbsp;AI threat intelligence briefings
+          </div>
         </div>
       </div>
-      <p style="color:#aaa;font-size:13px;line-height:1.6">{body_text}</p>
-      <p style="color:#555;font-size:11px;margin-top:32px">{footer_text}</p>
+
+      <!-- Footer -->
+      <div style="background:#0e0d12;border-top:1px solid #1a1a1a;padding:18px 36px">
+        <p style="color:#444;font-size:11px;margin:0;line-height:1.7">{footer_text}</p>
+      </div>
+
     </div>
     """
 
