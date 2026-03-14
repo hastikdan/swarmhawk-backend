@@ -4,7 +4,7 @@ outreach.py — SwarmHawk Automated Prospect Intelligence Engine
 
 Fully automated daily pipeline:
   1. 06:00 Prague → APScheduler fires _run_scan_job()
-  2. fetch_country_domains() pulls top 500 domains per CEE country:
+  2. fetch_country_domains() pulls top 500 domains per country:
        a. Cloudflare Radar API (if CLOUDFLARE_API_TOKEN set) — country-aware rankings
        b. Tranco top-1M filtered by TLD (cached 24 h)
        c. Hardcoded extended fallback list

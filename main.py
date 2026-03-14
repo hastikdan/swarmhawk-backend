@@ -408,7 +408,7 @@ def send_confirmation_email(to_email: str, name: str, token: str):
       </a>
       <p style="color:#555;font-size:12px;margin-top:28px;line-height:1.5">
         This link expires in 24 hours. If you didn't create an account, ignore this email.<br>
-        SwarmHawk · CEE Cybersecurity Intelligence
+        SwarmHawk · European Cybersecurity Intelligence
       </p>
     </div>
     """
@@ -457,7 +457,7 @@ def send_welcome_email(to_email: str, name: str):
       <a href="{dashboard_url}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 28px;border-radius:5px;text-decoration:none">
         Open Dashboard →
       </a>
-      <p style="color:#555;font-size:12px;margin-top:28px">SwarmHawk · CEE Cybersecurity Intelligence · swarmhawk.com</p>
+      <p style="color:#555;font-size:12px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence · swarmhawk.com</p>
     </div>
     """
     try:
@@ -511,7 +511,7 @@ def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
       <a href="{SITE_URL}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">
         View Full Report →
       </a>
-      <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · CEE Cybersecurity Intelligence</p>
+      <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence</p>
     </div>
     """
     try:
@@ -562,7 +562,7 @@ def send_monthly_pdf_email(to_email: str, domain: str, risk_score: int,
           </div>
           <p style="color:#aaa;font-size:13px;margin-bottom:20px">Your monthly security report is attached. It includes all check results and remediation recommendations.</p>
           <a href="{SITE_URL}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">Open Dashboard →</a>
-          <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · CEE Cybersecurity Intelligence · Cancel anytime at swarmhawk.com</p>
+          <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence · Cancel anytime at swarmhawk.com</p>
         </div>
         """
         import httpx as _httpx
@@ -1215,7 +1215,7 @@ _REPORT_EMAIL_DEFAULTS = {
         "Sign up free at <a href=\"https://www.swarmhawk.com\" style=\"color:#cbff00\">swarmhawk.com</a> "
         "to monitor this domain continuously, receive alerts on new threats, and access your full interactive dashboard."
     ),
-    "footer":  "SwarmHawk · CEE Cybersecurity Intelligence · www.swarmhawk.com<br>This report is confidential and intended for the named recipient only.",
+    "footer":  "SwarmHawk · European Cybersecurity Intelligence · www.swarmhawk.com<br>This report is confidential and intended for the named recipient only.",
 }
 
 _report_email_cache: dict | None = None
@@ -1657,7 +1657,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.cell(0, 8, "SWARMHAWK - Security Report", ln=True)
     pdf.set_font("Helvetica", "", 9)
     pdf.set_text_color(150, 150, 150)
-    pdf.cell(0, 5, _pdf_safe(f"Generated {scan_date}  |  CEE Cybersecurity Intelligence"), ln=True)
+    pdf.cell(0, 5, _pdf_safe(f"Generated {scan_date}  |  European Cybersecurity Intelligence"), ln=True)
 
     pdf.set_y(40)
 
@@ -1742,7 +1742,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.ln(3)
     pdf.set_font("Helvetica", "", 8)
     pdf.set_text_color(150, 150, 150)
-    pdf.cell(0, 5, "SwarmHawk - CEE Cybersecurity Intelligence - www.swarmhawk.com", ln=True, align="C")
+    pdf.cell(0, 5, "SwarmHawk - European Cybersecurity Intelligence - www.swarmhawk.com", ln=True, align="C")
     pdf.cell(0, 5, "This report is confidential and intended for the named recipient only.", ln=True, align="C")
 
     return bytes(pdf.output())
@@ -1838,7 +1838,7 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
       <!-- Header -->
       <div style="background:#0e0d12;padding:28px 36px;border-bottom:1px solid #1a1a1a">
         <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">&#9679;SWARMHAWK</span>
-        <span style="font-family:monospace;font-size:11px;color:#444;margin-left:12px">CEE Cybersecurity Intelligence</span>
+        <span style="font-family:monospace;font-size:11px;color:#444;margin-left:12px">European Cybersecurity Intelligence</span>
       </div>
 
       <!-- Body -->
@@ -2486,7 +2486,7 @@ async def intel(body: IntelRequest, authorization: str = Header(None)):
             "Generate a cybersecurity threat intelligence briefing as JSON:\n"
             '{"headline":"one sentence","briefing":"3 paragraphs","categories":['
             '{"title":"Active Threats","body":"2 sentences"},'
-            '{"title":"CEE Regional","body":"2 sentences"},'
+            '{"title":"European Regional","body":"2 sentences"},'
             '{"title":"Vulnerabilities","body":"2 sentences"},'
             '{"title":"Phishing","body":"2 sentences"},'
             '{"title":"Compliance","body":"2 sentences"},'
