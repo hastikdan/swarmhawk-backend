@@ -335,6 +335,9 @@ class CheckoutRequest(BaseModel):
     domain: str
     plan: str = "one_time"   # "one_time" ($10) | "annual" ($50/year subscription)
 
+class DomainContactRequest(BaseModel):
+    primary_contact: str
+
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def get_user_from_header(authorization: str) -> dict:
@@ -1623,16 +1626,16 @@ async def discover_domain_contacts(domain_id: str, authorization: str = Header(N
 
 
 @app.patch("/domains/{domain_id}/contact")
-def set_domain_contact(domain_id: str, body: dict, authorization: str = Header(None)):
+def set_domain_contact(domain_id: str, body: DomainContactRequest, authorization: str = Header(None)):
     """Set the primary outreach contact email for a domain (user-editable)."""
     user = get_user_from_header(authorization)
     db   = get_db()
     row  = db.table("domains").select("id,user_id").eq("id", domain_id).execute()
     if not row.data or row.data[0]["user_id"] != user["sub"]:
         raise HTTPException(404, "Domain not found")
-    email = (body.get("primary_contact") or "").strip()
+    email = (body.primary_contact or "").strip()
     if not email or "@" not in email:
-        raise HTTPException(400, "Invalid email")
+        raise HTTPException(400, "Invalid email address")
     db.table("domains").update({"primary_contact": email}).eq("id", domain_id).execute()
     return {"status": "saved", "primary_contact": email}
 
