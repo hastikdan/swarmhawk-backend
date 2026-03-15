@@ -572,8 +572,8 @@ def get_db():
     return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
 
 
-def upsert_prospect(p: dict, email_body: str):
-    db   = get_db()
+def upsert_prospect(p: dict, email_body: str, db=None):
+    db = db or get_db()
     pid  = hashlib.sha256(p["domain"].encode()).hexdigest()[:16]
     now  = datetime.now(timezone.utc).isoformat()
     existing = db.table("outreach_prospects").select("id,status").eq("domain", p["domain"]).execute()
@@ -643,54 +643,77 @@ def _run_scan_job():
         "finished_at":   None,
     }
 
-    # ── Phase 1: fetch all country domain lists in parallel ──────────────────
-    country_domains: dict[str, list[str]] = {}
-
-    def _fetch_country(country):
-        return country, fetch_country_domains(country, limit=SCAN_LIMIT)
-
-    with ThreadPoolExecutor(max_workers=len(COUNTRY_TLDS)) as ex:
-        for country, domains in ex.map(_fetch_country, COUNTRY_TLDS.keys()):
-            if domains:
-                country_domains[country] = domains
-
-    all_domains = [(d, c) for c, doms in country_domains.items() for d in doms]
-    total = len(all_domains)
-
-    # ── Phase 2: scan all domains across all countries in parallel ───────────
-    _scan_progress.update({
-        "status":  "running",
-        "phase":   f"Scanning {total} domains across {len(country_domains)} countries…",
-        "total":   total,
-        "country_stats": {
-            c: {"total": len(doms), "scanned": 0, "found": 0}
-            for c, doms in country_domains.items()
-        },
-    })
-
-    print(f"[outreach] Starting scan: {total} domains across {len(country_domains)} countries "
-          f"({SCAN_LIMIT}/country)")
     found = 0
+    try:
+        # ── Phase 1: fetch all country domain lists in parallel ──────────────
+        country_domains: dict[str, list[str]] = {}
 
-    # 20 workers: 6,000 domains / 20 = ~300 concurrent — fast but doesn't OOM Render
-    with ThreadPoolExecutor(max_workers=20) as ex:
-        futures = {ex.submit(scan_domain_passive, domain, country): (domain, country)
-                   for domain, country in all_domains}
-        for future in as_completed(futures):
-            domain, country = futures[future]
-            _scan_progress["scanned"] += 1
-            _scan_progress["country_stats"][country]["scanned"] += 1
-            try:
-                result = future.result()
-                if result:
-                    email_body = generate_email_body(result)
-                    upsert_prospect(result, email_body)
-                    found += 1
-                    _scan_progress["found"]  += 1
-                    _scan_progress["country_stats"][country]["found"] += 1
-                    print(f"[outreach] ✓ {result['domain']} — CVSS {result['max_cvss']}")
-            except Exception as e:
-                print(f"[outreach] ✗ {domain}: {e}")
+        def _fetch_country(country):
+            return country, fetch_country_domains(country, limit=SCAN_LIMIT)
+
+        with ThreadPoolExecutor(max_workers=len(COUNTRY_TLDS)) as ex:
+            for country, domains in ex.map(_fetch_country, COUNTRY_TLDS.keys()):
+                if domains:
+                    country_domains[country] = domains
+
+        all_domains = [(d, c) for c, doms in country_domains.items() for d in doms]
+        total = len(all_domains)
+
+        # ── Phase 2: scan all domains across all countries in parallel ────────
+        _scan_progress.update({
+            "status":  "running",
+            "phase":   f"Scanning {total} domains across {len(country_domains)} countries…",
+            "total":   total,
+            "country_stats": {
+                c: {"total": len(doms), "scanned": 0, "found": 0}
+                for c, doms in country_domains.items()
+            },
+        })
+
+        print(f"[outreach] Starting scan: {total} domains across {len(country_domains)} countries "
+              f"({SCAN_LIMIT}/country)")
+
+        db = get_db()  # single shared connection for all upserts
+
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            futures = {ex.submit(scan_domain_passive, domain, country): (domain, country)
+                       for domain, country in all_domains}
+            for future in as_completed(futures):
+                domain, country = futures[future]
+                _scan_progress["scanned"] += 1
+                _scan_progress["country_stats"][country]["scanned"] += 1
+                try:
+                    result = future.result()
+                    if result:
+                        # Use fallback email during bulk scan — no Claude API call per prospect.
+                        # AI email is generated on-demand when admin reviews/approves the prospect.
+                        email_body = _fallback_email(result)
+                        upsert_prospect(result, email_body, db=db)
+                        found += 1
+                        _scan_progress["found"]  += 1
+                        _scan_progress["country_stats"][country]["found"] += 1
+                        print(f"[outreach] ✓ {result['domain']} — CVSS {result['max_cvss']}")
+                except Exception as e:
+                    print(f"[outreach] ✗ {domain}: {e}")
+
+        try:
+            db.table("outreach_log").insert({
+                "event":     "daily_scan",
+                "prospects": found,
+                "ran_at":    datetime.now(timezone.utc).isoformat(),
+            }).execute()
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[outreach] Scan job crashed: {e}")
+        _scan_progress.update({
+            "status":      "done",
+            "phase":       f"Scan interrupted — {found} prospects saved before error",
+            "found":       found,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+        return
 
     print(f"[outreach] Scan complete — {found} vulnerable domains found")
     _scan_progress.update({
@@ -699,16 +722,6 @@ def _run_scan_job():
         "found":       found,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     })
-
-    try:
-        db = get_db()
-        db.table("outreach_log").insert({
-            "event":     "daily_scan",
-            "prospects": found,
-            "ran_at":    datetime.now(timezone.utc).isoformat(),
-        }).execute()
-    except Exception:
-        pass
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
