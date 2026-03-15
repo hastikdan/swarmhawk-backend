@@ -1757,8 +1757,8 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     FREE_CHECKS = {
         "ssl", "headers", "dns", "https_redirect", "breach", "typosquat", "performance",
         "urlhaus", "spamhaus", "safebrowsing", "virustotal", "cve", "darkweb",
-        "whois", "email_security", "sast", "sca", "dast", "iac",
-        # paid: ip_intel, shodan, open_ports
+        "whois", "email_security", "shodan", "open_ports", "sast", "sca", "dast", "iac",
+        # paid: ip_intel
     }
 
     if is_paid:
@@ -2742,7 +2742,7 @@ async def public_scan(body: PublicScanRequest):
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "sast", "sca", "dast", "iac", "darkweb"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "shodan", "open_ports", "sast", "sca", "dast", "iac", "darkweb"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 
