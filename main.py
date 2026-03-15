@@ -3481,85 +3481,95 @@ def domain_death_predictor(domain_id: str, authorization: str = Header(None)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# LIVE ATTACK MAP — public endpoint for global threat map
+# GLOBAL THREAT INTELLIGENCE MAP — aggregates Marketing scanner data
 # ══════════════════════════════════════════════════════════════════════════════
+
+_map_cache: dict = {"data": None, "built_at": None}
+_MAP_CACHE_TTL = 3600  # 1 hour
+
+
+def _build_map_data() -> dict:
+    """Aggregate outreach_prospects by country for the threat map."""
+    from outreach import get_db as outreach_get_db
+    db = outreach_get_db()
+    rows = db.table("outreach_prospects")\
+        .select("domain,country,max_cvss,scanned_at")\
+        .execute()
+
+    # Group by country
+    country_rows: dict = {}
+    for r in (rows.data or []):
+        cc = (r.get("country") or "").upper().strip()
+        if not cc or cc in ("EU", "??", ""):
+            cc = tld_to_country(r.get("domain", "unknown.com"))
+        if not cc:
+            continue
+        if cc not in country_rows:
+            country_rows[cc] = []
+        country_rows[cc].append(r)
+
+    result = []
+    for cc, items in country_rows.items():
+        scanned = [i for i in items if i.get("scanned_at")]
+        cvss_scores = [float(i["max_cvss"]) for i in scanned if i.get("max_cvss") is not None]
+        # CVSS 0–10 → risk 0–100
+        risk_scores = [round(s * 10, 1) for s in cvss_scores]
+        result.append({
+            "country":           cc,
+            "domains":           len(items),
+            "scanned":           len(scanned),
+            "avg_risk":          round(sum(risk_scores) / len(risk_scores), 1) if risk_scores else 0,
+            "high_risk_domains": sum(1 for s in cvss_scores if s >= 7.0),
+            "critical_findings": sum(1 for s in cvss_scores if s >= 9.0),
+        })
+
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "countries":     sorted(result, key=lambda x: x["avg_risk"], reverse=True),
+        "total_domains": sum(r["domains"] for r in result),
+        "total_scanned": sum(r["scanned"] for r in result),
+        "generated_at":  now,
+    }
+
 
 @app.get("/map/data")
 def attack_map_data():
     """
-    Public endpoint: returns anonymised threat counts per country for the live map.
-    No auth required. Aggregates scan data for the public map page.
+    Public endpoint: aggregated threat data per country from Marketing scanner.
+    No auth required. Cached for 1 hour.
     """
-    db = get_admin_db()
-    try:
-        domains = db.table("domains").select("id,domain,country").execute()
-        country_domain_ids: dict = {}
-        for d in (domains.data or []):
-            stored = (d.get("country") or "").upper().strip()
-            # Fall back to TLD resolver for legacy "EU" or missing codes
-            if not stored or stored in ("EU", "??"):
-                stored = tld_to_country(d.get("domain", "unknown.com"))
-            cc = stored
-            if cc not in country_domain_ids:
-                country_domain_ids[cc] = []
-            country_domain_ids[cc].append(d["id"])
-
-        # Get latest scans for risk breakdown per country
-        scans = db.table("scans").select("domain_id,risk_score,critical,scanned_at")\
-            .order("scanned_at", desc=True).limit(2000).execute()
-
-        # Map domain_id → latest scan
-        seen = set()
-        domain_scan: dict = {}
-        for s in (scans.data or []):
-            did = s.get("domain_id")
-            if did and did not in seen:
-                seen.add(did)
-                domain_scan[did] = s
-
-        # Aggregate per country
-        result = []
-        for cc, dids in country_domain_ids.items():
-            country_scans = [domain_scan[did] for did in dids if did in domain_scan]
-            if not country_scans:
-                continue
-            scores    = [s.get("risk_score") or 0 for s in country_scans]
-            criticals = sum(s.get("critical") or 0 for s in country_scans)
-            result.append({
-                "country":      cc,
-                "domains":      len(dids),
-                "scanned":      len(country_scans),
-                "avg_risk":     round(sum(scores) / len(scores), 1) if scores else 0,
-                "max_risk":     max(scores) if scores else 0,
-                "critical_findings": criticals,
-                "high_risk_domains": sum(1 for s in scores if s >= 70),
-            })
-
-        return {
-            "countries":    sorted(result, key=lambda x: x["avg_risk"], reverse=True),
-            "total_domains": sum(r["domains"] for r in result),
-            "total_scanned": sum(r["scanned"] for r in result),
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-    except Exception as e:
-        return {"countries": [], "error": str(e)}
+    global _map_cache
+    now = datetime.now(timezone.utc)
+    built_at = _map_cache.get("built_at")
+    if _map_cache["data"] is None or built_at is None or \
+            (now - built_at).total_seconds() > _MAP_CACHE_TTL:
+        try:
+            _map_cache["data"]     = _build_map_data()
+            _map_cache["built_at"] = now
+        except Exception as e:
+            return {"countries": [], "error": str(e)}
+    return _map_cache["data"]
 
 
 @app.get("/map/country/{code}")
 def map_country_top_domains(code: str):
     """
-    Public: top 100 domains for a given ISO country code, sourced from Tranco top-1M.
+    Public: top 50 highest-risk scanned domains for a country from outreach_prospects.
     Used by the live map side panel. No auth required.
     """
     code = code.upper()
     try:
-        from outreach import COUNTRY_TLDS, _get_tranco_domains
-        tld = COUNTRY_TLDS.get(code, "")
-        if tld:
-            domains = _get_tranco_domains(tld, 100)
-        else:
-            domains = []
-    except Exception as e:
+        from outreach import get_db as outreach_get_db
+        db = outreach_get_db()
+        rows = db.table("outreach_prospects")\
+            .select("domain,max_cvss")\
+            .eq("country", code)\
+            .not_.is_("scanned_at", "null")\
+            .order("max_cvss", desc=True)\
+            .limit(50)\
+            .execute()
+        domains = [r["domain"] for r in (rows.data or [])]
+    except Exception:
         domains = []
     return {"country": code, "domains": domains, "total": len(domains)}
 

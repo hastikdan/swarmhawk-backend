@@ -722,6 +722,12 @@ def _run_scan_job():
         "found":       found,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     })
+    # Bust the threat map cache so next /map/data request rebuilds from fresh data
+    try:
+        import main as _main
+        _main._map_cache["data"] = None
+    except Exception:
+        pass
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
