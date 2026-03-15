@@ -487,46 +487,19 @@ def scan_domain_passive(domain: str, country: str) -> Optional[dict]:
         return None
     priority = "CRITICAL" if max_cvss >= 9 else "HIGH" if max_cvss >= 7 else "MEDIUM"
 
-    # Check if a SwarmHawk user has manually set a primary contact for this domain
-    user_contact = None
-    try:
-        db = get_db()
-        domain_row = db.table("domains").select("primary_contact,contact_emails")\
-                       .eq("domain", domain).execute()
-        if domain_row.data:
-            user_contact = domain_row.data[0].get("primary_contact")
-            # Also reuse cached contact_emails from previous discovery if available
-            cached_emails = domain_row.data[0].get("contact_emails")
-            if cached_emails and not user_contact:
-                try:
-                    cached = json.loads(cached_emails) if isinstance(cached_emails, str) else cached_emails
-                    if cached:
-                        return {
-                            "domain":         domain,
-                            "country":        country,
-                            "software":       software,
-                            "cves":           cves[:5],
-                            "max_cvss":       max_cvss,
-                            "priority":       priority,
-                            "contact_email":  cached[0],
-                            "contact_emails": cached,
-                        }
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    contacts = discover_all_contacts(domain)
-    contact  = user_contact or (contacts[0] if contacts else f"security@{domain}")
+    # Lightweight contact discovery for bulk scans — security.txt only + fallback.
+    # Full multi-source discovery (WHOIS + scraping) runs on-demand per domain via
+    # POST /domains/{id}/contacts/discover — never in the batch pipeline.
+    contact = discover_contact_email(domain)
     return {
-        "domain":          domain,
-        "country":         country,
-        "software":        software,
-        "cves":            cves[:5],
-        "max_cvss":        max_cvss,
-        "priority":        priority,
-        "contact_email":   contact,
-        "contact_emails":  contacts,   # full ranked list for admin review
+        "domain":         domain,
+        "country":        country,
+        "software":       software,
+        "cves":           cves[:5],
+        "max_cvss":       max_cvss,
+        "priority":       priority,
+        "contact_email":  contact,
+        "contact_emails": [],   # populated later via on-demand discovery
     }
 
 
@@ -605,12 +578,21 @@ def upsert_prospect(p: dict, email_body: str):
     now  = datetime.now(timezone.utc).isoformat()
     existing = db.table("outreach_prospects").select("id,status").eq("domain", p["domain"]).execute()
 
+    # Honour primary_contact set by a SwarmHawk user for this domain (overrides auto-detected)
+    contact_email = p.get("contact_email", f"security@{p['domain']}")
+    try:
+        dom_row = db.table("domains").select("primary_contact").eq("domain", p["domain"]).execute()
+        if dom_row.data and dom_row.data[0].get("primary_contact"):
+            contact_email = dom_row.data[0]["primary_contact"]
+    except Exception:
+        pass
+
     update_data = {
         "software":        json.dumps(p["software"]),
         "cves":            json.dumps(p["cves"]),
         "max_cvss":        p["max_cvss"],
         "priority":        p["priority"],
-        "contact_email":   p.get("contact_email", f"security@{p['domain']}"),
+        "contact_email":   contact_email,
         "contact_emails":  json.dumps(p.get("contact_emails", [])),
         "scanned_at":      now,
     }
