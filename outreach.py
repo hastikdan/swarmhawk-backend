@@ -40,7 +40,7 @@ FROM_NAME           = "SwarmHawk Security"
 CVSS_THRESHOLD      = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
 DAILY_SEND_LIMIT    = int(os.getenv("OUTREACH_DAILY_LIMIT", "20"))
 CLOUDFLARE_TOKEN    = os.getenv("CLOUDFLARE_API_TOKEN", "")
-SCAN_LIMIT          = int(os.getenv("OUTREACH_SCAN_LIMIT", "500"))  # domains per country
+SCAN_LIMIT          = int(os.getenv("OUTREACH_SCAN_LIMIT", "100"))  # domains per country
 
 TIMEOUT = 10
 UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
@@ -626,37 +626,41 @@ _scan_progress: dict = {"status": "idle"}
 # ── Background scan job ───────────────────────────────────────────────────────
 
 def _run_scan_job():
-    """Daily job: fetch top 500 domains per country, passive scan, upsert prospects."""
+    """Scan top SCAN_LIMIT domains per country in parallel across all countries."""
     global _scan_progress
     import urllib3
     urllib3.disable_warnings()
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    # ── Phase 1: fetch domain lists per country ──────────────────────────────
     _scan_progress = {
-        "status":       "fetching",
-        "phase":        "Fetching domain lists…",
-        "started_at":   datetime.now(timezone.utc).isoformat(),
-        "total":        0,
-        "scanned":      0,
-        "found":        0,
+        "status":        "fetching",
+        "phase":         f"Fetching domain lists for {len(COUNTRY_TLDS)} countries in parallel…",
+        "started_at":    datetime.now(timezone.utc).isoformat(),
+        "total":         0,
+        "scanned":       0,
+        "found":         0,
         "country_stats": {},
-        "finished_at":  None,
+        "finished_at":   None,
     }
 
+    # ── Phase 1: fetch all country domain lists in parallel ──────────────────
     country_domains: dict[str, list[str]] = {}
-    for country in COUNTRY_TLDS:
-        domains = fetch_country_domains(country, limit=SCAN_LIMIT)
-        if domains:
-            country_domains[country] = domains
+
+    def _fetch_country(country):
+        return country, fetch_country_domains(country, limit=SCAN_LIMIT)
+
+    with ThreadPoolExecutor(max_workers=len(COUNTRY_TLDS)) as ex:
+        for country, domains in ex.map(_fetch_country, COUNTRY_TLDS.keys()):
+            if domains:
+                country_domains[country] = domains
 
     all_domains = [(d, c) for c, doms in country_domains.items() for d in doms]
     total = len(all_domains)
 
-    # ── Phase 2: scan ────────────────────────────────────────────────────────
+    # ── Phase 2: scan all domains across all countries in parallel ───────────
     _scan_progress.update({
         "status":  "running",
-        "phase":   "Scanning domains for vulnerabilities…",
+        "phase":   f"Scanning {total} domains across {len(country_domains)} countries…",
         "total":   total,
         "country_stats": {
             c: {"total": len(doms), "scanned": 0, "found": 0}
@@ -664,10 +668,12 @@ def _run_scan_job():
         },
     })
 
-    print(f"[outreach] Starting scan: {total} domains across {len(country_domains)} countries")
+    print(f"[outreach] Starting scan: {total} domains across {len(country_domains)} countries "
+          f"({SCAN_LIMIT}/country)")
     found = 0
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    # 20 workers: 6,000 domains / 20 = ~300 concurrent — fast but doesn't OOM Render
+    with ThreadPoolExecutor(max_workers=20) as ex:
         futures = {ex.submit(scan_domain_passive, domain, country): (domain, country)
                    for domain, country in all_domains}
         for future in as_completed(futures):
