@@ -50,3 +50,21 @@
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+## gstack Workflow Skills
+
+The following Claude Code slash commands are available at `~/.claude/commands/`:
+
+| Command | Role | Purpose |
+|---|---|---|
+| `/qa-swarmhawk` | QA Engineer | Visual browser-based testing of all 5 dashboard flows (domain expand, outreach approval, competitor polling, NIS2 grid, account tab) |
+| `/ship-swarmhawk` | Release Engineer | Pre-flight syntax checks → deploy frontend (GitHub Pages) → deploy backend (Render) → smoke test health endpoints |
+| `/review-swarmhawk` | Staff Security Engineer | Full security + code quality review of staged changes before shipping; outputs SHIP / NEEDS FIXES / DO NOT SHIP verdict |
+| `/plan-eng-swarmhawk` | Lead Engineer | 10-section engineering design doc for any non-trivial feature (data model, API, frontend, edge cases, security, complexity estimate) |
+| `/retro-swarmhawk` | Engineering Manager | Weekly retrospective from git history — velocity, bug patterns, technical debt, top risks; saved to `tasks/retro-YYYY-MM-DD.md` |
+
+### Usage Examples
+- Before starting a feature: `/plan-eng-swarmhawk add bulk domain import via CSV`
+- Before deploying: `/review-swarmhawk` then `/ship-swarmhawk`
+- After deploy: `/qa-swarmhawk`
+- Every Friday: `/retro-swarmhawk`

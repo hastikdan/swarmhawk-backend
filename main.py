@@ -1440,16 +1440,26 @@ def list_domains(authorization: str = Header(None)):
                     raw = []
             latest_checks = raw if isinstance(raw, list) else []
 
+        # Decode cached contact_emails if stored as JSON string
+        cached_contact_emails = d.get("contact_emails")
+        if isinstance(cached_contact_emails, str):
+            try:
+                cached_contact_emails = json.loads(cached_contact_emails)
+            except Exception:
+                cached_contact_emails = []
+
         result.append({
-            "id":          d["id"],
-            "domain":      d["domain"],
-            "country":     d["country"],
-            "added":       d["created_at"],
-            "status":      status,
-            "paid":        is_paid,
-            "risk_score":  latest_scan["risk_score"] if latest_scan else None,
-            "scanned_at":  latest_scan["scanned_at"] if latest_scan else None,
-            "checks":      latest_checks,
+            "id":              d["id"],
+            "domain":          d["domain"],
+            "country":         d["country"],
+            "added":           d["created_at"],
+            "status":          status,
+            "paid":            is_paid,
+            "risk_score":      latest_scan["risk_score"] if latest_scan else None,
+            "scanned_at":      latest_scan["scanned_at"] if latest_scan else None,
+            "checks":          latest_checks,
+            "primary_contact": d.get("primary_contact"),
+            "contact_emails":  cached_contact_emails or [],
             "scan_history": [
                 {"date": s["scanned_at"], "risk": s["risk_score"]}
                 for s in sorted(d.get("scans", []), key=lambda s: s["scanned_at"])
@@ -1545,6 +1555,84 @@ def rescan_domain(domain_id: str, background_tasks: BackgroundTasks, authorizati
     d = domain.data[0]
     background_tasks.add_task(run_scan_background, d["id"], d["domain"])
     return {"status": "scanning", "message": f"Rescan started for {d['domain']}"}
+
+
+@app.get("/domains/{domain_id}/contacts")
+def get_domain_contacts(domain_id: str, authorization: str = Header(None)):
+    """Discover contact emails for a domain (security.txt, WHOIS, website scrape)."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("id,domain,user_id,primary_contact,contact_emails")\
+             .eq("id", domain_id).execute()
+    if not row.data or row.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(404, "Domain not found")
+    d = row.data[0]
+
+    # Return cached contacts if available (re-discover if none)
+    cached = d.get("contact_emails")
+    if cached:
+        try:
+            contacts = json.loads(cached) if isinstance(cached, str) else cached
+        except Exception:
+            contacts = []
+    else:
+        contacts = []
+
+    return {
+        "domain":          d["domain"],
+        "primary_contact": d.get("primary_contact") or (contacts[0] if contacts else None),
+        "contacts":        contacts,
+    }
+
+
+@app.post("/domains/{domain_id}/contacts/discover")
+async def discover_domain_contacts(domain_id: str, authorization: str = Header(None)):
+    """Run fresh contact discovery for a domain and cache results."""
+    import asyncio
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("id,domain,user_id,primary_contact")\
+             .eq("id", domain_id).execute()
+    if not row.data or row.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(404, "Domain not found")
+    d = row.data[0]
+
+    try:
+        from outreach import discover_all_contacts
+        contacts = await asyncio.get_event_loop().run_in_executor(
+            None, discover_all_contacts, d["domain"]
+        )
+    except ImportError:
+        from swarmhawk_backend.outreach import discover_all_contacts
+        contacts = await asyncio.get_event_loop().run_in_executor(
+            None, discover_all_contacts, d["domain"]
+        )
+
+    db.table("domains").update({"contact_emails": json.dumps(contacts)}).eq("id", domain_id).execute()
+
+    # Set primary_contact to best discovered address if not already set
+    primary = d.get("primary_contact") or (contacts[0] if contacts else None)
+
+    return {
+        "domain":          d["domain"],
+        "primary_contact": primary,
+        "contacts":        contacts,
+    }
+
+
+@app.patch("/domains/{domain_id}/contact")
+def set_domain_contact(domain_id: str, body: dict, authorization: str = Header(None)):
+    """Set the primary outreach contact email for a domain (user-editable)."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("id,user_id").eq("id", domain_id).execute()
+    if not row.data or row.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(404, "Domain not found")
+    email = (body.get("primary_contact") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Invalid email")
+    db.table("domains").update({"primary_contact": email}).eq("id", domain_id).execute()
+    return {"status": "saved", "primary_contact": email}
 
 
 @app.get("/domains/{domain_id}/report")
@@ -2224,7 +2312,7 @@ async def _call_claude_async(api_key: str, model: str, max_tokens: int,
 
 # ── Background scan ───────────────────────────────────────────────────────────
 
-def _generate_ai_summary(domain: str, result: dict) -> str | None:
+def _generate_ai_summary(domain: str, result: dict, user_id: str | None = None) -> str | None:
     """Call Anthropic to generate a 5-section Intelligence Report for the scan."""
     AKEY = os.getenv("ANTHROPIC_API_KEY", "")
     if not AKEY:
@@ -2265,7 +2353,7 @@ def _generate_ai_summary(domain: str, result: dict) -> str | None:
             max_tokens=700,
             system="You are a cybersecurity analyst. Output only the report text in the exact format requested. No markdown, no backticks, no extra commentary.",
             messages=[{"role": "user", "content": prompt}],
-            metadata={"report_type": "domain_scan", "domain": domain},
+            metadata={"report_type": "domain_scan", "domain": domain, "_user": user_id or "system"},
         )
         return data["content"][0]["text"] if data.get("content") else None
     except Exception as e:
@@ -2280,10 +2368,16 @@ def run_scan_background(domain_id: str, domain: str):
         return
     try:
         from cee_scanner.checks import scan_domain
+
+        # Fetch owner early so user_id is available for AI summary metadata
+        db = get_db()
+        domain_owner = db.table("domains").select("user_id").eq("id", domain_id).execute()
+        owner_user_id = domain_owner.data[0]["user_id"] if domain_owner.data else None
+
         result = scan_domain(domain)
 
         # Generate AI Intelligence Report (requires ANTHROPIC_API_KEY env var)
-        ai_text = _generate_ai_summary(domain, result)
+        ai_text = _generate_ai_summary(domain, result, user_id=owner_user_id)
         if ai_text:
             result["checks"].append({
                 "check": "ai_summary",
@@ -2293,7 +2387,6 @@ def run_scan_background(domain_id: str, domain: str):
                 "score_impact": 0,
             })
 
-        db = get_db()
         # Pass list directly — NOT json.dumps — so supabase stores it as jsonb not a string
         db.table("scans").insert({
             "domain_id":  domain_id,
@@ -2305,9 +2398,8 @@ def run_scan_background(domain_id: str, domain: str):
         }).execute()
         print(f"Scan saved for {domain}: score={result['risk_score']}, checks={len(result['checks'])}, ai={'yes' if ai_text else 'no'}")
 
-        # Look up domain owner
-        domain_row = db.table("domains").select("user_id").eq("id", domain_id).execute()
-        user_id    = domain_row.data[0]["user_id"] if domain_row.data else None
+        # Look up domain owner email (user_id already fetched above)
+        user_id    = owner_user_id
         user_row   = db.table("users").select("email").eq("id", user_id).execute() if user_id else None
         user_email = user_row.data[0]["email"] if (user_row and user_row.data) else None
 
@@ -2489,6 +2581,7 @@ class IntelRequest(BaseModel):
     domains: str = ""
     date: str = ""
     prompt: str = ""
+    domain: str = ""
     max_tokens: int = 1000
 
 @app.post("/intel")
@@ -2521,6 +2614,9 @@ async def intel(body: IntelRequest, authorization: str = Header(None)):
         system  = "You are a cybersecurity analyst. Output valid JSON only, no markdown, no backticks."
         max_tok = 1000
 
+    # Resolve domain for metadata — explicit field takes priority, else first domain from briefing list
+    meta_domain = body.domain or (body.domains.split(",")[0].strip() if body.domains else "")
+
     try:
         data = await _call_claude_async(
             api_key=AKEY,
@@ -2528,7 +2624,7 @@ async def intel(body: IntelRequest, authorization: str = Header(None)):
             max_tokens=max_tok,
             system=system,
             messages=[{"role": "user", "content": user_msg}],
-            metadata={"report_type": report_type, "_user": user["sub"]},
+            metadata={"report_type": report_type, "_user": user["sub"], "domain": meta_domain},
         )
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"LLM error: {str(e)[:200]}")
@@ -2641,7 +2737,8 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
     try:
         from cee_scanner.checks import scan_domain
         result = scan_domain(domain)
-        ai_text = _generate_ai_summary(domain, result)
+        api_user_id = user.get("user_id") or user.get("sub") or "api_user"
+        ai_text = _generate_ai_summary(domain, result, user_id=api_user_id)
         if ai_text:
             result["checks"].append({
                 "check": "ai_summary", "status": "ok",

@@ -274,21 +274,124 @@ def fetch_country_domains(country_code: str, limit: int = 500) -> list[str]:
 
 # ── Contact email discovery ────────────────────────────────────────────────────
 
-def discover_contact_email(domain: str) -> str:
-    """Try security.txt → fallback to security@ / webmaster@."""
+# Domains that commonly appear in HTML but are not real contact emails
+_JUNK_EMAIL_DOMAINS = {
+    "example.com", "sentry.io", "w3.org", "schema.org", "cloudflare.com",
+    "googleapis.com", "gstatic.com", "jquery.com", "bootstrapcdn.com",
+    "fonts.googleapis.com", "cdn.jsdelivr.net", "amazonaws.com",
+    "wordpress.org", "placeholder.com", "yourdomain.com",
+}
+_EMAIL_RE = re.compile(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}')
+
+# Pages to scrape for contact emails (EU-aware: impressum is legally required in DACH/CEE)
+_CONTACT_PAGES = [
+    "/", "/contact", "/contact-us", "/kontakt", "/impressum",
+    "/imprint", "/about", "/about-us", "/datenschutz", "/privacy",
+]
+
+
+def _extract_emails_from_html(html: str, own_domain: str) -> list[str]:
+    """Pull emails from raw HTML, filter junk, prefer own-domain addresses."""
+    found = []
+    seen: set[str] = set()
+    for raw in _EMAIL_RE.findall(html):
+        e = raw.strip().lower().rstrip(".")
+        # Skip junk file extensions (CSS background-image, image files referenced as emails)
+        if any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg", ".css", ".js")):
+            continue
+        host = e.split("@")[1]
+        if host in _JUNK_EMAIL_DOMAINS:
+            continue
+        if e not in seen:
+            seen.add(e)
+            found.append(e)
+    # Own-domain addresses first
+    own   = [e for e in found if e.endswith(f"@{own_domain}")]
+    other = [e for e in found if not e.endswith(f"@{own_domain}")]
+    return own + other
+
+
+def discover_all_contacts(domain: str) -> list[str]:
+    """
+    Multi-source contact discovery.  Returns a deduplicated list of emails
+    ranked best-first:
+
+      1. security.txt  (RFC 9116 — most authoritative)
+      2. WHOIS registrant / admin / tech contacts
+      3. Website scrape: homepage + /contact, /impressum, /about …
+      4. Common pattern guesses (security@, info@, …) as last resort
+    """
+    seen: set[str] = set()
+    verified: list[str] = []   # real emails found in external sources
+    guesses:  list[str] = []   # pattern-derived fallbacks
+
+    def _add(email: str, *, is_guess: bool = False):
+        e = email.strip().lower().rstrip(".")
+        if not e or "@" not in e:
+            return
+        host = e.split("@")[1]
+        if "." not in host or host in _JUNK_EMAIL_DOMAINS:
+            return
+        if e in seen:
+            return
+        seen.add(e)
+        if is_guess:
+            guesses.append(e)
+        else:
+            verified.append(e)
+
+    # ── 1. security.txt ──────────────────────────────────────────────────────
     for path in ["/.well-known/security.txt", "/security.txt"]:
         try:
             r = req.get(f"https://{domain}{path}", timeout=5, headers=UA, verify=False)
             if r.status_code == 200 and "Contact:" in r.text:
-                m = re.search(r"Contact:\s*(?:mailto:)?([^\s]+@[^\s]+)", r.text, re.IGNORECASE)
-                if m:
-                    email = m.group(1).strip().rstrip(".")
-                    if "@" in email and "." in email.split("@")[1]:
-                        return email
+                for m in re.finditer(
+                    r"Contact:\s*(?:mailto:)?([^\s]+@[^\s]+)", r.text, re.IGNORECASE
+                ):
+                    _add(m.group(1))
         except Exception:
             pass
-    # Fall back to security@ (higher open rate than webmaster@)
-    return f"security@{domain}"
+
+    # ── 2. WHOIS ─────────────────────────────────────────────────────────────
+    try:
+        import whois  # python-whois
+        w = whois.whois(domain)
+        raw_emails = w.emails if isinstance(w.emails, list) else (
+            [w.emails] if w.emails else []
+        )
+        for e in raw_emails:
+            if e:
+                _add(str(e))
+    except Exception:
+        pass
+
+    # ── 3. Website scraping ──────────────────────────────────────────────────
+    for path in _CONTACT_PAGES:
+        try:
+            r = req.get(
+                f"https://{domain}{path}",
+                timeout=7, headers=UA, verify=False, allow_redirects=True,
+            )
+            if r.status_code == 200:
+                for e in _extract_emails_from_html(r.text[:80_000], domain):
+                    _add(e)
+        except Exception:
+            pass
+        if len(verified) >= 5:   # enough real contacts found — stop scraping
+            break
+
+    # ── 4. Pattern guesses (last resort) ─────────────────────────────────────
+    for prefix in ["security", "info", "contact", "webmaster", "admin"]:
+        _add(f"{prefix}@{domain}", is_guess=True)
+
+    # Real verified addresses first, then guesses
+    return (verified + guesses)[:10]
+
+
+def discover_contact_email(domain: str) -> str:
+    """Best single contact email for a domain (backward-compatible wrapper)."""
+    contacts = discover_all_contacts(domain)
+    return contacts[0] if contacts else f"security@{domain}"
 
 
 # ── Header / version detection ────────────────────────────────────────────────
@@ -383,15 +486,47 @@ def scan_domain_passive(domain: str, country: str) -> Optional[dict]:
     if max_cvss < CVSS_THRESHOLD:
         return None
     priority = "CRITICAL" if max_cvss >= 9 else "HIGH" if max_cvss >= 7 else "MEDIUM"
-    contact  = discover_contact_email(domain)
+
+    # Check if a SwarmHawk user has manually set a primary contact for this domain
+    user_contact = None
+    try:
+        db = get_db()
+        domain_row = db.table("domains").select("primary_contact,contact_emails")\
+                       .eq("domain", domain).execute()
+        if domain_row.data:
+            user_contact = domain_row.data[0].get("primary_contact")
+            # Also reuse cached contact_emails from previous discovery if available
+            cached_emails = domain_row.data[0].get("contact_emails")
+            if cached_emails and not user_contact:
+                try:
+                    cached = json.loads(cached_emails) if isinstance(cached_emails, str) else cached_emails
+                    if cached:
+                        return {
+                            "domain":         domain,
+                            "country":        country,
+                            "software":       software,
+                            "cves":           cves[:5],
+                            "max_cvss":       max_cvss,
+                            "priority":       priority,
+                            "contact_email":  cached[0],
+                            "contact_emails": cached,
+                        }
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    contacts = discover_all_contacts(domain)
+    contact  = user_contact or (contacts[0] if contacts else f"security@{domain}")
     return {
-        "domain":        domain,
-        "country":       country,
-        "software":      software,
-        "cves":          cves[:5],
-        "max_cvss":      max_cvss,
-        "priority":      priority,
-        "contact_email": contact,
+        "domain":          domain,
+        "country":         country,
+        "software":        software,
+        "cves":            cves[:5],
+        "max_cvss":        max_cvss,
+        "priority":        priority,
+        "contact_email":   contact,
+        "contact_emails":  contacts,   # full ranked list for admin review
     }
 
 
@@ -425,7 +560,7 @@ def generate_email_body(prospect: dict) -> str:
     try:
         r = req.post(
             _anthropic_url(),
-            headers=_anthropic_headers({"report_type": "outreach_email", "domain": prospect["domain"]}),
+            headers=_anthropic_headers({"report_type": "outreach_email", "domain": prospect["domain"], "_user": "system"}),
             json={
                 "model": "claude-sonnet-4-20250514",
                 "max_tokens": 500,
@@ -471,12 +606,13 @@ def upsert_prospect(p: dict, email_body: str):
     existing = db.table("outreach_prospects").select("id,status").eq("domain", p["domain"]).execute()
 
     update_data = {
-        "software":      json.dumps(p["software"]),
-        "cves":          json.dumps(p["cves"]),
-        "max_cvss":      p["max_cvss"],
-        "priority":      p["priority"],
-        "contact_email": p.get("contact_email", f"security@{p['domain']}"),
-        "scanned_at":    now,
+        "software":        json.dumps(p["software"]),
+        "cves":            json.dumps(p["cves"]),
+        "max_cvss":        p["max_cvss"],
+        "priority":        p["priority"],
+        "contact_email":   p.get("contact_email", f"security@{p['domain']}"),
+        "contact_emails":  json.dumps(p.get("contact_emails", [])),
+        "scanned_at":      now,
     }
 
     if existing.data:
@@ -667,6 +803,18 @@ async def update_email(prospect_id: str, body: EmailUpdate, authorization: str =
         "edited":     True,
     }).eq("id", prospect_id).execute()
     return {"status": "saved"}
+
+
+@router.patch("/prospects/{prospect_id}/contact")
+async def update_contact(prospect_id: str, body: dict, authorization: str = Header(None)):
+    """Update the send-to contact email for a prospect."""
+    require_admin(authorization)
+    email = (body.get("contact_email") or "").strip()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Invalid email")
+    db = get_db()
+    db.table("outreach_prospects").update({"contact_email": email}).eq("id", prospect_id).execute()
+    return {"status": "saved", "contact_email": email}
 
 
 @router.post("/prospects/{prospect_id}/approve")
@@ -938,7 +1086,7 @@ async def test_template(body: dict, authorization: str = Header(None)):
     try:
         r = req.post(
             _anthropic_url(),
-            headers=_anthropic_headers({"report_type": "outreach_email", "domain": test_domain}),
+            headers=_anthropic_headers({"report_type": "outreach_email", "domain": test_domain, "_user": "system"}),
             json={"model": "claude-sonnet-4-20250514", "max_tokens": 500, "messages": [{"role": "user", "content": filled}]},
             timeout=20,
         )

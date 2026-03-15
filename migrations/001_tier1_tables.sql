@@ -30,12 +30,23 @@ CREATE TABLE IF NOT EXISTS outreach_prospects (
     created_at    TIMESTAMPTZ DEFAULT now()
 );
 
-ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS contact_email TEXT;
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS contact_email  TEXT;
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS contact_emails TEXT;  -- JSON array of all discovered emails
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS software       TEXT;  -- JSON
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS cves           TEXT;  -- JSON
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS priority       TEXT;
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS email_body     TEXT;
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS edited         BOOLEAN DEFAULT false;
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS sent_to        TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_prospects_status  ON outreach_prospects(status);
 CREATE INDEX IF NOT EXISTS idx_prospects_country ON outreach_prospects(country);
 
 ALTER TABLE outreach_prospects DISABLE ROW LEVEL SECURITY;
+
+-- ── Domain contact fields ────────────────────────────────────────────────────
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS primary_contact  TEXT;    -- user-set outreach email
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS contact_emails   TEXT;    -- JSON array from last discovery
 
 -- ── API Keys ────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS api_keys (
