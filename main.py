@@ -1492,19 +1492,21 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
     if existing.data:
         raise HTTPException(status_code=409, detail="Domain already added")
 
-    # Free tier: 1 domain max unless user has an active paid plan
-    domain_count = db.table("domains").select("id", count="exact").eq("user_id", user["sub"]).execute()
-    if (domain_count.count or 0) >= 1:
-        paid = db.table("purchases").select("id")\
-            .eq("user_id", user["sub"])\
-            .is_("cancelled_at", "null")\
-            .not_.is_("paid_at", "null")\
-            .execute()
-        if not paid.data:
-            raise HTTPException(
-                status_code=403,
-                detail="Free accounts are limited to 1 domain. Upgrade to Annual ($50/year) to monitor unlimited domains."
-            )
+    # Free tier: 10 domains max unless user has an active paid plan or is admin
+    FREE_DOMAIN_LIMIT = 10
+    if not is_admin(user["sub"]):
+        domain_count = db.table("domains").select("id", count="exact").eq("user_id", user["sub"]).execute()
+        if (domain_count.count or 0) >= FREE_DOMAIN_LIMIT:
+            paid = db.table("purchases").select("id")\
+                .eq("user_id", user["sub"])\
+                .is_("cancelled_at", "null")\
+                .not_.is_("paid_at", "null")\
+                .execute()
+            if not paid.data:
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Free accounts are limited to {FREE_DOMAIN_LIMIT} domains. Upgrade to Annual ($50/year) to monitor unlimited domains."
+                )
 
     # Resolve country — use provided value only when it's a real ISO code
     resolved_country = body.country.upper().strip() if body.country else ""
