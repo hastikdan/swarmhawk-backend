@@ -619,39 +619,80 @@ def upsert_prospect(p: dict, email_body: str):
         }).execute()
 
 
+# ── Scan progress state (in-memory, updated by _run_scan_job) ─────────────────
+_scan_progress: dict = {"status": "idle"}
+
+
 # ── Background scan job ───────────────────────────────────────────────────────
 
 def _run_scan_job():
     """Daily job: fetch top 500 domains per country, passive scan, upsert prospects."""
+    global _scan_progress
     import urllib3
     urllib3.disable_warnings()
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    all_domains = []
+    # ── Phase 1: fetch domain lists per country ──────────────────────────────
+    _scan_progress = {
+        "status":       "fetching",
+        "phase":        "Fetching domain lists…",
+        "started_at":   datetime.now(timezone.utc).isoformat(),
+        "total":        0,
+        "scanned":      0,
+        "found":        0,
+        "country_stats": {},
+        "finished_at":  None,
+    }
+
+    country_domains: dict[str, list[str]] = {}
     for country in COUNTRY_TLDS:
         domains = fetch_country_domains(country, limit=SCAN_LIMIT)
-        for d in domains:
-            all_domains.append((d, country))
+        if domains:
+            country_domains[country] = domains
 
-    print(f"[outreach] Starting scan: {len(all_domains)} domains across {len(COUNTRY_TLDS)} countries")
+    all_domains = [(d, c) for c, doms in country_domains.items() for d in doms]
+    total = len(all_domains)
+
+    # ── Phase 2: scan ────────────────────────────────────────────────────────
+    _scan_progress.update({
+        "status":  "running",
+        "phase":   "Scanning domains for vulnerabilities…",
+        "total":   total,
+        "country_stats": {
+            c: {"total": len(doms), "scanned": 0, "found": 0}
+            for c, doms in country_domains.items()
+        },
+    })
+
+    print(f"[outreach] Starting scan: {total} domains across {len(country_domains)} countries")
     found = 0
 
     with ThreadPoolExecutor(max_workers=8) as ex:
         futures = {ex.submit(scan_domain_passive, domain, country): (domain, country)
                    for domain, country in all_domains}
         for future in as_completed(futures):
+            domain, country = futures[future]
+            _scan_progress["scanned"] += 1
+            _scan_progress["country_stats"][country]["scanned"] += 1
             try:
                 result = future.result()
                 if result:
                     email_body = generate_email_body(result)
                     upsert_prospect(result, email_body)
                     found += 1
+                    _scan_progress["found"]  += 1
+                    _scan_progress["country_stats"][country]["found"] += 1
                     print(f"[outreach] ✓ {result['domain']} — CVSS {result['max_cvss']}")
             except Exception as e:
-                domain, _ = futures[future]
                 print(f"[outreach] ✗ {domain}: {e}")
 
     print(f"[outreach] Scan complete — {found} vulnerable domains found")
+    _scan_progress.update({
+        "status":      "done",
+        "phase":       f"Complete — {found} vulnerable domains found",
+        "found":       found,
+        "finished_at": datetime.now(timezone.utc).isoformat(),
+    })
 
     try:
         db = get_db()
@@ -695,6 +736,8 @@ def require_admin(authorization: str):
 async def run_scan(background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Trigger prospect scan manually. Auto-runs at 06:00 daily."""
     require_admin(authorization)
+    if _scan_progress.get("status") == "running":
+        return {"status": "already_running", **_scan_progress}
     background_tasks.add_task(_run_scan_job)
     return {
         "status": "scan started",
@@ -702,6 +745,31 @@ async def run_scan(background_tasks: BackgroundTasks, authorization: str = Heade
         "scan_limit_per_country": SCAN_LIMIT,
         "source": "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
     }
+
+
+@router.get("/scan-progress")
+async def get_scan_progress(authorization: str = Header(None)):
+    """Return real-time scan progress. Poll this while a scan is running."""
+    require_admin(authorization)
+    p = dict(_scan_progress)
+    # Compute elapsed + ETA
+    if p.get("started_at") and p.get("status") in ("running", "fetching", "done"):
+        try:
+            started = datetime.fromisoformat(p["started_at"])
+            elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+            p["elapsed_s"] = int(elapsed)
+            scanned = p.get("scanned", 0)
+            total   = p.get("total", 0)
+            if scanned > 10 and total > scanned:
+                rate      = scanned / elapsed          # domains/sec
+                remaining = total - scanned
+                p["eta_s"] = int(remaining / rate)
+            else:
+                p["eta_s"] = None
+        except Exception:
+            p["elapsed_s"] = 0
+            p["eta_s"]     = None
+    return p
 
 
 @router.get("/prospects/stats")
