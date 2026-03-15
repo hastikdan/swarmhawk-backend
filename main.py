@@ -46,7 +46,7 @@ ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-a
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
 PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.com")
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "onboarding@resend.dev")
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
 SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-scanner")
 

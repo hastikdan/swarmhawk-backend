@@ -35,7 +35,7 @@ router = APIRouter(prefix="/outreach", tags=["outreach"])
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 ANTHROPIC_KEY       = os.getenv("ANTHROPIC_API_KEY", "")
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")
-FROM_EMAIL          = os.getenv("OUTREACH_FROM", "security@swarmhawk.com")
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "onboarding@resend.dev")
 FROM_NAME           = "SwarmHawk Security"
 CVSS_THRESHOLD      = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
 DAILY_SEND_LIMIT    = int(os.getenv("OUTREACH_DAILY_LIMIT", "20"))
