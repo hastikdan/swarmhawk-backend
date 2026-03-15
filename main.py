@@ -450,11 +450,11 @@ def send_welcome_email(to_email: str, name: str):
       </p>
       <div style="background:#111;border-radius:8px;padding:20px;margin-bottom:24px">
         <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">1. Add your domain</span><br>
-          <span style="color:#888;font-size:13px">Go to your dashboard → Domains → Add Domain. We'll run 19 security checks automatically.</span></div>
+          <span style="color:#888;font-size:13px">Go to your dashboard → Domains → Add Domain. We'll run 22 security checks automatically.</span></div>
         <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">2. Get your free report</span><br>
           <span style="color:#888;font-size:13px">Your free scan includes SSL, DNS, breach detection, malware checks, and more.</span></div>
         <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">3. Upgrade for full intelligence</span><br>
-          <span style="color:#888;font-size:13px">Full 19-check report with AI threat analysis for <strong style="color:#fff">$10 one-time</strong>, or monthly scans + PDF reports for <strong style="color:#fff">$50/year</strong>.</span></div>
+          <span style="color:#888;font-size:13px">Full 22-check report with AI threat analysis for <strong style="color:#fff">$10 one-time</strong>, or monthly scans + PDF reports for <strong style="color:#fff">$50/year</strong>.</span></div>
         <div><span style="color:#cbff00;font-weight:700">4. NIS2 compliance</span><br>
           <span style="color:#888;font-size:13px">Your reports serve as documented evidence of regular security monitoring required under NIS2.</span></div>
       </div>
@@ -1754,9 +1754,12 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     checks = raw_checks if isinstance(raw_checks, list) else []
 
     # Free = core checks visible; paid = all checks including AI summary
-    FREE_CHECKS = {"urlhaus", "safebrowsing", "virustotal", "spamhaus", "breach",
-                   "whois", "email_security", "ssl", "headers", "dns",
-                   "sast", "sca", "dast", "iac", "paranoidlab"}
+    FREE_CHECKS = {
+        "ssl", "headers", "dns", "https_redirect", "breach", "typosquat", "performance",
+        "urlhaus", "spamhaus", "safebrowsing", "virustotal", "cve", "darkweb",
+        "whois", "email_security", "sast", "sca", "dast", "iac",
+        # paid: ip_intel, shodan, open_ports
+    }
 
     if is_paid:
         visible_checks = checks
@@ -1879,15 +1882,16 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     # ── Checks table ────────────────────────────────────────────────────────
     CHECK_LABELS = {
         "ssl": "SSL/TLS", "headers": "Security Headers", "dns": "DNS",
-        "http_redirect": "HTTPS Redirect", "breach": "Breach Exposure",
-        "typosquat": "Typosquat", "response_time": "Response Time",
+        "https_redirect": "HTTPS Redirect", "breach": "Breach Exposure",
+        "typosquat": "Typosquat", "performance": "Response Time",
         "email_security": "Email Security", "whois": "WHOIS / RDAP",
         "urlhaus": "URLhaus Malware", "spamhaus": "Spamhaus DBL",
         "safebrowsing": "Safe Browsing", "virustotal": "VirusTotal",
-        "cve": "CVE Scan", "sast": "SAST — Source Exposure",
+        "cve": "CVE Scan", "darkweb": "Dark Web Leaks",
+        "ip_intel": "IP Intelligence", "shodan": "Shodan",
+        "open_ports": "Open Ports", "sast": "SAST — Source Exposure",
         "sca": "SCA — Dependency CVEs", "dast": "DAST — App Testing",
-        "iac": "IaC — Config Exposure", "ip_intel": "IP Intelligence",
-        "paranoidlab": "Dark Web Leaks",
+        "iac": "IaC — Config Exposure",
     }
 
     for c in non_ai:
@@ -2208,7 +2212,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                         "unit_amount": 1000,        # $10.00
                         "product_data": {
                             "name": f"Security Report — {body.domain}",
-                            "description": "Full 19-check security report with AI threat analysis. One-time purchase.",
+                            "description": "Full 22-check security report with AI threat analysis. One-time purchase.",
                         },
                     },
                     "quantity": 1,
@@ -2738,7 +2742,7 @@ async def public_scan(body: PublicScanRequest):
 
         # Free tier: only show first 5 checks, lock the rest
         checks = result.get("checks", [])
-        FREE_CHECKS = {"ssl", "headers", "dns", "sast", "sca", "dast", "iac", "paranoidlab"}
+        FREE_CHECKS = {"ssl", "headers", "dns", "sast", "sca", "dast", "iac", "darkweb"}
         free   = [c for c in checks if c.get("check") in FREE_CHECKS]
         locked = [c for c in checks if c.get("check") not in FREE_CHECKS and c.get("check") != "ai_summary"]
 

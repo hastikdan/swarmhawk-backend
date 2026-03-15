@@ -20,7 +20,9 @@ THREAT_LABELS = {
 CHECK_ICONS = {
     "ssl":"🔒","headers":"🛡","dns":"🌐","https_redirect":"↪","typosquat":"🎭",
     "performance":"⚡","urlhaus":"🦠","safebrowsing":"💻","virustotal":"🧪",
-    "spamhaus":"📧","breach":"💥",
+    "spamhaus":"📧","breach":"💥","cve":"🐛","darkweb":"🕵️",
+    "whois":"📋","email_security":"✉️","ip_intel":"🔍","shodan":"📡",
+    "open_ports":"🚪","sast":"💻","sca":"📦","dast":"🌐","iac":"🏗",
 }
 
 def _rc(s):
