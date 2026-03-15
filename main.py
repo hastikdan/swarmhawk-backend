@@ -87,6 +87,7 @@ def get_admin_db() -> Client:
 from contextlib import asynccontextmanager
 
 SCANNER_AVAILABLE = False  # set True at startup if cee_scanner imports OK
+_active_scans: dict = {}  # domain_id → {domain, started_at, user_id, status}
 
 def _send_breach_monday():
     """Every Monday: email each user a digest of new threats found across their domains."""
@@ -1059,6 +1060,80 @@ def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authoriza
     for d in (doms.data or []):
         background_tasks.add_task(run_scan_background, d["id"], d["domain"])
     return {"queued": len(doms.data or [])}
+
+
+@app.get("/admin/scans/active")
+def admin_active_scans(authorization: str = Header(None)):
+    """Return currently running domain scans + marketing scan progress."""
+    user = get_user_from_header(authorization)
+    if not is_admin(user["sub"]):
+        raise HTTPException(403, "Admin only")
+    from outreach import _scan_progress
+    return {
+        "domain_scans": [{"domain_id": k, **v} for k, v in _active_scans.items()],
+        "marketing_scan": _scan_progress,
+    }
+
+@app.get("/admin/scans/history")
+def admin_scan_history(authorization: str = Header(None)):
+    """Return recent domain scans and marketing scan log."""
+    user = get_user_from_header(authorization)
+    if not is_admin(user["sub"]):
+        raise HTTPException(403, "Admin only")
+    db = get_db()
+    try:
+        scans = db.table("scans")\
+            .select("id,domain_id,risk_score,critical,warnings,scanned_at,domains(domain)")\
+            .order("scanned_at", desc=True).limit(100).execute()
+    except Exception:
+        scans_data = []
+    else:
+        scans_data = scans.data or []
+    try:
+        logs = db.table("outreach_log").select("*").order("ran_at", desc=True).limit(20).execute()
+    except Exception:
+        logs_data = []
+    else:
+        logs_data = logs.data or []
+    return {"domain_scans": scans_data, "marketing_scans": logs_data}
+
+@app.get("/admin/portkey/usage")
+def admin_portkey_usage(authorization: str = Header(None)):
+    """Fetch AI cost/usage data from Portkey analytics API."""
+    user = get_user_from_header(authorization)
+    if not is_admin(user["sub"]):
+        raise HTTPException(403, "Admin only")
+    if not PORTKEY_API_KEY:
+        return {"error": "Portkey not configured", "total_requests": 0, "total_cost": 0}
+    try:
+        import httpx as _httpx
+        resp = _httpx.get(
+            "https://api.portkey.ai/v1/analytics",
+            headers={"x-portkey-api-key": PORTKEY_API_KEY, "Content-Type": "application/json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        # Try logs endpoint as fallback
+        resp2 = _httpx.get(
+            "https://api.portkey.ai/v1/logs?limit=100&order=desc",
+            headers={"x-portkey-api-key": PORTKEY_API_KEY},
+            timeout=10,
+        )
+        if resp2.status_code == 200:
+            data = resp2.json()
+            logs = data.get("data", data.get("logs", []))
+            total_cost = sum(float(l.get("cost", 0) or 0) for l in logs)
+            total_tokens = sum(int(l.get("usage", {}).get("total_tokens", 0) or 0) for l in logs)
+            return {
+                "total_requests": len(logs),
+                "total_tokens": total_tokens,
+                "total_cost": round(total_cost, 4),
+                "logs": logs[:20],  # last 20 calls
+            }
+        return {"error": f"Portkey API returned {resp.status_code}", "total_requests": 0, "total_cost": 0}
+    except Exception as e:
+        return {"error": str(e), "total_requests": 0, "total_cost": 0}
 
 
 @app.get("/admin/llm-stats")
@@ -2368,16 +2443,18 @@ def _generate_ai_summary(domain: str, result: dict, user_id: str | None = None) 
 
 def run_scan_background(domain_id: str, domain: str):
     """Run scanner in background and save results to DB."""
-    if not SCANNER_AVAILABLE:
-        print(f"Scan skipped for {domain}: cee_scanner not installed on this server")
-        return
+    _active_scans[domain_id] = {"domain": domain, "started_at": datetime.now(timezone.utc).isoformat(), "user_id": None, "status": "scanning"}
     try:
+        if not SCANNER_AVAILABLE:
+            print(f"Scan skipped for {domain}: cee_scanner not installed on this server")
+            return
         from cee_scanner.checks import scan_domain
 
         # Fetch owner early so user_id is available for AI summary metadata
         db = get_db()
         domain_owner = db.table("domains").select("user_id").eq("id", domain_id).execute()
         owner_user_id = domain_owner.data[0]["user_id"] if domain_owner.data else None
+        _active_scans[domain_id]["user_id"] = owner_user_id
 
         result = scan_domain(domain)
 
@@ -2462,6 +2539,8 @@ def run_scan_background(domain_id: str, domain: str):
             }).execute()
         except Exception:
             pass
+    finally:
+        _active_scans.pop(domain_id, None)
 
 
 # ── Passive prospect scan ─────────────────────────────────────────────────────
