@@ -3825,24 +3825,61 @@ def attack_map_data():
 @app.get("/map/country/{code}")
 def map_country_top_domains(code: str):
     """
-    Public: top 50 highest-risk scanned domains for a country from outreach_prospects.
-    Used by the live map side panel. No auth required.
+    Public: top 100 highest-risk scanned domains for a country.
+    Returns rich domain objects with score, scan date, and critical count.
+    Also returns country-level summary stats.
+    No auth required.
     """
     code = code.upper()
+    domains = []
+    summary = {}
     try:
         from outreach import get_db as outreach_get_db
         db = outreach_get_db()
+        # Fetch scanned domains sorted by risk
         rows = db.table("outreach_prospects")\
-            .select("domain,max_cvss")\
+            .select("domain,max_cvss,scanned_at")\
             .eq("country", code)\
             .not_.is_("scanned_at", "null")\
             .order("max_cvss", desc=True)\
-            .limit(50)\
+            .limit(100)\
             .execute()
-        domains = [r["domain"] for r in (rows.data or [])]
-    except Exception:
-        domains = []
-    return {"country": code, "domains": domains, "total": len(domains)}
+        for r in (rows.data or []):
+            cvss = r.get("max_cvss") or 0
+            # Convert CVSS (0-10) to risk score (0-100)
+            risk_score = min(100, int(round(cvss * 10)))
+            scan_date = ""
+            if r.get("scanned_at"):
+                try:
+                    from datetime import datetime as _dt
+                    dt = _dt.fromisoformat(r["scanned_at"].replace("Z", "+00:00"))
+                    scan_date = dt.strftime("%d %b %Y")
+                except Exception:
+                    scan_date = str(r["scanned_at"])[:10]
+            domains.append({
+                "domain": r["domain"],
+                "risk_score": risk_score,
+                "scanned_at": scan_date,
+                "max_cvss": round(cvss, 1),
+            })
+        # Also count all domains in pipeline (unscanned)
+        all_rows = db.table("outreach_prospects")\
+            .select("domain", count="exact")\
+            .eq("country", code)\
+            .execute()
+        total_tracked = all_rows.count or len(all_rows.data or [])
+        scanned_count = len(domains)
+        high_risk = sum(1 for d in domains if d["risk_score"] >= 70)
+        avg_risk = int(sum(d["risk_score"] for d in domains) / scanned_count) if scanned_count else 0
+        summary = {
+            "total_tracked": total_tracked,
+            "scanned": scanned_count,
+            "avg_risk": avg_risk,
+            "high_risk": high_risk,
+        }
+    except Exception as exc:
+        summary = {"error": str(exc)}
+    return {"country": code, "domains": domains, "total": len(domains), "summary": summary}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
