@@ -477,18 +477,21 @@ def query_nvd(product: str, version: str) -> list[dict]:
 
 def scan_domain_passive(domain: str, country: str) -> Optional[dict]:
     software = detect_software(domain)
-    if not software:
-        return None
     cves = []
-    for sw in software:
+    for sw in (software or []):
         if sw["version"] and sw["version"] != "unknown":
             cves.extend(query_nvd(sw["product"], sw["version"]))
-    if not cves:
-        return None
-    max_cvss = max(c["cvss"] for c in cves)
-    if max_cvss < CVSS_THRESHOLD:
-        return None
-    priority = "CRITICAL" if max_cvss >= 9 else "HIGH" if max_cvss >= 7 else "MEDIUM"
+    max_cvss = max((c["cvss"] for c in cves), default=0.0)
+    if max_cvss >= 9:
+        priority = "CRITICAL"
+    elif max_cvss >= 7:
+        priority = "HIGH"
+    elif max_cvss >= 4:
+        priority = "MEDIUM"
+    elif max_cvss > 0:
+        priority = "LOW"
+    else:
+        priority = "INFO"
 
     # Lightweight contact discovery for bulk scans — security.txt only + fallback.
     # Full multi-source discovery (WHOIS + scraping) runs on-demand per domain via
@@ -510,6 +513,8 @@ def scan_domain_passive(domain: str, country: str) -> Optional[dict]:
 
 def generate_email_body(prospect: dict) -> str:
     if not ANTHROPIC_KEY:
+        return _fallback_email(prospect)
+    if not prospect.get("cves"):
         return _fallback_email(prospect)
     top_cve  = prospect["cves"][0]
     sw_list  = ", ".join(f"{s['product']} {s['version']}" for s in prospect["software"])
@@ -552,20 +557,35 @@ def generate_email_body(prospect: dict) -> str:
 
 
 def _fallback_email(p: dict) -> str:
-    top = p["cves"][0]
-    sw  = p["software"][0]
-    return (
-        f"Subject: Security vulnerability detected on {p['domain']} — {top['id']} CVSS {top['cvss']}\n\n"
-        f"Dear {p['domain']} team,\n\n"
-        f"Our automated security scanner detected {top['id']} (CVSS {top['cvss']}) "
-        f"on your server running {sw['product']} {sw['version']}. "
-        f"This is a publicly known vulnerability that could expose your organisation "
-        f"to data breaches and NIS2 compliance penalties.\n\n"
-        f"We have prepared a free full security report for {p['domain']} including "
-        f"exact findings and remediation steps. Visit swarmhawk.com or reply to this "
-        f"email to access it.\n\n"
-        f"The SwarmHawk Team | swarmhawk.com"
-    )
+    cves = p.get("cves") or []
+    sw   = (p.get("software") or [{}])[0]
+    if cves:
+        top = cves[0]
+        return (
+            f"Subject: Security vulnerability detected on {p['domain']} — {top['id']} CVSS {top['cvss']}\n\n"
+            f"Dear {p['domain']} team,\n\n"
+            f"Our automated security scanner detected {top['id']} (CVSS {top['cvss']}) "
+            f"on your server running {sw.get('product','your server')} {sw.get('version','')}. "
+            f"This is a publicly known vulnerability that could expose your organisation "
+            f"to data breaches and NIS2 compliance penalties.\n\n"
+            f"We have prepared a free full security report for {p['domain']} including "
+            f"exact findings and remediation steps. Visit swarmhawk.com or reply to this "
+            f"email to access it.\n\n"
+            f"The SwarmHawk Team | swarmhawk.com"
+        )
+    else:
+        sw_line = f" running {sw.get('product','')} {sw.get('version','')}".strip() if sw.get('product') else ""
+        return (
+            f"Subject: Free security scan available for {p['domain']}\n\n"
+            f"Dear {p['domain']} team,\n\n"
+            f"SwarmHawk's automated scanner reviewed {p['domain']}{sw_line} as part of our "
+            f"NIS2 compliance monitoring programme. No critical vulnerabilities were detected today, "
+            f"however our full 22-point security audit covers SSL, email security, exposed services, "
+            f"source code exposure and more.\n\n"
+            f"We have a free detailed report available for {p['domain']}. "
+            f"Visit swarmhawk.com or reply to claim it.\n\n"
+            f"The SwarmHawk Team | swarmhawk.com"
+        )
 
 
 # ── Supabase helpers ──────────────────────────────────────────────────────────
@@ -701,8 +721,8 @@ def _run_scan_job():
                 try:
                     result = future.result()
                     if result:
-                        # AI-draft immediately for critical threats (CVSS ≥ 8); fallback for rest.
-                        if result["max_cvss"] >= 8.0 and ANTHROPIC_KEY:
+                        # AI-draft for critical CVE threats (CVSS ≥ 8); fallback for others.
+                        if result["max_cvss"] >= 8.0 and result.get("cves") and ANTHROPIC_KEY:
                             email_body = generate_email_body(result)
                         else:
                             email_body = _fallback_email(result)
@@ -1045,7 +1065,7 @@ def _draft_pending_job():
         except Exception:
             skipped += 1
             continue
-        if not cves or not software:
+        if not software:
             skipped += 1
             continue
         prospect = {
