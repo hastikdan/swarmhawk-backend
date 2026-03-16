@@ -624,13 +624,15 @@ def upsert_prospect(p: dict, email_body: str, db=None):
 
 # ── Scan progress state (in-memory, updated by _run_scan_job) ─────────────────
 _scan_progress: dict = {"status": "idle"}
+_stop_requested: bool = False
 
 
 # ── Background scan job ───────────────────────────────────────────────────────
 
 def _run_scan_job():
     """Scan top SCAN_LIMIT domains per country in parallel across all (or configured) countries."""
-    global _scan_progress
+    global _scan_progress, _stop_requested
+    _stop_requested = False
     import urllib3
     urllib3.disable_warnings()
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -689,6 +691,11 @@ def _run_scan_job():
                        for domain, country in all_domains}
             for future in as_completed(futures):
                 domain, country = futures[future]
+                if _stop_requested:
+                    print(f"[outreach] Stop requested — cancelling remaining futures")
+                    for f in futures:
+                        f.cancel()
+                    break
                 _scan_progress["scanned"] += 1
                 _scan_progress["country_stats"][country]["scanned"] += 1
                 try:
@@ -726,13 +733,22 @@ def _run_scan_job():
         })
         return
 
-    print(f"[outreach] Scan complete — {found} vulnerable domains found")
-    _scan_progress.update({
-        "status":      "done",
-        "phase":       f"Complete — {found} vulnerable domains found",
-        "found":       found,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    })
+    if _stop_requested:
+        print(f"[outreach] Scan stopped by admin — {found} vulnerable domains saved")
+        _scan_progress.update({
+            "status":      "done",
+            "phase":       f"Stopped — {found} vulnerable domains saved before stop",
+            "found":       found,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
+    else:
+        print(f"[outreach] Scan complete — {found} vulnerable domains found")
+        _scan_progress.update({
+            "status":      "done",
+            "phase":       f"Complete — {found} vulnerable domains found",
+            "found":       found,
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        })
 
     # ── Phase 3: sync user-set contacts → outreach_prospects ─────────────────
     # Any domain in the `domains` table that has a primary_contact set should
@@ -960,6 +976,17 @@ async def run_scan(background_tasks: BackgroundTasks, authorization: str = Heade
         "scan_limit_per_country": SCAN_LIMIT,
         "source": "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
     }
+
+
+@router.post("/stop-scan")
+async def stop_scan(authorization: str = Header(None)):
+    """Request the running scan to stop after the current batch."""
+    require_admin(authorization)
+    global _stop_requested
+    if _scan_progress.get("status") not in ("running", "fetching"):
+        return {"status": "not_running"}
+    _stop_requested = True
+    return {"status": "stop_requested", "saved_so_far": _scan_progress.get("found", 0)}
 
 
 @router.post("/sync-contacts")
