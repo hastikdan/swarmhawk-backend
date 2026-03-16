@@ -3803,6 +3803,35 @@ def _build_map_data() -> dict:
     }
 
 
+@app.get("/check-domains-available")
+def check_domains_available(domains: str):
+    """
+    Public: check whether domains are registered via RDAP.
+    Pass comma-separated list, max 10. Returns {domain: 'available'|'taken'|'unknown'}.
+    """
+    import concurrent.futures
+    domain_list = [d.strip().lower() for d in domains.split(',') if d.strip()][:10]
+
+    def check_one(d):
+        try:
+            r = requests.get(f"https://rdap.org/domain/{d}", timeout=6, allow_redirects=True,
+                             headers={"Accept": "application/json"})
+            if r.status_code == 200:
+                return d, "taken"
+            elif r.status_code in (404, 400):
+                return d, "available"
+            else:
+                return d, "unknown"
+        except Exception:
+            return d, "unknown"
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+        for domain, status in ex.map(check_one, domain_list):
+            results[domain] = status
+    return results
+
+
 @app.get("/map/data")
 def attack_map_data():
     """
