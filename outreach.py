@@ -41,6 +41,9 @@ CVSS_THRESHOLD      = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
 DAILY_SEND_LIMIT    = int(os.getenv("OUTREACH_DAILY_LIMIT", "20"))
 CLOUDFLARE_TOKEN    = os.getenv("CLOUDFLARE_API_TOKEN", "")
 SCAN_LIMIT          = int(os.getenv("OUTREACH_SCAN_LIMIT", "100"))  # domains per country
+# Comma-separated country codes to scan, e.g. "CZ,SK,PL". Empty = all countries.
+_OUTREACH_COUNTRIES_ENV = os.getenv("OUTREACH_COUNTRIES", "")
+ACTIVE_COUNTRIES    = [c.strip().upper() for c in _OUTREACH_COUNTRIES_ENV.split(",") if c.strip()] if _OUTREACH_COUNTRIES_ENV else None
 
 TIMEOUT = 10
 UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
@@ -626,15 +629,21 @@ _scan_progress: dict = {"status": "idle"}
 # ── Background scan job ───────────────────────────────────────────────────────
 
 def _run_scan_job():
-    """Scan top SCAN_LIMIT domains per country in parallel across all countries."""
+    """Scan top SCAN_LIMIT domains per country in parallel across all (or configured) countries."""
     global _scan_progress
     import urllib3
     urllib3.disable_warnings()
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    # Honour OUTREACH_COUNTRIES env var — restrict to listed countries if set
+    countries_to_scan = {k: v for k, v in COUNTRY_TLDS.items() if not ACTIVE_COUNTRIES or k in ACTIVE_COUNTRIES}
+    if not countries_to_scan:
+        print(f"[outreach] OUTREACH_COUNTRIES={ACTIVE_COUNTRIES} matched no known countries — aborting")
+        return
+
     _scan_progress = {
         "status":        "fetching",
-        "phase":         f"Fetching domain lists for {len(COUNTRY_TLDS)} countries in parallel…",
+        "phase":         f"Fetching domain lists for {len(countries_to_scan)} country/countries in parallel…",
         "started_at":    datetime.now(timezone.utc).isoformat(),
         "total":         0,
         "scanned":       0,
@@ -651,8 +660,8 @@ def _run_scan_job():
         def _fetch_country(country):
             return country, fetch_country_domains(country, limit=SCAN_LIMIT)
 
-        with ThreadPoolExecutor(max_workers=len(COUNTRY_TLDS)) as ex:
-            for country, domains in ex.map(_fetch_country, COUNTRY_TLDS.keys()):
+        with ThreadPoolExecutor(max_workers=max(1, len(countries_to_scan))) as ex:
+            for country, domains in ex.map(_fetch_country, countries_to_scan.keys()):
                 if domains:
                     country_domains[country] = domains
 
@@ -943,9 +952,11 @@ async def run_scan(background_tasks: BackgroundTasks, authorization: str = Heade
     if _scan_progress.get("status") == "running":
         return {"status": "already_running", **_scan_progress}
     background_tasks.add_task(_run_scan_job)
+    active = {k: v for k, v in COUNTRY_TLDS.items() if not ACTIVE_COUNTRIES or k in ACTIVE_COUNTRIES}
     return {
         "status": "scan started",
-        "countries": len(COUNTRY_TLDS),
+        "countries": len(active),
+        "active_countries": list(active.keys()),
         "scan_limit_per_country": SCAN_LIMIT,
         "source": "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
     }
