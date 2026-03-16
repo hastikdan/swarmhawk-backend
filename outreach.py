@@ -685,9 +685,11 @@ def _run_scan_job():
                 try:
                     result = future.result()
                     if result:
-                        # Use fallback email during bulk scan — no Claude API call per prospect.
-                        # AI email is generated on-demand when admin reviews/approves the prospect.
-                        email_body = _fallback_email(result)
+                        # AI-draft immediately for critical threats (CVSS ≥ 8); fallback for rest.
+                        if result["max_cvss"] >= 8.0 and ANTHROPIC_KEY:
+                            email_body = generate_email_body(result)
+                        else:
+                            email_body = _fallback_email(result)
                         upsert_prospect(result, email_body, db=db)
                         found += 1
                         _scan_progress["found"]  += 1
@@ -729,6 +731,9 @@ def _run_scan_job():
     # This runs after every daily batch so manually-added contacts propagate
     # to Marketing without waiting for the next domain re-scan.
     _sync_domain_contacts_to_prospects(db)
+
+    # ── Phase 4: send daily digest to admin ───────────────────────────────────
+    send_admin_digest(found, db=db)
 
     # Bust the threat map cache so next /map/data request rebuilds from fresh data
     try:
@@ -792,6 +797,118 @@ def _sync_domain_contacts_to_prospects(db=None):
         print(f"[outreach] contact sync error: {e}")
 
 
+# ── Admin daily digest ────────────────────────────────────────────────────────
+
+def send_admin_digest(found_count: int, db=None):
+    """Email the admin a daily summary: new prospects found, top 10 by CVSS, pending count."""
+    if not RESEND_API_KEY:
+        print("[outreach] digest: RESEND_API_KEY not set — skipping")
+        return
+    admin_email = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")
+    db = db or get_db()
+
+    # Fetch today's top prospects
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        top_rows = (
+            db.table("outreach_prospects")
+            .select("domain,country,max_cvss,status,contact_email,scanned_at")
+            .gte("scanned_at", today)
+            .order("max_cvss", desc=True)
+            .limit(10)
+            .execute()
+        )
+        top = top_rows.data or []
+    except Exception as e:
+        print(f"[outreach] digest: DB error {e}")
+        top = []
+
+    # Fetch pending count
+    try:
+        pending_count = (
+            db.table("outreach_prospects")
+            .select("id", count="exact")
+            .eq("status", "pending")
+            .execute()
+            .count or 0
+        )
+    except Exception:
+        pending_count = "?"
+
+    site = os.getenv("SITE_URL", "https://www.swarmhawk.com")
+
+    rows_html = ""
+    for r in top:
+        cvss = r.get("max_cvss", 0) or 0
+        color = "#E74C3C" if cvss >= 9 else "#E67E22" if cvss >= 7 else "#888"
+        status     = r.get("status", "pending")
+        sbg        = "rgba(26,122,74,.2)"  if status == "approved" else "rgba(212,133,10,.2)"
+        scolor     = "#2ECC71"             if status == "approved" else "#E67E22"
+        domain     = r.get("domain", "")
+        country    = r.get("country", "")
+        contact    = r.get("contact_email", "")
+        rows_html += (
+            f"<tr>"
+            f"<td style='padding:6px 10px;font-family:monospace;font-size:13px'>{domain}</td>"
+            f"<td style='padding:6px 10px;text-align:center'>{country}</td>"
+            f"<td style='padding:6px 10px;text-align:center;color:{color};font-weight:700'>{cvss}</td>"
+            f"<td style='padding:6px 10px;font-size:11px;color:#888'>{contact}</td>"
+            f"<td style='padding:6px 10px;text-align:center'>"
+            f"<span style='font-size:10px;padding:2px 8px;border-radius:8px;"
+            f"background:{sbg};color:{scolor}'>{status.upper()}</span>"
+            f"</td>"
+            f"</tr>"
+        )
+
+    html = f"""<!DOCTYPE html>
+<html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:650px;margin:0 auto;padding:24px;background:#f9f9f9">
+  <div style="background:#0E0D12;padding:18px 24px;border-radius:10px 10px 0 0;display:flex;align-items:center;gap:12px">
+    <strong style="font-family:monospace;font-size:16px;color:#0E0D12;background:#CBFF00;padding:4px 10px">SWARMHAWK</strong>
+    <span style="color:#888;font-size:13px">Daily Outreach Digest</span>
+  </div>
+  <div style="background:#fff;border:1px solid #eee;border-top:none;padding:24px;border-radius:0 0 10px 10px">
+    <h2 style="margin:0 0 16px 0;font-size:18px">📣 Daily Scan Complete</h2>
+    <div style="display:flex;gap:24px;margin-bottom:20px">
+      <div style="text-align:center;background:#f5f5f5;border-radius:8px;padding:14px 20px">
+        <div style="font-size:28px;font-weight:700;color:#E74C3C">{found_count}</div>
+        <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px">New Today</div>
+      </div>
+      <div style="text-align:center;background:#f5f5f5;border-radius:8px;padding:14px 20px">
+        <div style="font-size:28px;font-weight:700;color:#E67E22">{pending_count}</div>
+        <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px">Pending Review</div>
+      </div>
+    </div>
+    {"<h3 style='font-size:14px;margin:0 0 10px 0'>Top " + str(len(top)) + " by CVSS</h3><table style='width:100%;border-collapse:collapse;font-size:13px'><thead><tr style='background:#f5f5f5'><th style='padding:6px 10px;text-align:left'>Domain</th><th style='padding:6px 10px'>Country</th><th style='padding:6px 10px'>CVSS</th><th style='padding:6px 10px'>Contact</th><th style='padding:6px 10px'>Status</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if top else ""}
+    <div style="margin-top:24px;text-align:center">
+      <a href="{site}?admin=1#marketing" style="display:inline-block;background:#CBFF00;color:#0E0D12;font-weight:700;font-family:monospace;padding:12px 28px;border-radius:6px;text-decoration:none;font-size:14px">▸ Open Marketing Dashboard</a>
+    </div>
+    <p style="font-size:11px;color:#aaa;margin-top:20px;text-align:center">
+      SwarmHawk automated digest · Sent after daily 08:00 scan · <a href="{site}" style="color:#aaa">swarmhawk.com</a>
+    </p>
+  </div>
+</body></html>"""
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        r = req.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    f"{FROM_NAME} <{FROM_EMAIL}>",
+                "to":      [admin_email],
+                "subject": f"[SwarmHawk] Daily Digest — {found_count} new prospects · {now}",
+                "html":    html,
+            },
+            timeout=15,
+        )
+        if r.status_code in (200, 201):
+            print(f"[outreach] digest sent → {admin_email}")
+        else:
+            print(f"[outreach] digest Resend error {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[outreach] digest error: {e}")
+
+
 # ── API endpoints ─────────────────────────────────────────────────────────────
 
 class EmailUpdate(BaseModel):
@@ -842,6 +959,78 @@ async def sync_contacts(background_tasks: BackgroundTasks, authorization: str = 
     require_admin(authorization)
     background_tasks.add_task(_sync_domain_contacts_to_prospects)
     return {"status": "sync started — domain contacts propagating to Marketing prospects"}
+
+
+@router.post("/digest")
+async def trigger_digest(background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Manually send admin daily digest email."""
+    require_admin(authorization)
+    db = get_db()
+    try:
+        pending_count = (
+            db.table("outreach_prospects")
+            .select("id", count="exact")
+            .eq("status", "pending")
+            .execute()
+            .count or 0
+        )
+    except Exception:
+        pending_count = 0
+    background_tasks.add_task(send_admin_digest, pending_count)
+    return {"status": "digest sending"}
+
+
+def _draft_pending_job():
+    """AI-draft emails for all pending prospects that have only a fallback email."""
+    if not ANTHROPIC_KEY:
+        print("[outreach] draft-pending: ANTHROPIC_KEY not set")
+        return
+    db = get_db()
+    rows = (
+        db.table("outreach_prospects")
+        .select("*")
+        .eq("status", "pending")
+        .execute()
+    )
+    drafted = 0
+    skipped = 0
+    for row in (rows.data or []):
+        # Skip already AI-drafted (edited flag or email has more than 4 lines)
+        email_body = row.get("email_body") or ""
+        if row.get("edited"):
+            skipped += 1
+            continue
+        # Build a minimal prospect dict for generate_email_body
+        try:
+            software = json.loads(row["software"]) if isinstance(row.get("software"), str) else (row.get("software") or [])
+            cves     = json.loads(row["cves"])     if isinstance(row.get("cves"), str)     else (row.get("cves") or [])
+        except Exception:
+            skipped += 1
+            continue
+        if not cves or not software:
+            skipped += 1
+            continue
+        prospect = {
+            "domain":    row["domain"],
+            "country":   row.get("country", ""),
+            "software":  software,
+            "cves":      cves,
+            "max_cvss":  row.get("max_cvss", 0),
+        }
+        new_body = generate_email_body(prospect)
+        db.table("outreach_prospects").update({"email_body": new_body}).eq("id", row["id"]).execute()
+        drafted += 1
+        print(f"[outreach] AI-drafted → {row['domain']}")
+
+    print(f"[outreach] draft-pending: {drafted} drafted, {skipped} skipped")
+
+
+@router.post("/draft-pending")
+async def draft_pending(background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """AI-generate emails for all pending prospects that don't have a custom email yet."""
+    require_admin(authorization)
+    background_tasks.add_task(_draft_pending_job)
+    return {"status": "drafting started — AI emails generating in background"}
 
 
 @router.get("/scan-progress")
