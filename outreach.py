@@ -44,6 +44,11 @@ SCAN_LIMIT          = int(os.getenv("OUTREACH_SCAN_LIMIT", "100"))  # domains pe
 # Comma-separated country codes to scan, e.g. "CZ,SK,PL". Empty = all countries.
 _OUTREACH_COUNTRIES_ENV = os.getenv("OUTREACH_COUNTRIES", "")
 ACTIVE_COUNTRIES    = [c.strip().upper() for c in _OUTREACH_COUNTRIES_ENV.split(",") if c.strip()] if _OUTREACH_COUNTRIES_ENV else None
+# Skip top-N most popular domains per country (they have big security teams, no CVEs).
+# Set e.g. OUTREACH_RANK_OFFSET=500 to scan ranks 501-600 (mid-tier companies).
+# Supports multiple brackets: "500,2000,10000" → scans SCAN_LIMIT from each bracket offset.
+_RANK_OFFSET_ENV    = os.getenv("OUTREACH_RANK_OFFSET", "500")
+RANK_OFFSETS        = [int(x.strip()) for x in _RANK_OFFSET_ENV.split(",") if x.strip()] if _RANK_OFFSET_ENV else [500]
 
 TIMEOUT = 10
 UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
@@ -213,8 +218,9 @@ PROSPECT_DOMAINS = {
 _tranco_cache: dict = {"domains": [], "fetched_at": None}
 
 
-def _get_tranco_domains(tld: str, limit: int) -> list[str]:
-    """Download Tranco top-1M (cached 24 h) and filter by country TLD."""
+def _get_tranco_domains(tld: str, limit: int, offset: int = 0) -> list[str]:
+    """Download Tranco top-1M (cached 24 h) and filter by country TLD.
+    `offset` skips the top-N most popular domains (e.g. offset=500 skips rank 1-500)."""
     global _tranco_cache
     now = datetime.now(timezone.utc)
     age = (now - _tranco_cache["fetched_at"]).total_seconds() if _tranco_cache["fetched_at"] else 99999
@@ -232,7 +238,8 @@ def _get_tranco_domains(tld: str, limit: int) -> list[str]:
         except Exception as e:
             print(f"[tranco] Download failed: {e}")
             return []
-    return [d for d in _tranco_cache["domains"] if d.endswith(tld)][:limit]
+    tld_domains = [d for d in _tranco_cache["domains"] if d.endswith(tld)]
+    return tld_domains[offset:offset + limit]
 
 
 def _get_cloudflare_domains(country_code: str, limit: int) -> list[str]:
@@ -260,14 +267,23 @@ def _get_cloudflare_domains(country_code: str, limit: int) -> list[str]:
 
 def fetch_country_domains(country_code: str, limit: int = 500) -> list[str]:
     """Return up to `limit` top domains for a country.
+    Uses RANK_OFFSETS to skip most-popular domains and scan mid-tier brackets.
     Priority: Tranco TLD filter → hardcoded fallback."""
-    # 1. Tranco list filtered by country TLD
+    # 1. Tranco list filtered by country TLD, using rank offsets
     tld = COUNTRY_TLDS.get(country_code, "")
     if tld:
-        domains = _get_tranco_domains(tld, limit)
-        if domains:
-            print(f"[tranco] {country_code}{tld}: {len(domains)} domains")
-            return domains
+        seen: set[str] = set()
+        combined: list[str] = []
+        per_bracket = max(1, limit // len(RANK_OFFSETS))
+        for offset in RANK_OFFSETS:
+            bracket = _get_tranco_domains(tld, per_bracket, offset)
+            for d in bracket:
+                if d not in seen:
+                    seen.add(d)
+                    combined.append(d)
+        if combined:
+            print(f"[tranco] {country_code}{tld}: {len(combined)} domains (offsets={RANK_OFFSETS})")
+            return combined[:limit]
 
     # 2. Hardcoded fallback
     fallback = PROSPECT_DOMAINS.get(country_code, [])
