@@ -1,14 +1,21 @@
 -- SwarmHawk Migration 003 — Domain Outreach Contacts
 -- Paste into Supabase → SQL Editor → Run
+-- Safe to run multiple times (IF NOT EXISTS everywhere)
 
--- Add outreach contact columns to domains table
+-- ── domains table ──────────────────────────────────────────────────────────
 ALTER TABLE domains ADD COLUMN IF NOT EXISTS primary_contact TEXT;
-ALTER TABLE domains ADD COLUMN IF NOT EXISTS contact_emails  TEXT;  -- JSON array of all discovered emails
+ALTER TABLE domains ADD COLUMN IF NOT EXISTS contact_emails  TEXT;  -- JSON array of all contact emails
 
--- Index for quick lookup of domains with a contact set
-CREATE INDEX IF NOT EXISTS idx_domains_primary_contact ON domains(primary_contact)
-  WHERE primary_contact IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_domains_primary_contact
+  ON domains(primary_contact) WHERE primary_contact IS NOT NULL;
 
+-- Disable RLS so backend service role can read/write freely
 ALTER TABLE domains DISABLE ROW LEVEL SECURITY;
 
-SELECT 'Migration 003 complete — domain outreach contacts added' AS status;
+-- ── outreach_prospects table ───────────────────────────────────────────────
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS contact_email  TEXT;
+ALTER TABLE outreach_prospects ADD COLUMN IF NOT EXISTS contact_emails TEXT;  -- JSON array
+
+ALTER TABLE outreach_prospects DISABLE ROW LEVEL SECURITY;
+
+SELECT 'Migration 003 complete — domain outreach contacts ready' AS status;

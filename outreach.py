@@ -722,12 +722,74 @@ def _run_scan_job():
         "found":       found,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     })
+
+    # ── Phase 3: sync user-set contacts → outreach_prospects ─────────────────
+    # Any domain in the `domains` table that has a primary_contact set should
+    # have that contact reflected in the outreach_prospects row for the same domain.
+    # This runs after every daily batch so manually-added contacts propagate
+    # to Marketing without waiting for the next domain re-scan.
+    _sync_domain_contacts_to_prospects(db)
+
     # Bust the threat map cache so next /map/data request rebuilds from fresh data
     try:
         import main as _main
         _main._map_cache["data"] = None
     except Exception:
         pass
+
+
+def _sync_domain_contacts_to_prospects(db=None):
+    """Sync primary_contact and contact_emails from domains table → outreach_prospects.
+    Called after every daily scan batch. Safe to call at any time."""
+    db = db or get_db()
+    synced = 0
+    try:
+        # Fetch all domains that have a primary_contact set
+        rows = db.table("domains")\
+                 .select("domain,primary_contact,contact_emails")\
+                 .not_.is_("primary_contact", "null")\
+                 .neq("primary_contact", "")\
+                 .execute()
+        if not rows.data:
+            print("[outreach] contact sync: no domains with primary_contact set")
+            return
+
+        for d in rows.data:
+            domain          = d.get("domain", "")
+            primary_contact = d.get("primary_contact", "").strip()
+            raw_emails      = d.get("contact_emails") or "[]"
+            if not domain or not primary_contact:
+                continue
+
+            # Parse the full email list
+            try:
+                emails_list = json.loads(raw_emails) if isinstance(raw_emails, str) else (raw_emails or [])
+            except Exception:
+                emails_list = []
+            # Ensure primary is in list
+            if primary_contact not in emails_list:
+                emails_list.insert(0, primary_contact)
+
+            # Only update outreach_prospects where this domain exists
+            prospect = db.table("outreach_prospects")\
+                         .select("id,contact_email")\
+                         .eq("domain", domain)\
+                         .execute()
+            if not prospect.data:
+                continue
+
+            current = prospect.data[0].get("contact_email", "")
+            # Only overwrite if user-set contact differs (don't stomp manually edited outreach contacts)
+            if current != primary_contact:
+                db.table("outreach_prospects").update({
+                    "contact_email":  primary_contact,
+                    "contact_emails": json.dumps(emails_list),
+                }).eq("domain", domain).execute()
+                synced += 1
+
+        print(f"[outreach] contact sync: updated {synced}/{len(rows.data)} prospect contact(s)")
+    except Exception as e:
+        print(f"[outreach] contact sync error: {e}")
 
 
 # ── API endpoints ─────────────────────────────────────────────────────────────
@@ -770,6 +832,16 @@ async def run_scan(background_tasks: BackgroundTasks, authorization: str = Heade
         "scan_limit_per_country": SCAN_LIMIT,
         "source": "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
     }
+
+
+@router.post("/sync-contacts")
+async def sync_contacts(background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Manually trigger contact sync: domain primary_contact → outreach_prospects.
+    Runs automatically after every daily scan. Use this to sync immediately after
+    adding contacts in the Domains tab without waiting for next batch."""
+    require_admin(authorization)
+    background_tasks.add_task(_sync_domain_contacts_to_prospects)
+    return {"status": "sync started — domain contacts propagating to Marketing prospects"}
 
 
 @router.get("/scan-progress")

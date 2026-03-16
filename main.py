@@ -46,7 +46,8 @@ ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-a
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
 PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL          = os.getenv("OUTREACH_FROM", "onboarding@resend.dev")
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "outreach@swarmhawk.com")   # verified Resend domain
+REPORT_FROM_EMAIL   = os.getenv("REPORT_FROM_EMAIL", "reports@swarmhawk.com") # user-facing reports
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
 SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-scanner")
 
@@ -339,6 +340,9 @@ class CheckoutRequest(BaseModel):
 class DomainContactRequest(BaseModel):
     primary_contact: str
 
+class DomainContactAddRequest(BaseModel):
+    email: str
+
 # ── Auth helpers ──────────────────────────────────────────────────────────────
 
 def get_user_from_header(authorization: str) -> dict:
@@ -573,7 +577,7 @@ def send_monthly_pdf_email(to_email: str, domain: str, risk_score: int,
         _httpx.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={"from": f"SwarmHawk Reports <{FROM_EMAIL}>", "to": [to_email],
+            json={"from": f"SwarmHawk Reports <{REPORT_FROM_EMAIL}>", "to": [to_email],
                   "subject": f"Monthly Security Report: {domain} — {scanned_at[:10]}",
                   "html": html,
                   "attachments": [{"filename": filename, "content": pdf_b64}]},
@@ -1375,6 +1379,110 @@ def reset_report_email_template(authorization: str = Header(None)):
     return {"reset": True, "template": _REPORT_EMAIL_DEFAULTS}
 
 
+class ReportEmailTestRequest(BaseModel):
+    to:      str
+    subject: str = ""
+    body:    str = ""
+    footer:  str = ""
+
+
+@app.post("/admin/report-email-template/test")
+def send_test_report_email(body: ReportEmailTestRequest, authorization: str = Header(None)):
+    """Send a preview of the report email template to the admin's own inbox."""
+    import re as _re
+    import base64
+    require_admin(authorization)
+    if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', body.to):
+        raise HTTPException(400, "Invalid recipient email")
+    if not RESEND_API_KEY:
+        raise HTTPException(503, "Email service not configured (RESEND_API_KEY missing)")
+
+    # Build a preview using placeholder values
+    tpl_vars = dict(
+        domain="example.com", risk_score=72, score_label="HIGH RISK",
+        criticals=3, warnings=5, checks_count=22, scanned_at="2026-03-15",
+    )
+    subject_tpl = body.subject or _REPORT_EMAIL_DEFAULTS["subject"]
+    body_tpl    = body.body    or _REPORT_EMAIL_DEFAULTS["body"]
+    footer_tpl  = body.footer  or _REPORT_EMAIL_DEFAULTS["footer"]
+    try:
+        subject_str = subject_tpl.format(**tpl_vars)
+    except (KeyError, ValueError):
+        subject_str = subject_tpl
+    try:
+        body_str = body_tpl.format(**tpl_vars)
+    except (KeyError, ValueError):
+        body_str = body_tpl
+    try:
+        footer_str = footer_tpl.format(**tpl_vars)
+    except (KeyError, ValueError):
+        footer_str = footer_tpl
+
+    score_color = "#c0392b"
+    email_html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;border-radius:8px;overflow:hidden">
+      <div style="background:#0e0d12;padding:28px 36px;border-bottom:1px solid #1a1a1a">
+        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">&#9679;SWARMHAWK</span>
+        <span style="font-family:monospace;font-size:11px;color:#444;margin-left:12px">Preview — Template Test</span>
+      </div>
+      <div style="padding:32px 36px">
+        <div style="background:#1a0a0a;border:1px solid #3a1a1a;border-radius:6px;padding:10px 14px;margin-bottom:20px;font-family:monospace;font-size:11px;color:#c0392b">
+          ⚠ This is a <strong>template preview</strong> with placeholder data — not a real scan result.
+        </div>
+        <h2 style="color:#fff;margin:0 0 4px 0;font-size:20px">Security Report: example.com</h2>
+        <p style="color:#666;font-size:12px;margin:0 0 24px 0;font-family:monospace">Scanned 2026-03-15</p>
+        <div style="background:#111;border:1px solid #1e1e1e;border-radius:8px;padding:20px 24px;margin-bottom:24px;display:flex;align-items:center;gap:28px">
+          <div style="text-align:center;min-width:60px">
+            <div style="font-size:36px;font-weight:800;color:{score_color};line-height:1">72</div>
+            <div style="font-size:10px;color:#888;font-family:monospace;margin-top:4px">HIGH RISK</div>
+          </div>
+          <div style="border-left:1px solid #2a2a2a;padding-left:24px;flex:1">
+            <div style="color:#c0392b;font-weight:700;font-size:14px">3 Critical</div>
+            <div style="color:#d4850a;font-weight:700;font-size:14px">5 Warnings</div>
+            <div style="color:#555;font-size:12px;margin-top:6px">22 checks run</div>
+          </div>
+        </div>
+        <div style="background:#111;border:1px solid #1e3a1e;border-radius:6px;padding:14px 18px;margin-bottom:20px;display:flex;align-items:center;gap:12px">
+          <span style="font-size:22px">&#128196;</span>
+          <div>
+            <div style="color:#cbff00;font-family:monospace;font-size:11px;font-weight:700;letter-spacing:1px">PDF REPORT ATTACHED</div>
+            <div style="color:#888;font-size:12px;margin-top:2px">swarmhawk-report-example.com-2026-03-15.pdf — full findings &amp; remediation</div>
+          </div>
+        </div>
+        <p style="color:#aaa;font-size:13px;line-height:1.7;margin-bottom:28px">{body_str}</p>
+        <div style="margin-bottom:28px">
+          <a href="https://www.swarmhawk.com" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:13px 26px;border-radius:6px;text-decoration:none;margin-right:12px;margin-bottom:10px">Get Free Account &#8594;</a>
+        </div>
+      </div>
+      <div style="background:#0e0d12;border-top:1px solid #1a1a1a;padding:18px 36px">
+        <p style="color:#444;font-size:11px;margin:0;line-height:1.7">{footer_str}</p>
+      </div>
+    </div>
+    """
+
+    try:
+        import httpx as _httpx
+        resp = _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    f"SwarmHawk Reports <{REPORT_FROM_EMAIL}>",
+                "to":      [body.to],
+                "subject": f"[TEST PREVIEW] {subject_str}",
+                "html":    email_html,
+            },
+            timeout=20,
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(502, f"Send failed: {resp.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Send failed: {e}")
+
+    return {"sent": True, "to": body.to, "subject": f"[TEST PREVIEW] {subject_str}"}
+
+
 @app.get("/me")
 def get_me(authorization: str = Header(None)):
     """Return current user info including is_admin flag."""
@@ -1702,17 +1810,119 @@ async def discover_domain_contacts(domain_id: str, authorization: str = Header(N
 
 @app.patch("/domains/{domain_id}/contact")
 def set_domain_contact(domain_id: str, body: DomainContactRequest, authorization: str = Header(None)):
-    """Set the primary outreach contact email for a domain (user-editable)."""
+    """Set the primary outreach contact email for a domain (user-editable).
+    Also ensures the email is in the contact_emails list and syncs to outreach_prospects."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    row  = db.table("domains").select("id,user_id").eq("id", domain_id).execute()
+    row  = db.table("domains").select("id,domain,user_id,contact_emails").eq("id", domain_id).execute()
     if not row.data or row.data[0]["user_id"] != user["sub"]:
         raise HTTPException(404, "Domain not found")
+    d = row.data[0]
     email = (body.primary_contact or "").strip()
     if not email or "@" not in email:
         raise HTTPException(400, "Invalid email address")
-    db.table("domains").update({"primary_contact": email}).eq("id", domain_id).execute()
-    return {"status": "saved", "primary_contact": email}
+
+    # Merge email into contact_emails list (no duplicates)
+    raw = d.get("contact_emails") or "[]"
+    try:
+        emails_list = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        emails_list = []
+    if email not in emails_list:
+        emails_list.insert(0, email)
+
+    res = db.table("domains").update({
+        "primary_contact": email,
+        "contact_emails":  json.dumps(emails_list),
+    }).eq("id", domain_id).execute()
+
+    if hasattr(res, "error") and res.error:
+        raise HTTPException(500, f"Database error: {res.error}")
+
+    domain_name = d.get("domain", "")
+    # Sync to outreach_prospects if this domain exists there
+    try:
+        db.table("outreach_prospects").update({"contact_email": email})\
+          .eq("domain", domain_name).execute()
+    except Exception:
+        pass  # outreach_prospects row may not exist — that's fine
+
+    return {"status": "saved", "primary_contact": email, "contacts": emails_list}
+
+
+@app.post("/domains/{domain_id}/contacts/add")
+def add_domain_contact(domain_id: str, body: DomainContactAddRequest, authorization: str = Header(None)):
+    """Add an email to the domain's contact list (does not change primary)."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("id,domain,user_id,primary_contact,contact_emails")\
+             .eq("id", domain_id).execute()
+    if not row.data or row.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(404, "Domain not found")
+    d = row.data[0]
+    email = (body.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Invalid email address")
+
+    raw = d.get("contact_emails") or "[]"
+    try:
+        emails_list = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        emails_list = []
+    if email in emails_list:
+        return {"status": "exists", "contacts": emails_list, "primary_contact": d.get("primary_contact")}
+
+    emails_list.append(email)
+    db.table("domains").update({"contact_emails": json.dumps(emails_list)}).eq("id", domain_id).execute()
+
+    # If no primary contact set yet, set this one
+    primary = d.get("primary_contact")
+    if not primary:
+        db.table("domains").update({"primary_contact": email}).eq("id", domain_id).execute()
+        primary = email
+        try:
+            db.table("outreach_prospects").update({"contact_email": email})\
+              .eq("domain", d.get("domain", "")).execute()
+        except Exception:
+            pass
+
+    return {"status": "added", "contacts": emails_list, "primary_contact": primary}
+
+
+@app.delete("/domains/{domain_id}/contacts/{email:path}")
+def remove_domain_contact(domain_id: str, email: str, authorization: str = Header(None)):
+    """Remove an email from the domain's contact list."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("id,domain,user_id,primary_contact,contact_emails")\
+             .eq("id", domain_id).execute()
+    if not row.data or row.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(404, "Domain not found")
+    d = row.data[0]
+    email = email.strip()
+
+    raw = d.get("contact_emails") or "[]"
+    try:
+        emails_list = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception:
+        emails_list = []
+    emails_list = [e for e in emails_list if e != email]
+
+    update = {"contact_emails": json.dumps(emails_list)}
+    # If we removed the primary, promote the next one (or clear)
+    primary = d.get("primary_contact")
+    if primary == email:
+        primary = emails_list[0] if emails_list else None
+        update["primary_contact"] = primary
+        if primary:
+            try:
+                db.table("outreach_prospects").update({"contact_email": primary})\
+                  .eq("domain", d.get("domain", "")).execute()
+            except Exception:
+                pass
+
+    db.table("domains").update(update).eq("id", domain_id).execute()
+    return {"status": "removed", "contacts": emails_list, "primary_contact": primary}
 
 
 @app.get("/domains/{domain_id}/report")
@@ -2102,7 +2312,7 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
             json={
-                "from":    f"SwarmHawk Reports <{FROM_EMAIL}>",
+                "from":    f"SwarmHawk Reports <{REPORT_FROM_EMAIL}>",
                 "to":      [body.email],
                 "subject": subject,
                 "html":    email_html,
@@ -3493,43 +3703,100 @@ _MAP_CACHE_TTL = 3600  # 1 hour
 
 
 def _build_map_data() -> dict:
-    """Aggregate outreach_prospects by country for the threat map."""
-    from outreach import get_db as outreach_get_db
+    """Aggregate threat data per country for the threat map.
+
+    Data sources (merged in order of priority):
+    1. outreach_prospects — real scan results with CVSS scores
+    2. PROSPECT_DOMAINS   — hardcoded known domains per country (domain count only)
+    3. COUNTRY_TLDS       — all monitored countries shown as 'in pipeline' even if empty
+    """
+    from outreach import get_db as outreach_get_db, PROSPECT_DOMAINS, COUNTRY_TLDS
     db = outreach_get_db()
-    rows = db.table("outreach_prospects")\
-        .select("domain,country,max_cvss,scanned_at")\
-        .execute()
 
-    # Group by country
-    country_rows: dict = {}
-    for r in (rows.data or []):
-        cc = (r.get("country") or "").upper().strip()
-        if not cc or cc in ("EU", "??", ""):
-            cc = tld_to_country(r.get("domain", "unknown.com"))
-        if not cc:
-            continue
-        if cc not in country_rows:
-            country_rows[cc] = []
-        country_rows[cc].append(r)
+    # ── Base layer: all known countries from PROSPECT_DOMAINS + COUNTRY_TLDS ──
+    country_data: dict = {}
 
-    result = []
-    for cc, items in country_rows.items():
-        scanned = [i for i in items if i.get("scanned_at")]
-        cvss_scores = [float(i["max_cvss"]) for i in scanned if i.get("max_cvss") is not None]
-        # CVSS 0–10 → risk 0–100
-        risk_scores = [round(s * 10, 1) for s in cvss_scores]
-        result.append({
+    # Seed every country we monitor so the map is never blank
+    for cc in COUNTRY_TLDS:
+        country_data[cc] = {
             "country":           cc,
-            "domains":           len(items),
-            "scanned":           len(scanned),
-            "avg_risk":          round(sum(risk_scores) / len(risk_scores), 1) if risk_scores else 0,
-            "high_risk_domains": sum(1 for s in cvss_scores if s >= 7.0),
-            "critical_findings": sum(1 for s in cvss_scores if s >= 9.0),
-        })
+            "domains":           0,
+            "scanned":           0,
+            "avg_risk":          0,
+            "high_risk_domains": 0,
+            "critical_findings": 0,
+            "_cvss_sum":         0.0,
+            "_cvss_count":       0,
+        }
+
+    # Add domain counts from PROSPECT_DOMAINS hardcoded list
+    for cc, domains in PROSPECT_DOMAINS.items():
+        cc = cc.upper()
+        if cc not in country_data:
+            country_data[cc] = {
+                "country": cc, "domains": 0, "scanned": 0,
+                "avg_risk": 0, "high_risk_domains": 0, "critical_findings": 0,
+                "_cvss_sum": 0.0, "_cvss_count": 0,
+            }
+        country_data[cc]["domains"] = max(country_data[cc]["domains"], len(domains))
+
+    # ── Overlay: real scan results from outreach_prospects ─────────────────────
+    try:
+        rows = db.table("outreach_prospects")\
+            .select("domain,country,max_cvss,scanned_at")\
+            .execute()
+
+        scan_counts: dict = {}  # cc -> {domains, scanned, cvss_list}
+        for r in (rows.data or []):
+            cc = (r.get("country") or "").upper().strip()
+            if not cc or cc in ("EU", "??", ""):
+                cc = tld_to_country(r.get("domain", "unknown.com"))
+            if not cc:
+                continue
+            if cc not in scan_counts:
+                scan_counts[cc] = {"domains": 0, "scanned": 0, "cvss": []}
+            scan_counts[cc]["domains"] += 1
+            if r.get("scanned_at"):
+                scan_counts[cc]["scanned"] += 1
+            if r.get("max_cvss") is not None:
+                try:
+                    scan_counts[cc]["cvss"].append(float(r["max_cvss"]))
+                except (ValueError, TypeError):
+                    pass
+
+        for cc, sc in scan_counts.items():
+            if cc not in country_data:
+                country_data[cc] = {
+                    "country": cc, "domains": 0, "scanned": 0,
+                    "avg_risk": 0, "high_risk_domains": 0, "critical_findings": 0,
+                    "_cvss_sum": 0.0, "_cvss_count": 0,
+                }
+            # Real scan data overrides domain count
+            country_data[cc]["domains"]  = max(country_data[cc]["domains"], sc["domains"])
+            country_data[cc]["scanned"]  = sc["scanned"]
+            if sc["cvss"]:
+                avg_cvss = sum(sc["cvss"]) / len(sc["cvss"])
+                country_data[cc]["avg_risk"]          = round(avg_cvss * 10, 1)
+                country_data[cc]["high_risk_domains"] = sum(1 for s in sc["cvss"] if s >= 7.0)
+                country_data[cc]["critical_findings"] = sum(1 for s in sc["cvss"] if s >= 9.0)
+
+    except Exception as e:
+        print(f"[map] outreach_prospects query failed: {e}")
+
+    # Strip internal keys, drop countries with 0 domains
+    result = []
+    for cc, row in country_data.items():
+        row.pop("_cvss_sum", None)
+        row.pop("_cvss_count", None)
+        if row["domains"] > 0 or cc in PROSPECT_DOMAINS or cc in COUNTRY_TLDS:
+            # Ensure in-pipeline countries with 0 scanned show at least domain=1
+            if row["domains"] == 0:
+                row["domains"] = len(PROSPECT_DOMAINS.get(cc, [])) or 1
+            result.append(row)
 
     now = datetime.now(timezone.utc).isoformat()
     return {
-        "countries":     sorted(result, key=lambda x: x["avg_risk"], reverse=True),
+        "countries":     sorted(result, key=lambda x: (x["avg_risk"], x["scanned"]), reverse=True),
         "total_domains": sum(r["domains"] for r in result),
         "total_scanned": sum(r["scanned"] for r in result),
         "generated_at":  now,
