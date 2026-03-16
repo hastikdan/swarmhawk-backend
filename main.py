@@ -49,7 +49,7 @@ RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "outreach@swarmhawk.com")   # verified Resend domain
 REPORT_FROM_EMAIL   = os.getenv("REPORT_FROM_EMAIL", "reports@swarmhawk.com") # user-facing reports
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
-SITE_URL            = os.getenv("SITE_URL", "https://hastikdan.github.io/cee-scanner")
+SITE_URL            = os.getenv("SITE_URL", "https://www.swarmhawk.com")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -2282,7 +2282,7 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
         <!-- CTAs -->
         <div style="margin-bottom:28px">
           <a href="https://www.swarmhawk.com" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:13px 26px;border-radius:6px;text-decoration:none;margin-right:12px;margin-bottom:10px">Get Free Account &#8594;</a>
-          <a href="https://www.swarmhawk.com/#pricing" style="display:inline-block;background:transparent;color:#cbff00;font-family:monospace;font-weight:700;font-size:13px;padding:12px 26px;border-radius:6px;text-decoration:none;border:1px solid #cbff00;margin-bottom:10px">Full Paid Report &#8594;</a>
+          <a href="https://www.swarmhawk.com" style="display:inline-block;background:transparent;color:#cbff00;font-family:monospace;font-weight:700;font-size:13px;padding:12px 26px;border-radius:6px;text-decoration:none;border:1px solid #cbff00;margin-bottom:10px">Full Paid Report &#8594;</a>
         </div>
 
         <!-- Feature bullets -->
