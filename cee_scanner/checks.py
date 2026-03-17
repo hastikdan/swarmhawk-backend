@@ -932,17 +932,23 @@ ALL_CHECKS = [
 
 
 def scan_domain(domain: str) -> dict:
-    """Run all passive checks against a single domain."""
-    results = []
-    for check_fn in ALL_CHECKS:
+    """Run all passive checks against a single domain in parallel."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _run(check_fn):
         try:
-            r = check_fn(domain)
-            results.append(r.to_dict())
+            return check_fn(domain).to_dict()
         except Exception as e:
             logger.error(f"Check {check_fn.__name__} failed for {domain}: {e}")
-            results.append(CheckResult(check_fn.__name__, domain).error(
+            return CheckResult(check_fn.__name__, domain).error(
                 "Check crashed", str(e)[:80]
-            ).to_dict())
+            ).to_dict()
+
+    results = []
+    with ThreadPoolExecutor(max_workers=len(ALL_CHECKS)) as executor:
+        futures = {executor.submit(_run, fn): fn for fn in ALL_CHECKS}
+        for future in as_completed(futures):
+            results.append(future.result())
 
     # Calculate risk score (0=best, 100=worst)
     penalty = sum(r["score_impact"] for r in results)
