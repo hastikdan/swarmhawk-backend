@@ -2442,6 +2442,28 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
     return {"sent": True, "to": body.email, "domain": d["domain"]}
 
 
+def _resolve_stripe_customer(db, user_id: str) -> str | None:
+    """Return a Stripe customer ID for the user, trying purchases first, then email lookup."""
+    purchases = db.table("purchases").select("stripe_session_id")\
+        .eq("user_id", user_id).not_.is_("stripe_session_id", "null").limit(5).execute()
+    if purchases.data:
+        for p in purchases.data:
+            try:
+                session = stripe.checkout.Session.retrieve(p["stripe_session_id"])
+                if session.customer:
+                    return session.customer
+            except Exception:
+                continue
+    # Fallback: look up by email
+    u_row = db.table("users").select("email").eq("id", user_id).execute()
+    email = u_row.data[0]["email"] if u_row.data else None
+    if email:
+        customers = stripe.Customer.list(email=email, limit=1)
+        if customers.data:
+            return customers.data[0].id
+    return None
+
+
 @app.get("/billing-portal")
 def billing_portal(authorization: str = Header(None)):
     """Return a Stripe Customer Portal URL so users can manage subscriptions and payment methods."""
@@ -2451,20 +2473,39 @@ def billing_portal(authorization: str = Header(None)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Stripe not configured")
 
-    # Find a Stripe session belonging to this user
     purchases = db.table("purchases").select("stripe_session_id")\
         .eq("user_id", user["sub"]).not_.is_("stripe_session_id", "null").limit(1).execute()
-
     if not purchases.data:
         raise HTTPException(400, "No billing history found — purchase a plan first")
 
     try:
-        session    = stripe.checkout.Session.retrieve(purchases.data[0]["stripe_session_id"])
-        customer   = session.customer
+        customer = _resolve_stripe_customer(db, user["sub"])
         if not customer:
             raise HTTPException(400, "No Stripe customer record found")
         portal = stripe.billing_portal.Session.create(
             customer=customer, return_url=FRONTEND_URL
+        )
+        return {"url": portal.url}
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/billing-portal/api")
+def billing_portal_api(authorization: str = Header(None)):
+    """Return a Stripe Customer Portal URL for managing an API plan subscription."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured")
+
+    try:
+        customer = _resolve_stripe_customer(db, user["sub"])
+        if not customer:
+            raise HTTPException(400, "No Stripe customer record found — complete a purchase first")
+        portal = stripe.billing_portal.Session.create(
+            customer=customer,
+            return_url=f"{FRONTEND_URL}?tab=account",
         )
         return {"url": portal.url}
     except stripe.error.StripeError as e:
@@ -3853,10 +3894,16 @@ def checkout_api_plan(body: ApiPlanCheckoutRequest, authorization: str = Header(
 
 @app.get("/api/v1/plan")
 def get_api_plan(authorization: str = Header(None)):
-    """Return the current API pricing plan for the authenticated user."""
+    """Return the current API pricing plan and usage for the authenticated user."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    return _get_user_api_plan(db, user["sub"])
+    plan_info = _get_user_api_plan(db, user["sub"])
+    # Enrich with actual usage from the user's API keys
+    keys = db.table("api_keys").select("calls_this_month,limit_per_month")\
+        .eq("user_id", user["sub"]).execute()
+    calls = sum((k.get("calls_this_month") or 0) for k in (keys.data or []))
+    plan_info["calls_this_month"] = calls
+    return plan_info
 
 
 # ══════════════════════════════════════════════════════════════════════════════
