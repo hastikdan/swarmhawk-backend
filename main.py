@@ -1705,17 +1705,45 @@ def list_domains(authorization: str = Header(None)):
     user = get_user_from_header(authorization)
     db = get_db()
 
-    domains = db.table("domains")\
-        .select("*, scans(*), purchases(*)")\
+    # Fetch domains with lightweight scan metadata (no checks blob) and purchase flags.
+    # Omitting checks(*) here is the key optimisation — checks are large JSON and we
+    # only need them for the single latest scan per domain, fetched separately below.
+    domains_res = db.table("domains")\
+        .select("id,domain,country,created_at,primary_contact,contact_emails,scans(id,scanned_at,risk_score),purchases(paid_at)")\
         .eq("user_id", user["sub"])\
         .order("created_at", desc=True)\
         .execute()
 
+    if not domains_res.data:
+        return {"domains": []}
+
+    # Build a map of domain_id → latest scan row (no checks yet)
+    latest_scan_by_domain: dict = {}
+    for d in domains_res.data:
+        scans = d.get("scans") or []
+        if scans:
+            latest_scan_by_domain[d["id"]] = max(scans, key=lambda s: s["scanned_at"])
+
+    # Single targeted query: fetch checks only for the latest scan of each domain
+    latest_checks_map: dict = {}
+    if latest_scan_by_domain:
+        scan_ids = [s["id"] for s in latest_scan_by_domain.values()]
+        checks_res = db.table("scans").select("id,checks").in_("id", scan_ids).execute()
+        for row in (checks_res.data or []):
+            raw = row.get("checks", [])
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except Exception:
+                    raw = []
+            latest_checks_map[row["id"]] = raw if isinstance(raw, list) else []
+
     result = []
-    for d in domains.data:
-        latest_scan = max(d.get("scans", []), key=lambda s: s["scanned_at"], default=None)
-        is_paid = any(p.get("paid_at") for p in d.get("purchases", []))
-        # "scanning" if added within last 10 min and no scan yet
+    for d in domains_res.data:
+        scans      = d.get("scans") or []
+        latest_scan = latest_scan_by_domain.get(d["id"])
+        is_paid    = any(p.get("paid_at") for p in (d.get("purchases") or []))
+
         created_at = d.get("created_at", "")
         is_new = False
         if created_at and not latest_scan:
@@ -1727,18 +1755,8 @@ def list_domains(authorization: str = Header(None)):
                 pass
         status = "scanning" if is_new else ("active" if latest_scan else "pending")
 
-        # Decode checks from latest scan (may be jsonb list or legacy json string)
-        latest_checks = []
-        if latest_scan:
-            raw = latest_scan.get("checks", [])
-            if isinstance(raw, str):
-                try:
-                    raw = json.loads(raw)
-                except Exception:
-                    raw = []
-            latest_checks = raw if isinstance(raw, list) else []
+        latest_checks = latest_checks_map.get(latest_scan["id"], []) if latest_scan else []
 
-        # Decode cached contact_emails if stored as JSON string
         cached_contact_emails = d.get("contact_emails")
         if isinstance(cached_contact_emails, str):
             try:
@@ -1760,7 +1778,7 @@ def list_domains(authorization: str = Header(None)):
             "contact_emails":  cached_contact_emails or [],
             "scan_history": [
                 {"date": s["scanned_at"], "risk": s["risk_score"]}
-                for s in sorted(d.get("scans", []), key=lambda s: s["scanned_at"])
+                for s in sorted(scans, key=lambda s: s["scanned_at"])
             ],
         })
 
