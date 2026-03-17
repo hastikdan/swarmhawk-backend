@@ -3859,7 +3859,8 @@ def checkout_api_plan(body: ApiPlanCheckoutRequest, authorization: str = Header(
     email = u_row.data[0]["email"] if u_row.data else ""
 
     price_id = _API_PLAN_PRICE_IDS.get(body.plan, "")
-    if price_id:
+    # Only use a preconfigured price ID if it looks like a real Stripe ID (min ~20 chars)
+    if price_id and len(price_id) >= 20:
         line_items = [{"price": price_id, "quantity": 1}]
     else:
         line_items = [{
