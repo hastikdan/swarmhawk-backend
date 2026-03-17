@@ -46,10 +46,11 @@ ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-a
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
 PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
-FROM_EMAIL          = os.getenv("OUTREACH_FROM", "outreach@swarmhawk.com")   # verified Resend domain
+FROM_EMAIL          = os.getenv("OUTREACH_FROM", "hello@swarmhawk.com")       # verified Resend domain
 REPORT_FROM_EMAIL   = os.getenv("REPORT_FROM_EMAIL", "reports@swarmhawk.com") # user-facing reports
 GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
 SITE_URL            = os.getenv("SITE_URL", "https://www.swarmhawk.com")
+API_URL             = os.getenv("API_URL", "https://swarmhawk-backend.onrender.com")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -396,90 +397,99 @@ def require_admin(authorization: str) -> str:
 
 # ── Email confirmation helper ─────────────────────────────────────────────────
 
-def send_confirmation_email(to_email: str, name: str, token: str):
-    """Send signup confirmation email via Resend."""
+def send_welcome_and_confirm_email(to_email: str, name: str, token: str):
+    """Send a single combined welcome + email-confirmation email from hello@swarmhawk.com."""
     if not RESEND_API_KEY:
-        print(f"[auth] RESEND_API_KEY not set — skipping confirmation email to {to_email}")
+        print(f"[auth] RESEND_API_KEY not set — skipping welcome email to {to_email}")
         return
-    confirm_url = f"{SITE_URL}?confirm={token}"
-    html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
-      <div style="margin-bottom:28px">
-        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
-      </div>
-      <h2 style="color:#fff;margin-bottom:8px">Confirm your email</h2>
-      <p style="color:#888;line-height:1.6;margin-bottom:24px">
-        Hi {name}, welcome to SwarmHawk. Click below to confirm your email address and activate your account.
-      </p>
-      <a href="{confirm_url}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 28px;border-radius:5px;text-decoration:none">
-        CONFIRM EMAIL →
-      </a>
-      <p style="color:#555;font-size:12px;margin-top:28px;line-height:1.5">
-        This link expires in 24 hours. If you didn't create an account, ignore this email.<br>
-        SwarmHawk · European Cybersecurity Intelligence
-      </p>
+    confirm_url = f"{API_URL}/auth/verify-email?token={token}"
+    html = f"""<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#0e0d12;font-family:Arial,sans-serif">
+<div style="max-width:580px;margin:0 auto;padding:48px 24px">
+
+  <!-- Logo -->
+  <div style="margin-bottom:32px">
+    <span style="font-family:monospace;font-size:20px;font-weight:700;color:#cbff00;letter-spacing:1px">&#9679;SWARMHAWK</span>
+  </div>
+
+  <!-- Headline -->
+  <h1 style="color:#f0eef8;font-size:22px;font-weight:700;margin:0 0 8px">Welcome to SwarmHawk, {name}</h1>
+  <p style="color:#6b6880;font-size:14px;line-height:1.6;margin:0 0 32px">
+    Your account is ready. Before you start, please confirm your email address.
+  </p>
+
+  <!-- Confirm button -->
+  <div style="margin-bottom:40px">
+    <a href="{confirm_url}"
+       style="display:inline-block;background:#cbff00;color:#0e0d12;font-family:monospace;font-weight:700;font-size:13px;letter-spacing:1px;padding:14px 32px;border-radius:6px;text-decoration:none">
+      CONFIRM MY EMAIL →
+    </a>
+    <p style="color:#555;font-size:11px;margin:12px 0 0;font-family:monospace">
+      Link expires in 24 hours. If you didn't sign up, ignore this email.
+    </p>
+  </div>
+
+  <!-- Divider -->
+  <div style="border-top:1px solid rgba(255,255,255,.08);margin-bottom:32px"></div>
+
+  <!-- What SwarmHawk does -->
+  <p style="color:#6b6880;font-size:13px;margin:0 0 20px;line-height:1.6">
+    SwarmHawk monitors your domains for security threats — continuously scanning for SSL issues, data breaches, exposed ports, malware listings, DNS misconfigurations, and more across 22 checks.
+  </p>
+
+  <!-- Steps -->
+  <div style="background:#16151e;border-radius:8px;padding:20px;margin-bottom:32px">
+    <div style="margin-bottom:16px">
+      <span style="color:#cbff00;font-family:monospace;font-size:12px;font-weight:700">1. ADD YOUR DOMAIN</span><br>
+      <span style="color:#6b6880;font-size:13px">Dashboard → Domains → Add Domain. 22 security checks run automatically.</span>
     </div>
-    """
+    <div style="margin-bottom:16px">
+      <span style="color:#cbff00;font-family:monospace;font-size:12px;font-weight:700">2. GET YOUR FREE REPORT</span><br>
+      <span style="color:#6b6880;font-size:13px">SSL, DNS, breach detection, open ports, malware checks — all free.</span>
+    </div>
+    <div style="margin-bottom:16px">
+      <span style="color:#cbff00;font-family:monospace;font-size:12px;font-weight:700">3. UNLOCK FULL INTELLIGENCE</span><br>
+      <span style="color:#6b6880;font-size:13px">AI threat analysis + PDF reports for €50/year per domain.</span>
+    </div>
+    <div>
+      <span style="color:#cbff00;font-family:monospace;font-size:12px;font-weight:700">4. NIS2 COMPLIANCE EVIDENCE</span><br>
+      <span style="color:#6b6880;font-size:13px">Your reports document regular security monitoring as required under EU NIS2 law.</span>
+    </div>
+  </div>
+
+  <!-- CTA -->
+  <a href="{SITE_URL}"
+     style="display:inline-block;background:rgba(203,255,0,.08);color:#cbff00;border:1px solid rgba(203,255,0,.25);font-family:monospace;font-weight:700;font-size:12px;letter-spacing:1px;padding:11px 24px;border-radius:6px;text-decoration:none">
+    OPEN DASHBOARD →
+  </a>
+
+  <!-- Footer -->
+  <p style="color:#3a3840;font-size:11px;margin-top:40px;font-family:monospace;line-height:1.8">
+    SwarmHawk · European Cybersecurity Intelligence<br>
+    hello@swarmhawk.com · swarmhawk.com<br>
+    You received this because you created an account.
+  </p>
+
+</div>
+</body>
+</html>"""
     try:
         import httpx as _httpx
-        _httpx.post(
+        r = _httpx.post(
             "https://api.resend.com/emails",
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
             json={
                 "from":    f"SwarmHawk <{FROM_EMAIL}>",
                 "to":      [to_email],
-                "subject": "Confirm your SwarmHawk account",
+                "subject": f"Confirm your SwarmHawk account, {name}",
                 "html":    html,
             },
             timeout=10,
         )
-        print(f"[auth] Confirmation email sent to {to_email}")
+        print(f"[auth] Welcome+confirm email sent to {to_email} (status {r.status_code})")
     except Exception as e:
-        print(f"[auth] Failed to send confirmation email: {e}")
-
-
-def send_welcome_email(to_email: str, name: str):
-    """Send welcome email after successful registration."""
-    if not RESEND_API_KEY:
-        return
-    dashboard_url = SITE_URL
-    html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
-      <div style="margin-bottom:24px">
-        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
-      </div>
-      <h2 style="color:#fff;margin-bottom:8px">Welcome, {name} 👋</h2>
-      <p style="color:#888;line-height:1.7;margin-bottom:20px">
-        Your SwarmHawk account is active. Here's what happens next:
-      </p>
-      <div style="background:#111;border-radius:8px;padding:20px;margin-bottom:24px">
-        <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">1. Add your domain</span><br>
-          <span style="color:#888;font-size:13px">Go to your dashboard → Domains → Add Domain. We'll run 22 security checks automatically.</span></div>
-        <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">2. Get your free report</span><br>
-          <span style="color:#888;font-size:13px">Your free scan includes SSL, DNS, breach detection, malware checks, and more.</span></div>
-        <div style="margin-bottom:14px"><span style="color:#cbff00;font-weight:700">3. Upgrade for full intelligence</span><br>
-          <span style="color:#888;font-size:13px">Full 22-check report with AI threat analysis for <strong style="color:#fff">$10 one-time</strong>, or monthly scans + PDF reports for <strong style="color:#fff">$50/year</strong>.</span></div>
-        <div><span style="color:#cbff00;font-weight:700">4. NIS2 compliance</span><br>
-          <span style="color:#888;font-size:13px">Your reports serve as documented evidence of regular security monitoring required under NIS2.</span></div>
-      </div>
-      <a href="{dashboard_url}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 28px;border-radius:5px;text-decoration:none">
-        Open Dashboard →
-      </a>
-      <p style="color:#555;font-size:12px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence · swarmhawk.com</p>
-    </div>
-    """
-    try:
-        import httpx as _httpx
-        _httpx.post(
-            "https://api.resend.com/emails",
-            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-            json={"from": f"SwarmHawk <{FROM_EMAIL}>", "to": [to_email],
-                  "subject": f"Welcome to SwarmHawk, {name}! 🔒", "html": html},
-            timeout=10,
-        )
-        print(f"[auth] Welcome email sent to {to_email}")
-    except Exception as e:
-        print(f"[auth] Failed to send welcome email: {e}")
+        print(f"[auth] Failed to send welcome email to {to_email}: {e}")
 
 
 def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
@@ -668,9 +678,8 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
     except Exception:
         pass  # columns may not exist yet — email still works, just unverified
     background_tasks.add_task(
-        send_confirmation_email, body.email.lower(), body.username.strip(), verification_token
+        send_welcome_and_confirm_email, body.email.lower(), body.username.strip(), verification_token
     )
-    background_tasks.add_task(send_welcome_email, body.email.lower(), body.username.strip())
 
     # Add first domain if provided
     first_domain = None
@@ -754,6 +763,32 @@ def verify_email(token: str):
     # Redirect to site with success flag
     from fastapi.responses import RedirectResponse
     return RedirectResponse(url=f"{SITE_URL}?verified=1", status_code=302)
+
+
+class TestWelcomeEmailRequest(BaseModel):
+    to: str
+    name: str = "Test User"
+
+@app.post("/admin/test-welcome-email")
+def test_welcome_email(body: TestWelcomeEmailRequest, authorization: str = Header(None)):
+    """Send a test welcome+confirmation email to verify the template and Resend config."""
+    import re as _re
+    require_admin(authorization)
+    if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', body.to):
+        raise HTTPException(400, "Invalid email address")
+    if not RESEND_API_KEY:
+        raise HTTPException(503, "RESEND_API_KEY not set — configure it in Render environment variables")
+    fake_token = "test_" + secrets.token_urlsafe(16)
+    try:
+        send_welcome_and_confirm_email(body.to, body.name, fake_token)
+        return {
+            "sent_to":    body.to,
+            "from":       FROM_EMAIL,
+            "confirm_url": f"{API_URL}/auth/verify-email?token={fake_token}",
+            "note":       "Confirmation link is a test token and will not verify any account",
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Send failed: {e}")
 
 
 class GoogleAuthRequest(BaseModel):
