@@ -37,10 +37,21 @@ from supabase import create_client, Client
 SUPABASE_URL        = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY        = os.getenv("SUPABASE_KEY", "")        # anon/service key
 SUPABASE_SERVICE_KEY= os.getenv("SUPABASE_SERVICE_KEY", "")  # service_role key (bypasses RLS)
-STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY", "")   # sk_live_... or sk_test_...
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")  # whsec_...
-STRIPE_PRICE_ID     = os.getenv("STRIPE_PRICE_ID", "")     # price_... from Stripe dashboard
-STRIPE_MSP_PRICE_ID = os.getenv("STRIPE_MSP_PRICE_ID", "")  # $200/yr — 10-domain MSP plan
+STRIPE_SECRET_KEY          = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET      = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+STRIPE_PRICE_ID            = os.getenv("STRIPE_PRICE_ID", "")
+STRIPE_MSP_PRICE_ID        = os.getenv("STRIPE_MSP_PRICE_ID", "")
+STRIPE_API_STARTER_PRICE   = os.getenv("STRIPE_API_STARTER_PRICE", "")   # €19/mo — 500 calls
+STRIPE_API_GROWTH_PRICE    = os.getenv("STRIPE_API_GROWTH_PRICE",  "")   # €49/mo — 2000 calls
+STRIPE_API_PRO_PRICE       = os.getenv("STRIPE_API_PRO_PRICE",     "")   # €99/mo — 10000 calls
+
+# Monthly call limits per API tier
+API_PLAN_LIMITS = {
+    "free":        10,
+    "api_starter": 500,
+    "api_growth":  2000,
+    "api_pro":     10000,
+}
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
 PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
@@ -2617,7 +2628,25 @@ async def stripe_webhook(request: Request):
         domain   = meta.get("domain", "")
         plan     = meta.get("plan", "one_time")
 
-        if user_id and domain_id:
+        if plan.startswith("api_") and user_id:
+            # API pricing plan — record purchase (no domain) and apply limit
+            sub_id = session.get("subscription")
+            now = datetime.now(timezone.utc).isoformat()
+            try:
+                db.table("purchases").insert({
+                    "user_id":           user_id,
+                    "stripe_session_id": session["id"],
+                    "stripe_sub_id":     sub_id,
+                    "amount_usd":        (session.get("amount_total") or _API_PLAN_AMOUNTS.get(plan, 0)) / 100,
+                    "plan":              plan,
+                    "domain":            "api_plan",
+                    "paid_at":           now,
+                }).execute()
+            except Exception:
+                pass
+            _apply_api_plan(db, user_id, plan)
+
+        elif user_id and domain_id:
             sub_id = session.get("subscription")   # None for one-time
             _record_purchase(
                 db, user_id, domain_id, domain,
@@ -2627,29 +2656,40 @@ async def stripe_webhook(request: Request):
                 subscription_id=sub_id,
             )
 
-    # ── Subscription renewal — queue a fresh scan each billing period ──────────
+    # ── Subscription renewal ──────────────────────────────────────────────────
     elif event["type"] == "invoice.payment_succeeded":
         invoice = event["data"]["object"]
         sub_id  = invoice.get("subscription")
-        # Only act on renewals (billing_reason = subscription_cycle), not first invoice
         if invoice.get("billing_reason") == "subscription_cycle" and sub_id:
-            # Find the domain linked to this subscription
-            purchases = db.table("purchases").select("domain_id, domain, user_id")\
+            purchases = db.table("purchases").select("domain_id, domain, user_id, plan")\
                 .eq("stripe_sub_id", sub_id).limit(1).execute()
             if purchases.data:
                 p = purchases.data[0]
-                db.table("domains").update({"full_scan_enabled": True}).eq("id", p["domain_id"]).execute()
-                from threading import Thread
-                Thread(target=run_scan_background, args=(p["domain_id"], p.get("domain", "")), daemon=True).start()
-                print(f"[stripe] Subscription renewal scan queued for {p.get('domain')}")
+                if (p.get("plan") or "").startswith("api_"):
+                    # API plan renewal — reset monthly call counter
+                    db.table("api_keys").update({"calls_this_month": 0})\
+                        .eq("user_id", p["user_id"]).execute()
+                    print(f"[stripe] API plan renewed, calls reset for user {p['user_id']}")
+                else:
+                    # Domain subscription renewal — queue rescan
+                    db.table("domains").update({"full_scan_enabled": True}).eq("id", p["domain_id"]).execute()
+                    from threading import Thread
+                    Thread(target=run_scan_background, args=(p["domain_id"], p.get("domain", "")), daemon=True).start()
+                    print(f"[stripe] Subscription renewal scan queued for {p.get('domain')}")
 
     # ── Subscription cancelled ────────────────────────────────────────────────
     elif event["type"] == "customer.subscription.deleted":
-        sub = event["data"]["object"]
+        sub    = event["data"]["object"]
         sub_id = sub.get("id")
         if sub_id:
-            db.table("purchases").update({"cancelled_at": datetime.now(timezone.utc).isoformat()})\
+            now = datetime.now(timezone.utc).isoformat()
+            db.table("purchases").update({"cancelled_at": now})\
                 .eq("stripe_sub_id", sub_id).execute()
+            # If this was an API plan, downgrade the user's key limits
+            purchases = db.table("purchases").select("user_id, plan")\
+                .eq("stripe_sub_id", sub_id).limit(1).execute()
+            if purchases.data and (purchases.data[0].get("plan") or "").startswith("api_"):
+                _apply_api_plan(db, purchases.data[0]["user_id"], "free")
             print(f"[stripe] Subscription cancelled: {sub_id}")
 
     return {"received": True}
@@ -3707,6 +3747,116 @@ async def checkout_msp(body: MSPCheckoutRequest, authorization: str = Header(Non
         return {"url": session.url}
     except stripe.error.StripeError as e:
         raise HTTPException(400, str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVELOPER API PRICING
+# ══════════════════════════════════════════════════════════════════════════════
+
+_API_PLAN_PRICE_IDS = {
+    "api_starter": STRIPE_API_STARTER_PRICE,
+    "api_growth":  STRIPE_API_GROWTH_PRICE,
+    "api_pro":     STRIPE_API_PRO_PRICE,
+}
+
+_API_PLAN_AMOUNTS = {          # cents, EUR
+    "api_starter": 1900,
+    "api_growth":  4900,
+    "api_pro":     9900,
+}
+
+_API_PLAN_NAMES = {
+    "api_starter": "API Starter — 500 calls/month",
+    "api_growth":  "API Growth — 2,000 calls/month",
+    "api_pro":     "API Pro — 10,000 calls/month",
+}
+
+
+def _apply_api_plan(db, user_id: str, plan: str):
+    """Set limit_per_month on all active API keys for this user."""
+    limit = API_PLAN_LIMITS.get(plan, API_PLAN_LIMITS["free"])
+    db.table("api_keys").update({"limit_per_month": limit})\
+        .eq("user_id", user_id).eq("active", True).execute()
+    print(f"[stripe] API plan applied: user={user_id} plan={plan} limit={limit}")
+
+
+def _get_user_api_plan(db, user_id: str) -> dict:
+    """Return the current active API plan for a user, or 'free'."""
+    rows = db.table("purchases")\
+        .select("plan,stripe_sub_id,paid_at")\
+        .eq("user_id", user_id)\
+        .in_("plan", ["api_starter", "api_growth", "api_pro"])\
+        .is_("cancelled_at", "null")\
+        .order("paid_at", desc=True)\
+        .limit(1).execute()
+    if rows.data:
+        p = rows.data[0]
+        return {
+            "plan":    p["plan"],
+            "limit":   API_PLAN_LIMITS.get(p["plan"], 10),
+            "sub_id":  p.get("stripe_sub_id"),
+            "paid_at": p.get("paid_at"),
+        }
+    return {"plan": "free", "limit": API_PLAN_LIMITS["free"], "sub_id": None, "paid_at": None}
+
+
+class ApiPlanCheckoutRequest(BaseModel):
+    plan: str  # "api_starter" | "api_growth" | "api_pro"
+
+
+@app.post("/checkout/api-plan")
+def checkout_api_plan(body: ApiPlanCheckoutRequest, authorization: str = Header(None)):
+    """Create a Stripe Checkout session for an API pricing tier subscription."""
+    if body.plan not in _API_PLAN_NAMES:
+        raise HTTPException(400, "plan must be one of: api_starter, api_growth, api_pro")
+    if not STRIPE_SECRET_KEY:
+        raise HTTPException(503, "Stripe not configured")
+
+    user  = get_user_from_header(authorization)
+    db    = get_db()
+    u_row = db.table("users").select("email").eq("id", user["sub"]).execute()
+    email = u_row.data[0]["email"] if u_row.data else ""
+
+    price_id = _API_PLAN_PRICE_IDS.get(body.plan, "")
+    if price_id:
+        line_items = [{"price": price_id, "quantity": 1}]
+    else:
+        line_items = [{
+            "price_data": {
+                "currency":    "eur",
+                "unit_amount": _API_PLAN_AMOUNTS[body.plan],
+                "recurring":   {"interval": "month"},
+                "product_data": {
+                    "name":        _API_PLAN_NAMES[body.plan],
+                    "description": f"{API_PLAN_LIMITS[body.plan]:,} API calls/month. Cancel anytime.",
+                },
+            },
+            "quantity": 1,
+        }]
+
+    meta = {"user_id": str(user["sub"]), "plan": body.plan}
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            mode="subscription",
+            line_items=line_items,
+            success_url=f"{SITE_URL}?api_upgrade=success",
+            cancel_url=f"{SITE_URL}?api_upgrade=cancelled",
+            metadata=meta,
+            customer_email=email,
+            subscription_data={"metadata": meta},
+        )
+        return {"url": session.url, "plan": body.plan}
+    except stripe.error.StripeError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/api/v1/plan")
+def get_api_plan(authorization: str = Header(None)):
+    """Return the current API pricing plan for the authenticated user."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    return _get_user_api_plan(db, user["sub"])
 
 
 # ══════════════════════════════════════════════════════════════════════════════
