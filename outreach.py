@@ -722,7 +722,7 @@ def _run_scan_job():
 
         db = get_db()  # single shared connection for all upserts
 
-        with ThreadPoolExecutor(max_workers=20) as ex:
+        with ThreadPoolExecutor(max_workers=50) as ex:
             futures = {ex.submit(scan_domain_passive, domain, country): (domain, country)
                        for domain, country in all_domains}
             for future in as_completed(futures):
@@ -868,13 +868,13 @@ def send_admin_digest(found_count: int, db=None):
     admin_email = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")
     db = db or get_db()
 
-    # Fetch today's top prospects
+    # Fetch top prospects by CVSS (all-time, not just today — so digest is never empty)
+    # Also count how many were scanned today specifically
+    today = datetime.now(timezone.utc).date().isoformat()
     try:
-        today = datetime.now(timezone.utc).date().isoformat()
         top_rows = (
             db.table("outreach_prospects")
             .select("domain,country,max_cvss,status,contact_email,scanned_at")
-            .gte("scanned_at", today)
             .order("max_cvss", desc=True)
             .limit(10)
             .execute()
@@ -883,6 +883,18 @@ def send_admin_digest(found_count: int, db=None):
     except Exception as e:
         print(f"[outreach] digest: DB error {e}")
         top = []
+
+    # Count prospects scanned today (separate from found_count which is this run's new finds)
+    try:
+        today_rows = (
+            db.table("outreach_prospects")
+            .select("id", count="exact")
+            .gte("scanned_at", today)
+            .execute()
+        )
+        today_count = today_rows.count or 0
+    except Exception:
+        today_count = found_count
 
     # Fetch pending count
     try:
@@ -931,15 +943,19 @@ def send_admin_digest(found_count: int, db=None):
     <h2 style="margin:0 0 16px 0;font-size:18px">📣 Daily Scan Complete</h2>
     <div style="display:flex;gap:24px;margin-bottom:20px">
       <div style="text-align:center;background:#f5f5f5;border-radius:8px;padding:14px 20px">
+        <div style="font-size:28px;font-weight:700;color:#E74C3C">{today_count}</div>
+        <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px">Scanned Today</div>
+      </div>
+      <div style="text-align:center;background:#f5f5f5;border-radius:8px;padding:14px 20px">
         <div style="font-size:28px;font-weight:700;color:#E74C3C">{found_count}</div>
-        <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px">New Today</div>
+        <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px">New Vulnerable</div>
       </div>
       <div style="text-align:center;background:#f5f5f5;border-radius:8px;padding:14px 20px">
         <div style="font-size:28px;font-weight:700;color:#E67E22">{pending_count}</div>
         <div style="font-size:11px;color:#888;text-transform:uppercase;letter-spacing:1px">Pending Review</div>
       </div>
     </div>
-    {"<h3 style='font-size:14px;margin:0 0 10px 0'>Top " + str(len(top)) + " by CVSS</h3><table style='width:100%;border-collapse:collapse;font-size:13px'><thead><tr style='background:#f5f5f5'><th style='padding:6px 10px;text-align:left'>Domain</th><th style='padding:6px 10px'>Country</th><th style='padding:6px 10px'>CVSS</th><th style='padding:6px 10px'>Contact</th><th style='padding:6px 10px'>Status</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if top else ""}
+    {"<h3 style='font-size:14px;margin:0 0 10px 0'>Top " + str(len(top)) + " by CVSS (all-time)</h3><table style='width:100%;border-collapse:collapse;font-size:13px'><thead><tr style='background:#f5f5f5'><th style='padding:6px 10px;text-align:left'>Domain</th><th style='padding:6px 10px'>Country</th><th style='padding:6px 10px'>CVSS</th><th style='padding:6px 10px'>Contact</th><th style='padding:6px 10px'>Status</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if top else "<p style='color:#888'>No prospects in database yet.</p>"}
     <div style="margin-top:24px;text-align:center">
       <a href="{site}?admin=1#marketing" style="display:inline-block;background:#CBFF00;color:#0E0D12;font-weight:700;font-family:monospace;padding:12px 28px;border-radius:6px;text-decoration:none;font-size:14px">▸ Open Marketing Dashboard</a>
     </div>
@@ -1514,10 +1530,10 @@ def start_scheduler():
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler(timezone="Europe/Prague")
-        scheduler.add_job(_run_scan_job, "cron", hour=8, minute=0, id="daily_prospect_scan")
+        scheduler.add_job(_run_scan_job, "cron", hour=2, minute=0, id="daily_prospect_scan")
         scheduler.start()
         source = "Cloudflare Radar" if CLOUDFLARE_TOKEN else "Tranco+fallback"
-        print(f"[outreach] Daily scan scheduler started — 08:00 Prague, {len(COUNTRY_TLDS)} countries × {SCAN_LIMIT} domains ({source})")
+        print(f"[outreach] Daily scan scheduler started — 02:00 Prague (data ready by 08:00 CET), {len(COUNTRY_TLDS)} countries × {SCAN_LIMIT} domains ({source})")
         return scheduler
     except ImportError:
         print("[outreach] APScheduler not installed — add apscheduler to requirements.txt")
