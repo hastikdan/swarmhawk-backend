@@ -3056,13 +3056,13 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
 
 @app.post("/api/v1/keys")
 def create_api_key(authorization: str = Header(None)):
-    """Generate a new API key for the authenticated user."""
+    """Generate a new API key. If the user already has one, return it instead of creating a duplicate."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    existing = db.table("api_keys").select("key,calls_this_month,limit_per_month,created_at")\
-        .eq("user_id", user["sub"]).execute()
+    existing = db.table("api_keys").select("key,calls_this_month,limit_per_month,active,created_at")\
+        .eq("user_id", user["sub"]).eq("active", True).execute()
     if existing.data:
-        return {"keys": existing.data}
+        return {"keys": existing.data, "created": False}
     new_key = "swh_" + secrets.token_hex(24)
     db.table("api_keys").insert({
         "key":              new_key,
@@ -3072,7 +3072,7 @@ def create_api_key(authorization: str = Header(None)):
         "active":           True,
         "created_at":       datetime.now(timezone.utc).isoformat(),
     }).execute()
-    return {"keys": [{"key": new_key, "calls_this_month": 0, "limit_per_month": 10}]}
+    return {"keys": [{"key": new_key, "calls_this_month": 0, "limit_per_month": 10, "active": True}], "created": True}
 
 
 @app.get("/api/v1/keys")
@@ -3085,12 +3085,35 @@ def list_api_keys(authorization: str = Header(None)):
     return {"keys": rows.data or []}
 
 
-@app.delete("/api/v1/keys/{key}")
-def revoke_api_key(key: str, authorization: str = Header(None)):
-    """Revoke an API key."""
+@app.post("/api/v1/keys/{key}/regenerate")
+def regenerate_api_key(key: str, authorization: str = Header(None)):
+    """Revoke the given key and issue a fresh one, preserving the usage limit."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    db.table("api_keys").update({"active": False}).eq("key", key).eq("user_id", user["sub"]).execute()
+    existing = db.table("api_keys").select("limit_per_month")\
+        .eq("key", key).eq("user_id", user["sub"]).execute()
+    if not existing.data:
+        raise HTTPException(404, "Key not found")
+    limit = existing.data[0].get("limit_per_month") or 10
+    db.table("api_keys").delete().eq("key", key).eq("user_id", user["sub"]).execute()
+    new_key = "swh_" + secrets.token_hex(24)
+    db.table("api_keys").insert({
+        "key":              new_key,
+        "user_id":          user["sub"],
+        "calls_this_month": 0,
+        "limit_per_month":  limit,
+        "active":           True,
+        "created_at":       datetime.now(timezone.utc).isoformat(),
+    }).execute()
+    return {"key": new_key, "calls_this_month": 0, "limit_per_month": limit}
+
+
+@app.delete("/api/v1/keys/{key}")
+def revoke_api_key(key: str, authorization: str = Header(None)):
+    """Permanently delete an API key."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    db.table("api_keys").delete().eq("key", key).eq("user_id", user["sub"]).execute()
     return {"revoked": key}
 
 
