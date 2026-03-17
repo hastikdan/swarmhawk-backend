@@ -1446,7 +1446,7 @@ def _get_report_email_template() -> dict:
     if _report_email_cache is not None:
         return _report_email_cache
     try:
-        db = get_db()
+        db = get_admin_db()
         rows = db.table("admin_settings").select("key,value").in_("key", ["report_subject", "report_body", "report_footer"]).execute()
         tpl = dict(_REPORT_EMAIL_DEFAULTS)
         for row in (rows.data or []):
@@ -1474,9 +1474,12 @@ def get_report_email_template(authorization: str = Header(None)):
 def save_report_email_template(body: ReportEmailTemplate, authorization: str = Header(None)):
     global _report_email_cache
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
     for key, val in [("report_subject", body.subject), ("report_body", body.body), ("report_footer", body.footer)]:
-        db.table("admin_settings").upsert({"key": key, "value": val, "updated_at": datetime.now(timezone.utc).isoformat()}, on_conflict="key").execute()
+        # Try update first; insert if no row exists yet
+        res = db.table("admin_settings").update({"value": val, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("key", key).execute()
+        if not res.data:
+            db.table("admin_settings").insert({"key": key, "value": val, "updated_at": datetime.now(timezone.utc).isoformat()}).execute()
     _report_email_cache = {"subject": body.subject, "body": body.body, "footer": body.footer}
     return {"saved": True}
 
@@ -1485,7 +1488,7 @@ def save_report_email_template(body: ReportEmailTemplate, authorization: str = H
 def reset_report_email_template(authorization: str = Header(None)):
     global _report_email_cache
     require_admin(authorization)
-    db = get_db()
+    db = get_admin_db()
     db.table("admin_settings").delete().in_("key", ["report_subject", "report_body", "report_footer"]).execute()
     _report_email_cache = None
     return {"reset": True, "template": _REPORT_EMAIL_DEFAULTS}
