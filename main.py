@@ -1081,6 +1081,72 @@ def admin_stats(authorization: str = Header(None)):
     }
 
 
+@app.get("/admin/api-keys")
+def admin_list_api_keys(authorization: str = Header(None)):
+    """List all API keys with owner info. Admin only."""
+    require_admin(authorization)
+    db = get_admin_db()
+    rows = db.table("api_keys").select("key,user_id,calls_this_month,limit_per_month,active,created_at").execute()
+    keys = rows.data or []
+    user_ids = list({k["user_id"] for k in keys if k.get("user_id")})
+    user_map = {}
+    if user_ids:
+        users = db.table("users").select("id,email,name").in_("id", user_ids).execute()
+        for u in (users.data or []):
+            user_map[u["id"]] = {"email": u.get("email", ""), "name": u.get("name", "")}
+    for k in keys:
+        u = user_map.get(k.get("user_id", ""), {})
+        k["user_email"] = u.get("email", "—")
+        k["user_name"]  = u.get("name",  "—")
+    keys.sort(key=lambda k: k.get("calls_this_month") or 0, reverse=True)
+    return {"keys": keys}
+
+
+class AdminKeyLimitBody(BaseModel):
+    limit: int
+
+@app.patch("/admin/api-keys/{key}/limit")
+def admin_set_key_limit(key: str, body: AdminKeyLimitBody, authorization: str = Header(None)):
+    """Set monthly call limit for any API key. Admin only."""
+    require_admin(authorization)
+    if body.limit < 1:
+        raise HTTPException(400, "Limit must be at least 1")
+    db = get_admin_db()
+    db.table("api_keys").update({"limit_per_month": body.limit}).eq("key", key).execute()
+    return {"key": key, "limit": body.limit}
+
+
+@app.post("/admin/api-keys/{key}/reset-calls")
+def admin_reset_key_calls(key: str, authorization: str = Header(None)):
+    """Reset monthly call counter to 0. Admin only."""
+    require_admin(authorization)
+    db = get_admin_db()
+    db.table("api_keys").update({"calls_this_month": 0}).eq("key", key).execute()
+    return {"reset": key}
+
+
+@app.patch("/admin/api-keys/{key}/toggle")
+def admin_toggle_key(key: str, authorization: str = Header(None)):
+    """Enable or disable an API key. Admin only."""
+    require_admin(authorization)
+    db = get_admin_db()
+    existing = db.table("api_keys").select("active").eq("key", key).execute()
+    if not existing.data:
+        raise HTTPException(404, "Key not found")
+    new_state = not existing.data[0].get("active", True)
+    db.table("api_keys").update({"active": new_state}).eq("key", key).execute()
+    return {"key": key, "active": new_state}
+
+
+@app.delete("/admin/api-keys/{key}")
+def admin_revoke_key(key: str, authorization: str = Header(None)):
+    """Hard-delete any API key. Admin only."""
+    require_admin(authorization)
+    db = get_admin_db()
+    db.table("api_keys").delete().eq("key", key).execute()
+    return {"revoked": key}
+
+
 @app.delete("/admin/users/{user_id}")
 def admin_delete_user(user_id: str, authorization: str = Header(None)):
     """Delete a user and all their data. Admin only."""
