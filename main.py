@@ -21,6 +21,7 @@ import json
 import hmac
 import hashlib
 import secrets
+import asyncio
 import httpx
 import stripe
 from datetime import datetime, timezone
@@ -54,7 +55,8 @@ API_PLAN_LIMITS = {
 }
 FRONTEND_URL        = os.getenv("FRONTEND_URL", "https://hastikdan.github.io/cee-scanner")
 ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-admin
-PORTKEY_API_KEY     = os.getenv("PORTKEY_API_KEY", "")                  # Portkey AI gateway key
+PORTKEY_API_KEY      = os.getenv("PORTKEY_API_KEY", "")                 # Portkey AI gateway key
+PORTKEY_WORKSPACE    = os.getenv("PORTKEY_WORKSPACE_SLUG", "")          # Portkey workspace slug
 PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "hello@swarmhawk.com")       # verified Resend domain
@@ -1215,41 +1217,39 @@ def admin_scan_history(authorization: str = Header(None)):
 
 @app.get("/admin/portkey/usage")
 def admin_portkey_usage(authorization: str = Header(None)):
-    """Fetch AI cost/usage data from Portkey analytics API."""
+    """Fetch AI cost/usage summary from Portkey analytics API (last 30 days)."""
     user = get_user_from_header(authorization)
     if not is_admin(user["sub"]):
         raise HTTPException(403, "Admin only")
-    if not PORTKEY_API_KEY:
-        return {"error": "Portkey not configured", "total_requests": 0, "total_cost": 0}
+    if not PORTKEY_API_KEY or not PORTKEY_WORKSPACE:
+        msg = "Portkey not configured (set PORTKEY_API_KEY and PORTKEY_WORKSPACE_SLUG in Render)"
+        return {"error": msg, "total_requests": 0, "total_cost": 0, "total_tokens": 0, "logs": []}
     try:
-        import httpx as _httpx
-        resp = _httpx.get(
-            "https://api.portkey.ai/v1/analytics",
-            headers={"x-portkey-api-key": PORTKEY_API_KEY, "Content-Type": "application/json"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            return resp.json()
-        # Try logs endpoint as fallback
-        resp2 = _httpx.get(
-            "https://api.portkey.ai/v1/logs?limit=100&order=desc",
-            headers={"x-portkey-api-key": PORTKEY_API_KEY},
-            timeout=10,
-        )
-        if resp2.status_code == 200:
-            data = resp2.json()
-            logs = data.get("data", data.get("logs", []))
-            total_cost = sum(float(l.get("cost", 0) or 0) for l in logs)
-            total_tokens = sum(int(l.get("usage", {}).get("total_tokens", 0) or 0) for l in logs)
-            return {
-                "total_requests": len(logs),
-                "total_tokens": total_tokens,
-                "total_cost": round(total_cost, 4),
-                "logs": logs[:20],  # last 20 calls
-            }
-        return {"error": f"Portkey API returned {resp.status_code}", "total_requests": 0, "total_cost": 0}
+        now = datetime.now(timezone.utc)
+        period_start = (now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+        params = {
+            "workspace_slug":         PORTKEY_WORKSPACE,
+            "time_of_generation_min": period_start.isoformat(),
+            "time_of_generation_max": now.isoformat(),
+        }
+        pk_h = {"x-portkey-api-key": PORTKEY_API_KEY}
+        cost_r = httpx.get("https://api.portkey.ai/v1/analytics/graphs/cost",     headers=pk_h, params=params, timeout=10)
+        req_r  = httpx.get("https://api.portkey.ai/v1/analytics/graphs/requests", headers=pk_h, params=params, timeout=10)
+        tok_r  = httpx.get("https://api.portkey.ai/v1/analytics/graphs/tokens",   headers=pk_h, params=params, timeout=10)
+        cost_data = cost_r.json() if cost_r.status_code == 200 else {}
+        req_data  = req_r.json()  if req_r.status_code == 200 else {}
+        tok_data  = tok_r.json()  if tok_r.status_code == 200 else {}
+        total_cost    = float((cost_data.get("summary") or {}).get("total", 0) or 0) / 100.0
+        total_requests = int((req_data.get("summary") or {}).get("total", 0) or 0)
+        total_tokens   = int((tok_data.get("summary") or {}).get("total", 0) or 0)
+        return {
+            "total_requests": total_requests,
+            "total_tokens":   total_tokens,
+            "total_cost":     round(total_cost, 4),
+            "logs":           [],  # use /admin/llm-stats for detailed breakdown
+        }
     except Exception as e:
-        return {"error": str(e), "total_requests": 0, "total_cost": 0}
+        return {"error": str(e), "total_requests": 0, "total_cost": 0, "total_tokens": 0, "logs": []}
 
 
 @app.get("/admin/llm-stats")
@@ -1265,138 +1265,122 @@ async def admin_llm_stats(
             "configured": False,
             "message": "PORTKEY_API_KEY not set — add it to Render env vars to enable LLM observability",
         }
+    if not PORTKEY_WORKSPACE:
+        return {
+            "configured": False,
+            "message": "PORTKEY_WORKSPACE_SLUG not set — add your Portkey workspace slug to Render env vars (find it in Portkey dashboard → Settings → Workspace)",
+        }
 
-    pk_headers = {
-        "x-portkey-api-key": PORTKEY_API_KEY,
-        "Content-Type": "application/json",
-    }
+    pk_headers = {"x-portkey-api-key": PORTKEY_API_KEY}
     now = datetime.now(timezone.utc)
 
-    # Compute period start based on requested granularity
     if period == "day":
         period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         period_label = "today"
-        ts_fmt = "%H:00"          # group by hour
-        ts_key = lambda ts: ts[:13]  # "YYYY-MM-DDTHH"
+        ts_slice = 13   # group by hour "YYYY-MM-DDTHH"
     elif period == "year":
         period_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         period_label = "this year"
-        ts_fmt = "%b %Y"          # group by month "Jan 2025"
-        ts_key = lambda ts: ts[:7]   # "YYYY-MM"
-    else:  # month (default)
+        ts_slice = 7    # group by month "YYYY-MM"
+    else:
         period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         period_label = "this month"
-        ts_fmt = "%d %b"          # group by day "01 Mar"
-        ts_key = lambda ts: ts[:10]  # "YYYY-MM-DD"
+        ts_slice = 10   # group by day "YYYY-MM-DD"
 
-    period_start_iso = period_start.isoformat()
+    base_params = {
+        "workspace_slug":          PORTKEY_WORKSPACE,
+        "time_of_generation_min":  period_start.isoformat(),
+        "time_of_generation_max":  now.isoformat(),
+    }
+    group_params = {**base_params, "page_size": 100, "current_page": 0}
 
     try:
-        import httpx
         async with httpx.AsyncClient(timeout=30) as client:
-            # 1. Aggregate analytics for the period
-            analytics_r = await client.get(
-                "https://api.portkey.ai/v1/analytics",
-                headers=pk_headers,
-                params={"filters[time_of_generation][gt]": period_start_iso},
+            (cost_r, req_r, tok_r,
+             domain_r, user_r, type_r) = await asyncio.gather(
+                client.get("https://api.portkey.ai/v1/analytics/graphs/cost",              headers=pk_headers, params=base_params),
+                client.get("https://api.portkey.ai/v1/analytics/graphs/requests",          headers=pk_headers, params=base_params),
+                client.get("https://api.portkey.ai/v1/analytics/graphs/tokens",            headers=pk_headers, params=base_params),
+                client.get("https://api.portkey.ai/v1/analytics/groups/metadata/domain",   headers=pk_headers, params=group_params),
+                client.get("https://api.portkey.ai/v1/analytics/groups/metadata/_user",    headers=pk_headers, params=group_params),
+                client.get("https://api.portkey.ai/v1/analytics/groups/metadata/report_type", headers=pk_headers, params=group_params),
             )
-            analytics = analytics_r.json() if analytics_r.status_code == 200 else {}
-
-            # 2. Fetch logs for the period (up to 500 for richer breakdowns)
-            logs_r = await client.get(
-                "https://api.portkey.ai/v1/logs",
-                headers=pk_headers,
-                params={
-                    "page_size": 500,
-                    "page": 0,
-                    "filters[time_of_generation][gt]": period_start_iso,
-                },
-            )
-            logs_data = logs_r.json() if logs_r.status_code == 200 else {}
-
     except Exception as e:
         raise HTTPException(502, f"Portkey API error: {e}")
 
-    # Parse analytics totals (Portkey shape varies by version)
-    totals = analytics.get("total", analytics)
-    total_cost        = float(totals.get("cost", totals.get("total_cost", 0)) or 0)
-    total_tokens      = int(totals.get("tokens", totals.get("total_tokens", 0)) or 0)
-    total_requests    = int(totals.get("requests", totals.get("total_requests", 0)) or 0)
-    prompt_tokens     = int(totals.get("prompt_tokens", 0) or 0)
-    completion_tokens = int(totals.get("completion_tokens", 0) or 0)
+    def _j(r): return r.json() if r.status_code == 200 else {}
+    cost_data   = _j(cost_r)
+    req_data    = _j(req_r)
+    tok_data    = _j(tok_r)
+    domain_data = _j(domain_r)
+    user_data   = _j(user_r)
+    type_data   = _j(type_r)
 
-    # Parse logs for per-domain, per-user, per-type, and time-series breakdowns
-    logs       = logs_data.get("data", logs_data.get("logs", []))
-    user_map   = {}   # user_id  -> {cost, tokens, requests}
-    type_map   = {}   # report_type -> {cost, tokens, requests}
-    domain_map = {}   # domain   -> {cost, tokens, requests}
-    time_map   = {}   # date_key -> {cost, tokens, requests}
+    # Totals — Portkey cost values are in USD cents, divide by 100
+    total_cost_cents = float((cost_data.get("summary") or {}).get("total", 0) or 0)
+    total_cost       = total_cost_cents / 100.0
+    total_requests   = int((req_data.get("summary") or {}).get("total", 0) or 0)
+    total_tokens     = int((tok_data.get("summary") or {}).get("total", 0) or 0)
 
-    import json as _j
-    for log in logs:
-        meta = log.get("metadata") or {}
-        if isinstance(meta, str):
-            try:
-                meta = _j.loads(meta)
-            except Exception:
-                meta = {}
-
-        uid    = meta.get("_user", "anonymous")
-        rtype  = meta.get("report_type", "unknown")
-        domain = meta.get("domain", "")
-        cost   = float(log.get("cost", 0) or 0)
-        toks   = int(log.get("total_tokens", 0) or 0)
-
-        # ── time key from log timestamp ──────────────────────────────────────
-        ts_raw = log.get("created_at") or log.get("time_of_generation") or ""
-        try:
-            dk = ts_key(ts_raw) if ts_raw else ""
-        except Exception:
-            dk = ""
-
-        def _add(m, key, label_key, label_val):
-            if key not in m:
-                m[key] = {label_key: label_val, "cost": 0.0, "tokens": 0, "requests": 0}
-            m[key]["cost"]     += cost
-            m[key]["tokens"]   += toks
-            m[key]["requests"] += 1
-
-        _add(user_map,   uid,    "user_id",     uid)
-        _add(type_map,   rtype,  "report_type", rtype)
-        if domain:
-            _add(domain_map, domain, "domain",  domain)
+    # Time series from cost + requests graph data_points
+    cost_pts = {}
+    for p in (cost_data.get("data_points") or []):
+        dk = (p.get("timestamp") or "")[:ts_slice]
         if dk:
-            _add(time_map,   dk,     "date_key", dk)
+            cost_pts[dk] = cost_pts.get(dk, 0.0) + float(p.get("total", 0) or 0) / 100.0
+    req_pts = {}
+    for p in (req_data.get("data_points") or []):
+        dk = (p.get("timestamp") or "")[:ts_slice]
+        if dk:
+            req_pts[dk] = req_pts.get(dk, 0) + int(p.get("total", 0) or 0)
+    all_dates  = sorted(set(cost_pts) | set(req_pts))
+    time_series = [
+        {"date": d, "cost": round(cost_pts.get(d, 0.0), 6), "requests": req_pts.get(d, 0)}
+        for d in all_dates
+    ]
+
+    # Group breakdown helper — cost in groups is also in cents
+    def _parse_groups(gdata, name_field):
+        rows = []
+        for item in (gdata.get("data") or []):
+            c    = float(item.get("cost", 0) or 0) / 100.0
+            reqs = int(item.get("requests", 0) or 0)
+            avg_tok = float(item.get("avg_tokens", 0) or 0)
+            rows.append({
+                name_field:  item.get("metadata_value", ""),
+                "requests":  reqs,
+                "tokens":    int(avg_tok * reqs),
+                "cost":      round(c, 6),
+            })
+        rows.sort(key=lambda x: x["cost"], reverse=True)
+        return rows
+
+    domain_breakdown = _parse_groups(domain_data, "domain")
+    type_breakdown   = _parse_groups(type_data,   "report_type")
+    type_breakdown.sort(key=lambda x: x["requests"], reverse=True)
+    user_rows        = _parse_groups(user_data,   "user_id")
 
     # Enrich user breakdown with emails
     db = get_admin_db()
-    user_ids  = [u for u in user_map if u != "anonymous"]
+    user_ids  = [u["user_id"] for u in user_rows if u["user_id"] and u["user_id"] != "anonymous"]
     email_map = {}
     if user_ids:
         try:
-            rows = db.table("users").select("id,email,name").in_("id", user_ids).execute()
+            rows = db.table("users").select("id,email").in_("id", user_ids).execute()
             for row in (rows.data or []):
                 email_map[row["id"]] = row.get("email", "")
         except Exception:
             pass
-
-    user_breakdown = sorted(user_map.values(), key=lambda x: x["cost"], reverse=True)
-    for u in user_breakdown:
-        u["email"] = email_map.get(u["user_id"], u["user_id"][:8] + "…")
-        u["cost"]  = round(u["cost"], 6)
-
-    domain_breakdown = sorted(domain_map.values(), key=lambda x: x["cost"], reverse=True)
-    for d in domain_breakdown:
-        d["cost"] = round(d["cost"], 6)
-
-    type_breakdown = sorted(type_map.values(), key=lambda x: x["requests"], reverse=True)
-
-    # Build sorted time series
-    time_series = sorted(
-        [{"date": k, "cost": round(v["cost"], 6), "tokens": v["tokens"], "requests": v["requests"]}
-         for k, v in time_map.items()],
-        key=lambda x: x["date"],
-    )
+    user_breakdown = []
+    for u in user_rows:
+        uid = u["user_id"]
+        user_breakdown.append({
+            "user_id":  uid,
+            "email":    email_map.get(uid, (uid[:8] + "…") if len(uid) > 8 else uid),
+            "requests": u["requests"],
+            "tokens":   u["tokens"],
+            "cost":     u["cost"],
+        })
 
     return {
         "configured":    True,
@@ -1405,8 +1389,8 @@ async def admin_llm_stats(
         "totals": {
             "cost":              round(total_cost, 6),
             "tokens":            total_tokens,
-            "prompt_tokens":     prompt_tokens,
-            "completion_tokens": completion_tokens,
+            "prompt_tokens":     0,   # not split in graph endpoints
+            "completion_tokens": 0,
             "requests":          total_requests,
             "avg_cost_per_req":  round(total_cost / max(total_requests, 1), 6),
         },
