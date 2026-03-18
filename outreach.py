@@ -607,8 +607,10 @@ def _fallback_email(p: dict) -> str:
 # ── Supabase helpers ──────────────────────────────────────────────────────────
 
 def get_db():
+    """Use service_role key so queries work after RLS deny-all is enabled."""
     from supabase import create_client
-    return create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+    key = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+    return create_client(os.getenv("SUPABASE_URL"), key)
 
 
 def upsert_prospect(p: dict, email_body: str, db=None):

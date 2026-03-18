@@ -73,24 +73,19 @@ db: Client = None
 admin_db: Client = None
 
 def get_db() -> Client:
-    global db
-    if db is None:
-        if not SUPABASE_URL or not SUPABASE_KEY:
-            raise HTTPException(503, "Database not configured — set SUPABASE_URL and SUPABASE_KEY on Render")
-        try:
-            db = create_client(SUPABASE_URL, SUPABASE_KEY)
-        except Exception as e:
-            raise HTTPException(503, f"Database connection failed: {str(e)[:200]}")
-    return db
+    """Return a service-role Supabase client.
+    All backend queries run with service-role key so they work correctly
+    after RLS is enabled on all tables (deny-all for anon key).
+    Security is enforced at the application layer via user_id filters."""
+    return get_admin_db()
 
 def get_admin_db() -> Client:
-    """Return a Supabase client using the service_role key to bypass RLS.
-    Falls back to regular key if SUPABASE_SERVICE_KEY is not set."""
+    """Return a Supabase client using the service_role key to bypass RLS."""
     global admin_db
     if admin_db is None:
         key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
         if not SUPABASE_URL or not key:
-            raise HTTPException(503, "Database not configured")
+            raise HTTPException(503, "Database not configured — set SUPABASE_URL and SUPABASE_KEY on Render")
         try:
             admin_db = create_client(SUPABASE_URL, key)
         except Exception as e:
