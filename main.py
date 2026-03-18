@@ -3246,20 +3246,27 @@ def create_api_key(authorization: str = Header(None)):
     """Generate a new API key. If the user already has one, return it instead of creating a duplicate."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    existing = db.table("api_keys").select("key,calls_this_month,limit_per_month,active,created_at")\
-        .eq("user_id", user["sub"]).eq("active", True).execute()
-    if existing.data:
-        return {"keys": existing.data, "created": False}
-    new_key = "swh_" + secrets.token_hex(24)
-    db.table("api_keys").insert({
-        "key":              new_key,
-        "user_id":          user["sub"],
-        "calls_this_month": 0,
-        "limit_per_month":  10,
-        "active":           True,
-        "created_at":       datetime.now(timezone.utc).isoformat(),
-    }).execute()
-    return {"keys": [{"key": new_key, "calls_this_month": 0, "limit_per_month": 10, "active": True}], "created": True}
+    try:
+        existing = db.table("api_keys").select("key,calls_this_month,limit_per_month,active,created_at")\
+            .eq("user_id", user["sub"]).eq("active", True).execute()
+        if existing.data:
+            return {"keys": existing.data, "created": False}
+        new_key = "swh_" + secrets.token_hex(24)
+        res = db.table("api_keys").insert({
+            "key":              new_key,
+            "user_id":          user["sub"],
+            "calls_this_month": 0,
+            "limit_per_month":  10,
+            "active":           True,
+            "created_at":       datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        if not res.data:
+            raise HTTPException(500, "Insert returned no data — check SUPABASE_SERVICE_KEY is set in Render env vars")
+        return {"keys": [{"key": new_key, "calls_this_month": 0, "limit_per_month": 10, "active": True}], "created": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Failed to create API key: {str(e)[:300]}")
 
 
 @app.get("/api/v1/keys")
