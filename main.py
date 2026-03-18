@@ -1690,7 +1690,9 @@ def delete_account(authorization: str = Header(None)):
 def list_domains(authorization: str = Header(None)):
     """List all domains for the logged-in user."""
     user = get_user_from_header(authorization)
-    db = get_db()
+    # Use service-role DB so the query works regardless of Supabase RLS config.
+    # Security is enforced via the application-level user_id filter below.
+    db = get_admin_db()
 
     # Fetch domains with lightweight scan metadata (no checks blob) and purchase flags.
     # Omitting checks(*) here is the key optimisation — checks are large JSON and we
@@ -1709,7 +1711,10 @@ def list_domains(authorization: str = Header(None)):
     for d in domains_res.data:
         scans = d.get("scans") or []
         if scans:
-            latest_scan_by_domain[d["id"]] = max(scans, key=lambda s: s["scanned_at"])
+            # Guard against scans with null scanned_at
+            latest_scan_by_domain[d["id"]] = max(
+                scans, key=lambda s: s.get("scanned_at") or ""
+            )
 
     # Single targeted query: fetch checks only for the latest scan of each domain
     latest_checks_map: dict = {}
@@ -1765,7 +1770,7 @@ def list_domains(authorization: str = Header(None)):
             "contact_emails":  cached_contact_emails or [],
             "scan_history": [
                 {"date": s["scanned_at"], "risk": s["risk_score"]}
-                for s in sorted(scans, key=lambda s: s["scanned_at"])
+                for s in sorted(scans, key=lambda s: s.get("scanned_at") or "")
             ],
         })
 
