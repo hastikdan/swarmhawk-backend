@@ -4110,53 +4110,6 @@ def _build_map_data() -> dict:
     except Exception as e:
         print(f"[map] outreach_prospects query failed: {e}")
 
-    # ── Overlay: real scan risk_scores from user scans table ───────────────────
-    try:
-        admin_db = get_admin_db()
-        user_domains = admin_db.table("domains").select("id,domain,country").execute()
-        dom_map: dict = {}  # domain_id -> (domain, country_code)
-        for ud in (user_domains.data or []):
-            d   = ud.get("domain", "")
-            cc  = (ud.get("country") or "").upper().strip()
-            if not cc or cc in ("EU", "??", ""):
-                cc = tld_to_country(d)
-            dom_map[ud["id"]] = (d, cc)
-
-        if dom_map:
-            scans_res = admin_db.table("scans")\
-                .select("domain_id,risk_score,scanned_at")\
-                .order("scanned_at", desc=True)\
-                .limit(2000)\
-                .execute()
-            seen_scan: set = set()
-            for s in (scans_res.data or []):
-                did = s.get("domain_id")
-                if did not in dom_map or did in seen_scan:
-                    continue
-                seen_scan.add(did)
-                _, cc = dom_map[did]
-                score = s.get("risk_score") or 0
-                if cc not in country_data:
-                    country_data[cc] = {
-                        "country": cc, "domains": 0, "scanned": 0,
-                        "avg_risk": 0, "high_risk_domains": 0, "critical_findings": 0,
-                        "_cvss_sum": 0.0, "_cvss_count": 0,
-                    }
-                country_data[cc]["domains"] = max(country_data[cc].get("domains", 0) + 1, 1)
-                country_data[cc]["scanned"] = country_data[cc].get("scanned", 0) + 1
-                country_data[cc]["_cvss_sum"]   = country_data[cc].get("_cvss_sum", 0) + score
-                country_data[cc]["_cvss_count"] = country_data[cc].get("_cvss_count", 0) + 1
-                if score >= 70:
-                    country_data[cc]["high_risk_domains"] = country_data[cc].get("high_risk_domains", 0) + 1
-
-        # Recalculate avg_risk for countries that got scan data
-        for cc, row in country_data.items():
-            if row.get("_cvss_count", 0) > 0:
-                row["avg_risk"] = round(row["_cvss_sum"] / row["_cvss_count"], 1)
-
-    except Exception as e:
-        print(f"[map] scans table overlay failed: {e}")
-
     # Strip internal keys, drop countries with 0 domains
     result = []
     for cc, row in country_data.items():
@@ -4276,51 +4229,6 @@ def map_country_top_domains(code: str):
                 "max_cvss": round(cvss, 1),
                 "source": "outreach",
             })
-
-        # ── 2. User-scanned domains — domains + latest scan risk_score ──
-        try:
-            admin_db = get_admin_db()
-            user_domains = admin_db.table("domains")\
-                .select("id,domain,country")\
-                .execute()
-            dom_ids = []
-            dom_map = {}
-            for ud in (user_domains.data or []):
-                d = ud.get("domain", "")
-                cc = (ud.get("country") or "").upper().strip()
-                if not cc or cc in ("EU", "??", ""):
-                    cc = tld_to_country(d)
-                if cc != code:
-                    continue
-                dom_ids.append(ud["id"])
-                dom_map[ud["id"]] = d
-
-            if dom_ids:
-                # Fetch latest scan per domain
-                scans_res = admin_db.table("scans")\
-                    .select("domain_id,risk_score,scanned_at")\
-                    .in_("domain_id", dom_ids[:50])\
-                    .order("scanned_at", desc=True)\
-                    .execute()
-                seen_scan: set = set()
-                for s in (scans_res.data or []):
-                    did = s.get("domain_id")
-                    if did in seen_scan:
-                        continue
-                    seen_scan.add(did)
-                    dom = dom_map.get(did, "")
-                    if not dom or dom in seen:
-                        continue
-                    seen.add(dom)
-                    domain_rows.append({
-                        "domain": dom,
-                        "risk_score": s.get("risk_score") or 0,
-                        "scanned_at": fmt_date(s.get("scanned_at")),
-                        "max_cvss": 0,
-                        "source": "scan",
-                    })
-        except Exception:
-            pass  # scans table optional — outreach data is enough
 
         # Sort by risk_score desc, limit 100
         domain_rows.sort(key=lambda x: x["risk_score"], reverse=True)
