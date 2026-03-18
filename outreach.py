@@ -1032,6 +1032,27 @@ async def run_scan(background_tasks: BackgroundTasks, authorization: str = Heade
     }
 
 
+@router.post("/internal/cron")
+async def internal_cron_trigger(background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Trigger daily scan via a static CRON_SECRET — for GitHub Actions / external schedulers.
+    Bypasses session auth so it works even when the Render dyno was sleeping."""
+    secret = os.getenv("CRON_SECRET", "")
+    if not secret:
+        raise HTTPException(503, "CRON_SECRET not configured on server")
+    if not authorization or authorization != f"Bearer {secret}":
+        raise HTTPException(401, "Invalid cron secret")
+    if _scan_progress.get("status") == "running":
+        return {"status": "already_running", **_scan_progress}
+    background_tasks.add_task(_run_scan_job)
+    active = {k: v for k, v in COUNTRY_TLDS.items() if not ACTIVE_COUNTRIES or k in ACTIVE_COUNTRIES}
+    return {
+        "status": "scan started",
+        "triggered_by": "cron",
+        "countries": len(active),
+        "scan_limit_per_country": SCAN_LIMIT,
+    }
+
+
 @router.post("/stop-scan")
 async def stop_scan(authorization: str = Header(None)):
     """Request the running scan to stop after the current batch."""
