@@ -1029,17 +1029,17 @@ def admin_stats(authorization: str = Header(None)):
 
     # API key usage stats
     try:
-        api_key_rows = db.table("api_keys").select("user_id,calls_this_month,limit_per_month,active,created_at").execute()
+        api_key_rows = db.table("api_keys").select("user_id,calls_this_month,limit_per_month,key_prefix,created_at,revoked_at").execute()
         api_keys_data = api_key_rows.data or []
     except Exception:
         api_keys_data = []
-    active_keys    = [k for k in api_keys_data if k.get("active", True)]
+    active_keys    = [k for k in api_keys_data if not k.get("revoked_at")]
     total_api_calls = sum(k.get("calls_this_month") or 0 for k in api_keys_data)
     new_keys_7d    = within_days(api_keys_data, "created_at", 7)
     new_keys_30d   = within_days(api_keys_data, "created_at", 30)
     # Top 5 API users by calls this month
     top_api = sorted(
-        [{"user_id": k.get("user_id","?"), "key": (k.get("key") or "")[:12]+"…",
+        [{"user_id": k.get("user_id","?"), "key": (k.get("key_prefix") or "")[:12]+"…",
           "calls": k.get("calls_this_month") or 0, "limit": k.get("limit_per_month") or 10}
          for k in api_keys_data if k.get("calls_this_month")],
         key=lambda x: x["calls"], reverse=True
@@ -1094,7 +1094,7 @@ def admin_list_api_keys(authorization: str = Header(None)):
     """List all API keys with owner info. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
-    rows = db.table("api_keys").select("key,user_id,calls_this_month,limit_per_month,active,created_at").execute()
+    rows = db.table("api_keys").select("id,key_prefix,user_id,calls_this_month,limit_per_month,created_at,revoked_at,last_used_at").execute()
     keys = rows.data or []
     user_ids = list({k["user_id"] for k in keys if k.get("user_id")})
     user_map = {}
@@ -1106,6 +1106,8 @@ def admin_list_api_keys(authorization: str = Header(None)):
         u = user_map.get(k.get("user_id", ""), {})
         k["user_email"] = u.get("email", "—")
         k["user_name"]  = u.get("name",  "—")
+        k["active"]     = not bool(k.get("revoked_at"))
+        k["key"]        = k.get("key_prefix", "")   # frontend compat alias
     keys.sort(key=lambda k: k.get("calls_this_month") or 0, reverse=True)
     return {"keys": keys}
 
@@ -1113,46 +1115,47 @@ def admin_list_api_keys(authorization: str = Header(None)):
 class AdminKeyLimitBody(BaseModel):
     limit: int
 
-@app.patch("/admin/api-keys/{key}/limit")
-def admin_set_key_limit(key: str, body: AdminKeyLimitBody, authorization: str = Header(None)):
+@app.patch("/admin/api-keys/{key_id}/limit")
+def admin_set_key_limit(key_id: str, body: AdminKeyLimitBody, authorization: str = Header(None)):
     """Set monthly call limit for any API key. Admin only."""
     require_admin(authorization)
     if body.limit < 1:
         raise HTTPException(400, "Limit must be at least 1")
     db = get_admin_db()
-    db.table("api_keys").update({"limit_per_month": body.limit}).eq("key", key).execute()
-    return {"key": key, "limit": body.limit}
+    db.table("api_keys").update({"limit_per_month": body.limit}).eq("id", key_id).execute()
+    return {"id": key_id, "limit": body.limit}
 
 
-@app.post("/admin/api-keys/{key}/reset-calls")
-def admin_reset_key_calls(key: str, authorization: str = Header(None)):
+@app.post("/admin/api-keys/{key_id}/reset-calls")
+def admin_reset_key_calls(key_id: str, authorization: str = Header(None)):
     """Reset monthly call counter to 0. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
-    db.table("api_keys").update({"calls_this_month": 0}).eq("key", key).execute()
-    return {"reset": key}
+    db.table("api_keys").update({"calls_this_month": 0}).eq("id", key_id).execute()
+    return {"reset": key_id}
 
 
-@app.patch("/admin/api-keys/{key}/toggle")
-def admin_toggle_key(key: str, authorization: str = Header(None)):
-    """Enable or disable an API key. Admin only."""
+@app.patch("/admin/api-keys/{key_id}/toggle")
+def admin_toggle_key(key_id: str, authorization: str = Header(None)):
+    """Enable or disable an API key via revoked_at. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
-    existing = db.table("api_keys").select("active").eq("key", key).execute()
+    existing = db.table("api_keys").select("revoked_at").eq("id", key_id).execute()
     if not existing.data:
         raise HTTPException(404, "Key not found")
-    new_state = not existing.data[0].get("active", True)
-    db.table("api_keys").update({"active": new_state}).eq("key", key).execute()
-    return {"key": key, "active": new_state}
+    currently_revoked = bool(existing.data[0].get("revoked_at"))
+    new_revoked_at = None if currently_revoked else datetime.now(timezone.utc).isoformat()
+    db.table("api_keys").update({"revoked_at": new_revoked_at}).eq("id", key_id).execute()
+    return {"id": key_id, "active": currently_revoked}  # active = was revoked, now enabled
 
 
-@app.delete("/admin/api-keys/{key}")
-def admin_revoke_key(key: str, authorization: str = Header(None)):
-    """Hard-delete any API key. Admin only."""
+@app.delete("/admin/api-keys/{key_id}")
+def admin_revoke_key(key_id: str, authorization: str = Header(None)):
+    """Soft-revoke any API key. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
-    db.table("api_keys").delete().eq("key", key).execute()
-    return {"revoked": key}
+    db.table("api_keys").update({"revoked_at": datetime.now(timezone.utc).isoformat()}).eq("id", key_id).execute()
+    return {"revoked": key_id}
 
 
 @app.delete("/admin/users/{user_id}")
@@ -2714,7 +2717,7 @@ async def stripe_webhook(request: Request):
                 if (p.get("plan") or "").startswith("api_"):
                     # API plan renewal — reset monthly call counter
                     db.table("api_keys").update({"calls_this_month": 0})\
-                        .eq("user_id", p["user_id"]).execute()
+                        .eq("user_id", p["user_id"]).is_("revoked_at", "null").execute()
                     print(f"[stripe] API plan renewed, calls reset for user {p['user_id']}")
                 else:
                     # Domain subscription renewal — queue rescan
@@ -3168,16 +3171,18 @@ async def public_scan(body: PublicScanRequest):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _resolve_api_key(api_key: str) -> dict:
-    """Return user row for a valid API key. Raises 401/429 on failure."""
+    """Return key row for a valid API key. Raises 401/429 on failure."""
     if not api_key:
         raise HTTPException(401, "Missing X-API-Key header")
+    import hashlib as _hl
+    key_hash = _hl.sha256(api_key.encode()).hexdigest()
     db = get_db()
-    row = db.table("api_keys").select("user_id, calls_this_month, limit_per_month, active")\
-        .eq("key", api_key).execute()
+    row = db.table("api_keys").select("id, user_id, calls_this_month, limit_per_month, revoked_at")\
+        .eq("key_hash", key_hash).execute()
     if not row.data:
         raise HTTPException(401, "Invalid API key")
     r = row.data[0]
-    if not r.get("active", True):
+    if r.get("revoked_at"):
         raise HTTPException(403, "API key disabled")
     limit = r.get("limit_per_month") or 10
     used  = r.get("calls_this_month") or 0
@@ -3203,8 +3208,10 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
     if api_key:
         # Developer API path — rate-limited by API key
         user = _resolve_api_key(api_key)
-        db.table("api_keys").update({"calls_this_month": (user.get("calls_this_month") or 0) + 1})\
-            .eq("key", api_key).execute()
+        db.table("api_keys").update({
+            "calls_this_month": (user.get("calls_this_month") or 0) + 1,
+            "last_used_at": datetime.now(timezone.utc).isoformat(),
+        }).eq("id", user["id"]).execute()
     elif auth_hdr.startswith("Bearer "):
         # Session-authenticated dashboard user — no API key needed
         user = get_user_from_header(auth_hdr)
@@ -3243,26 +3250,37 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
 
 @app.post("/api/v1/keys")
 def create_api_key(authorization: str = Header(None)):
-    """Generate a new API key. If the user already has one, return it instead of creating a duplicate."""
+    """Generate a new API key. Returns existing active key if one already exists."""
     user = get_user_from_header(authorization)
     db   = get_db()
     try:
-        existing = db.table("api_keys").select("key,calls_this_month,limit_per_month,active,created_at")\
-            .eq("user_id", user["sub"]).eq("active", True).execute()
+        existing = db.table("api_keys")\
+            .select("id,key_prefix,calls_this_month,limit_per_month,created_at")\
+            .eq("user_id", user["sub"]).is_("revoked_at", "null").execute()
         if existing.data:
-            return {"keys": existing.data, "created": False}
-        new_key = "swh_" + secrets.token_hex(24)
+            k = existing.data[0]
+            return {"keys": [k], "created": False, "full_key": None}
+        import hashlib as _hl
+        raw_key   = "swh_" + secrets.token_hex(24)
+        key_hash  = _hl.sha256(raw_key.encode()).hexdigest()
+        key_prefix = raw_key[:12]
         res = db.table("api_keys").insert({
-            "key":              new_key,
             "user_id":          user["sub"],
+            "key_hash":         key_hash,
+            "key_prefix":       key_prefix,
+            "name":             "Default",
             "calls_this_month": 0,
             "limit_per_month":  10,
-            "active":           True,
             "created_at":       datetime.now(timezone.utc).isoformat(),
         }).execute()
         if not res.data:
-            raise HTTPException(500, "Insert returned no data — check SUPABASE_SERVICE_KEY is set in Render env vars")
-        return {"keys": [{"key": new_key, "calls_this_month": 0, "limit_per_month": 10, "active": True}], "created": True}
+            raise HTTPException(500, "Insert returned no data — ensure SUPABASE_SERVICE_KEY is set in Render")
+        new_id = res.data[0]["id"]
+        return {
+            "keys":     [{"id": new_id, "key_prefix": key_prefix, "calls_this_month": 0, "limit_per_month": 10}],
+            "created":  True,
+            "full_key": raw_key,   # shown once — never stored in plaintext
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -3271,44 +3289,55 @@ def create_api_key(authorization: str = Header(None)):
 
 @app.get("/api/v1/keys")
 def list_api_keys(authorization: str = Header(None)):
-    """List API keys and usage for the current user."""
+    """List active API keys and usage for the current user."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    rows = db.table("api_keys").select("key,calls_this_month,limit_per_month,active,created_at")\
-        .eq("user_id", user["sub"]).execute()
+    rows = db.table("api_keys")\
+        .select("id,key_prefix,calls_this_month,limit_per_month,last_used_at,created_at")\
+        .eq("user_id", user["sub"]).is_("revoked_at", "null").execute()
     return {"keys": rows.data or []}
 
 
-@app.post("/api/v1/keys/{key}/regenerate")
-def regenerate_api_key(key: str, authorization: str = Header(None)):
+@app.post("/api/v1/keys/{key_id}/regenerate")
+def regenerate_api_key(key_id: str, authorization: str = Header(None)):
     """Revoke the given key and issue a fresh one, preserving the usage limit."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    existing = db.table("api_keys").select("limit_per_month")\
-        .eq("key", key).eq("user_id", user["sub"]).execute()
+    existing = db.table("api_keys").select("id,limit_per_month,name")\
+        .eq("id", key_id).eq("user_id", user["sub"]).is_("revoked_at", "null").execute()
     if not existing.data:
         raise HTTPException(404, "Key not found")
     limit = existing.data[0].get("limit_per_month") or 10
-    db.table("api_keys").delete().eq("key", key).eq("user_id", user["sub"]).execute()
-    new_key = "swh_" + secrets.token_hex(24)
-    db.table("api_keys").insert({
-        "key":              new_key,
+    name  = existing.data[0].get("name") or "Default"
+    # Revoke old key
+    db.table("api_keys").update({"revoked_at": datetime.now(timezone.utc).isoformat()})\
+        .eq("id", key_id).execute()
+    # Issue new key
+    import hashlib as _hl
+    raw_key    = "swh_" + secrets.token_hex(24)
+    key_hash   = _hl.sha256(raw_key.encode()).hexdigest()
+    key_prefix = raw_key[:12]
+    res = db.table("api_keys").insert({
         "user_id":          user["sub"],
+        "key_hash":         key_hash,
+        "key_prefix":       key_prefix,
+        "name":             name,
         "calls_this_month": 0,
         "limit_per_month":  limit,
-        "active":           True,
         "created_at":       datetime.now(timezone.utc).isoformat(),
     }).execute()
-    return {"key": new_key, "calls_this_month": 0, "limit_per_month": limit}
+    new_id = res.data[0]["id"] if res.data else None
+    return {"id": new_id, "key_prefix": key_prefix, "full_key": raw_key, "calls_this_month": 0, "limit_per_month": limit}
 
 
-@app.delete("/api/v1/keys/{key}")
-def revoke_api_key(key: str, authorization: str = Header(None)):
-    """Permanently delete an API key."""
+@app.delete("/api/v1/keys/{key_id}")
+def revoke_api_key(key_id: str, authorization: str = Header(None)):
+    """Soft-revoke an API key."""
     user = get_user_from_header(authorization)
     db   = get_db()
-    db.table("api_keys").delete().eq("key", key).eq("user_id", user["sub"]).execute()
-    return {"revoked": key}
+    db.table("api_keys").update({"revoked_at": datetime.now(timezone.utc).isoformat()})\
+        .eq("id", key_id).eq("user_id", user["sub"]).execute()
+    return {"revoked": key_id}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3829,7 +3858,7 @@ def _apply_api_plan(db, user_id: str, plan: str):
     """Set limit_per_month on all active API keys for this user."""
     limit = API_PLAN_LIMITS.get(plan, API_PLAN_LIMITS["free"])
     db.table("api_keys").update({"limit_per_month": limit})\
-        .eq("user_id", user_id).eq("active", True).execute()
+        .eq("user_id", user_id).is_("revoked_at", "null").execute()
     print(f"[stripe] API plan applied: user={user_id} plan={plan} limit={limit}")
 
 
@@ -3911,9 +3940,9 @@ def get_api_plan(authorization: str = Header(None)):
     user = get_user_from_header(authorization)
     db   = get_db()
     plan_info = _get_user_api_plan(db, user["sub"])
-    # Enrich with actual usage from the user's API keys
+    # Enrich with actual usage from the user's active API keys
     keys = db.table("api_keys").select("calls_this_month,limit_per_month")\
-        .eq("user_id", user["sub"]).execute()
+        .eq("user_id", user["sub"]).is_("revoked_at", "null").execute()
     calls = sum((k.get("calls_this_month") or 0) for k in (keys.data or []))
     plan_info["calls_this_month"] = calls
     return plan_info
