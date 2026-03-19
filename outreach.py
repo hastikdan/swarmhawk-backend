@@ -1204,12 +1204,25 @@ async def prospects_stats(authorization: str = Header(None)):
     except Exception:
         pass
 
+    # Count prospects whose scanned_at is today (UTC date)
+    today = datetime.now(timezone.utc).date().isoformat()
+    scanned_today = 0
+    try:
+        today_rows = db.table("outreach_prospects")\
+            .select("id", count="exact")\
+            .gte("scanned_at", today)\
+            .execute()
+        scanned_today = today_rows.count or 0
+    except Exception:
+        pass
+
     return {
-        "countries":  sorted(stats.values(), key=lambda x: x["total"], reverse=True),
-        "last_scan":  last_scan,
-        "total":      sum(s["total"] for s in stats.values()),
-        "source":     "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
-        "scan_limit": SCAN_LIMIT,
+        "countries":     sorted(stats.values(), key=lambda x: x["total"], reverse=True),
+        "last_scan":     last_scan,
+        "scanned_today": scanned_today,
+        "total":         sum(s["total"] for s in stats.values()),
+        "source":        "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
+        "scan_limit":    SCAN_LIMIT,
     }
 
 
