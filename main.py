@@ -4664,53 +4664,68 @@ def competitor_history(competitor_id: str, authorization: str = Header(None)):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# API v2 — Clean Public API (scan + domain data only)
-#
-# All /api/v2/* routes are the documented public developer API.
-# They expose only scan results, domain data, and key management.
-# Admin, outreach/marketing, and user-management endpoints are NOT here.
+# API v2 — Clean Public API
 #
 # Authentication: X-API-Key header OR Authorization: Bearer <session_token>
 # Docs: https://www.swarmhawk.com/docs/api
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ── Scan ──────────────────────────────────────────────────────────────────────
+_v2 = APIRouter(prefix="/api/v2", tags=["API v2"])
 
-app.add_api_route("/api/v2/scan",    api_scan, methods=["POST"],
-    summary="Trigger a domain scan",
-    description="Run a full security scan against a domain. Returns risk score, findings, and AI synthesis.")
+@_v2.post("/scan",    summary="Trigger a domain scan")
+async def v2_scan(request: Request, background_tasks: BackgroundTasks):
+    return await api_scan(request, background_tasks)
 
-# ── Domains ───────────────────────────────────────────────────────────────────
+@_v2.get("/domains",  summary="List domains")
+def v2_list_domains(authorization: str = Header(None)):
+    return list_domains(authorization)
 
-app.add_api_route("/api/v2/domains",            list_domains,  methods=["GET"],
-    summary="List domains")
-app.add_api_route("/api/v2/domains",            add_domain,    methods=["POST"],
-    summary="Add a domain")
-app.add_api_route("/api/v2/domains/{domain_id}",          delete_domain,  methods=["DELETE"],
-    summary="Remove a domain")
-app.add_api_route("/api/v2/domains/{domain_id}/rescan",   rescan_domain,  methods=["POST"],
-    summary="Re-trigger scan for a domain")
-app.add_api_route("/api/v2/domains/{domain_id}/report",   get_report,     methods=["GET"],
-    summary="Get the latest scan report")
-app.add_api_route("/api/v2/domains/{domain_id}/history",  get_domain_history, methods=["GET"],
-    summary="Get historical scan results")
-app.add_api_route("/api/v2/domains/{domain_id}/nis2",     get_nis2_compliance, methods=["GET"],
-    summary="Get NIS2 compliance status")
+@_v2.post("/domains", summary="Add a domain")
+def v2_add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    return add_domain(body, background_tasks, authorization)
 
-# ── API Keys ──────────────────────────────────────────────────────────────────
+@_v2.delete("/domains/{domain_id}", summary="Remove a domain")
+def v2_delete_domain(domain_id: str, authorization: str = Header(None)):
+    return delete_domain(domain_id, authorization)
 
-app.add_api_route("/api/v2/keys",                        create_api_key,    methods=["POST"],
-    summary="Create an API key")
-app.add_api_route("/api/v2/keys",                        list_api_keys,     methods=["GET"],
-    summary="List active API keys and usage")
-app.add_api_route("/api/v2/keys/{key_id}/regenerate",    regenerate_api_key, methods=["POST"],
-    summary="Regenerate an API key")
-app.add_api_route("/api/v2/keys/{key_id}",               revoke_api_key,    methods=["DELETE"],
-    summary="Revoke an API key")
+@_v2.post("/domains/{domain_id}/rescan", summary="Re-trigger scan")
+def v2_rescan_domain(domain_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    return rescan_domain(domain_id, background_tasks, authorization)
 
-# ── Account / Plan ────────────────────────────────────────────────────────────
+@_v2.get("/domains/{domain_id}/report", summary="Get latest scan report")
+def v2_get_report(domain_id: str, authorization: str = Header(None)):
+    return get_report(domain_id, authorization)
 
-app.add_api_route("/api/v2/me",   get_me,       methods=["GET"],
-    summary="Get current user profile")
-app.add_api_route("/api/v2/plan", get_api_plan, methods=["GET"],
-    summary="Get API plan and usage")
+@_v2.get("/domains/{domain_id}/history", summary="Get scan history")
+def v2_get_domain_history(domain_id: str, authorization: str = Header(None)):
+    return get_domain_history(domain_id, authorization)
+
+@_v2.get("/domains/{domain_id}/nis2", summary="Get NIS2 compliance status")
+def v2_get_nis2_compliance(domain_id: str, authorization: str = Header(None)):
+    return get_nis2_compliance(domain_id, authorization)
+
+@_v2.post("/keys", summary="Create an API key")
+def v2_create_api_key(authorization: str = Header(None)):
+    return create_api_key(authorization)
+
+@_v2.get("/keys", summary="List API keys and usage")
+def v2_list_api_keys(authorization: str = Header(None)):
+    return list_api_keys(authorization)
+
+@_v2.post("/keys/{key_id}/regenerate", summary="Regenerate an API key")
+def v2_regenerate_api_key(key_id: str, authorization: str = Header(None)):
+    return regenerate_api_key(key_id, authorization)
+
+@_v2.delete("/keys/{key_id}", summary="Revoke an API key")
+def v2_revoke_api_key(key_id: str, authorization: str = Header(None)):
+    return revoke_api_key(key_id, authorization)
+
+@_v2.get("/me", summary="Get current user profile")
+def v2_get_me(authorization: str = Header(None)):
+    return get_me(authorization)
+
+@_v2.get("/plan", summary="Get API plan and usage")
+def v2_get_api_plan(authorization: str = Header(None)):
+    return get_api_plan(authorization)
+
+app.include_router(_v2)
