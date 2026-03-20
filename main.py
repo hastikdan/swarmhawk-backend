@@ -613,20 +613,6 @@ def health():
     return {"status": "ok", "version": "2.0.0", "scanner": SCANNER_AVAILABLE}
 
 
-@app.get("/debug-config")
-def debug_config():
-    """Temporary: show env var config (no secrets exposed)."""
-    url = SUPABASE_URL or ""
-    key = SUPABASE_KEY or ""
-    return {
-        "url_set": bool(url),
-        "url_preview": url[:30] if url else "",
-        "key_set": bool(key),
-        "key_length": len(key),
-        "key_preview": key[:10] if key else "",
-        "key_suffix": key[-6:] if len(key) > 6 else "",
-    }
-
 
 # ── Email / password auth ─────────────────────────────────────────────────────
 
@@ -4675,3 +4661,56 @@ def competitor_history(competitor_id: str, authorization: str = Header(None)):
     scans = db.table("competitor_scans").select("risk_score,critical,warnings,scanned_at")\
         .eq("competitor_id", competitor_id).order("scanned_at", desc=True).limit(52).execute()
     return {"competitor": c.data[0], "history": scans.data or []}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API v2 — Clean Public API (scan + domain data only)
+#
+# All /api/v2/* routes are the documented public developer API.
+# They expose only scan results, domain data, and key management.
+# Admin, outreach/marketing, and user-management endpoints are NOT here.
+#
+# Authentication: X-API-Key header OR Authorization: Bearer <session_token>
+# Docs: https://www.swarmhawk.com/docs/api
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Scan ──────────────────────────────────────────────────────────────────────
+
+app.add_api_route("/api/v2/scan",    api_scan, methods=["POST"],
+    summary="Trigger a domain scan",
+    description="Run a full security scan against a domain. Returns risk score, findings, and AI synthesis.")
+
+# ── Domains ───────────────────────────────────────────────────────────────────
+
+app.add_api_route("/api/v2/domains",            list_domains,  methods=["GET"],
+    summary="List domains")
+app.add_api_route("/api/v2/domains",            add_domain,    methods=["POST"],
+    summary="Add a domain")
+app.add_api_route("/api/v2/domains/{domain_id}",          delete_domain,  methods=["DELETE"],
+    summary="Remove a domain")
+app.add_api_route("/api/v2/domains/{domain_id}/rescan",   rescan_domain,  methods=["POST"],
+    summary="Re-trigger scan for a domain")
+app.add_api_route("/api/v2/domains/{domain_id}/report",   get_report,     methods=["GET"],
+    summary="Get the latest scan report")
+app.add_api_route("/api/v2/domains/{domain_id}/history",  get_domain_history, methods=["GET"],
+    summary="Get historical scan results")
+app.add_api_route("/api/v2/domains/{domain_id}/nis2",     get_nis2_compliance, methods=["GET"],
+    summary="Get NIS2 compliance status")
+
+# ── API Keys ──────────────────────────────────────────────────────────────────
+
+app.add_api_route("/api/v2/keys",                        create_api_key,    methods=["POST"],
+    summary="Create an API key")
+app.add_api_route("/api/v2/keys",                        list_api_keys,     methods=["GET"],
+    summary="List active API keys and usage")
+app.add_api_route("/api/v2/keys/{key_id}/regenerate",    regenerate_api_key, methods=["POST"],
+    summary="Regenerate an API key")
+app.add_api_route("/api/v2/keys/{key_id}",               revoke_api_key,    methods=["DELETE"],
+    summary="Revoke an API key")
+
+# ── Account / Plan ────────────────────────────────────────────────────────────
+
+app.add_api_route("/api/v2/me",   get_me,       methods=["GET"],
+    summary="Get current user profile")
+app.add_api_route("/api/v2/plan", get_api_plan, methods=["GET"],
+    summary="Get API plan and usage")
