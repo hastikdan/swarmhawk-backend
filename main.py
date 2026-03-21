@@ -3199,8 +3199,23 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
             "last_used_at": datetime.now(timezone.utc).isoformat(),
         }).eq("id", user["id"]).execute()
     elif auth_hdr.startswith("Bearer "):
-        # Session-authenticated dashboard user — no API key needed
+        # Session-authenticated dashboard user
         user = get_user_from_header(auth_hdr)
+        # If this session user also has an API key, enforce the same quota
+        _uid = user.get("sub")
+        if _uid:
+            _key_row = db.table("api_keys").select("id, user_id, calls_this_month, limit_per_month, revoked_at")\
+                .eq("user_id", _uid).is_("revoked_at", "null").execute()
+            if _key_row.data:
+                _kr = _key_row.data[0]
+                _limit = _kr.get("limit_per_month") or 10
+                _used  = _kr.get("calls_this_month") or 0
+                if _used >= _limit:
+                    raise HTTPException(429, f"Monthly API limit reached ({_limit} calls). Upgrade at swarmhawk.com")
+                db.table("api_keys").update({
+                    "calls_this_month": _used + 1,
+                    "last_used_at": datetime.now(timezone.utc).isoformat(),
+                }).eq("id", _kr["id"]).execute()
     else:
         raise HTTPException(401, "Missing X-API-Key header or Authorization token")
 
@@ -3208,6 +3223,9 @@ async def api_scan(request: Request, background_tasks: BackgroundTasks):
     domain  = (body.get("domain") or "").strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
     if not domain or "." not in domain:
         raise HTTPException(400, "Invalid domain")
+    import re as _re
+    if not _re.match(r'^[a-z0-9][a-z0-9\-\.]{1,253}[a-z0-9]$', domain):
+        raise HTTPException(400, "Invalid domain format")
 
     if not SCANNER_AVAILABLE:
         raise HTTPException(503, "Scanner not available on this instance")
