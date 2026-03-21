@@ -219,7 +219,13 @@ def ingest_domains(domains: list[str], source: str, country: Optional[str] = Non
     except Exception:
         existing_sr = set()
 
-    new_domains = [d.lower().strip() for d in domains if d.lower().strip() not in existing_sr]
+    _domain_re = re.compile(r'^[a-z0-9][a-z0-9\-\.]{1,253}[a-z0-9]$')
+    new_domains = [
+        d.lower().strip() for d in domains
+        if d.lower().strip() not in existing_sr
+        and _domain_re.match(d.lower().strip())
+        and "." in d
+    ]
     if not new_domains:
         return 0
 
