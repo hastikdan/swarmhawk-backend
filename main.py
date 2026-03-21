@@ -274,6 +274,19 @@ async def lifespan(app):
         print("✓ Breach Monday scheduler started")
     except Exception as e:
         print(f"Breach Monday scheduler init failed: {e}")
+    # Global domain discovery — daily 01:00 Prague (fills domain_queue from Radar + CT logs)
+    try:
+        from apscheduler.schedulers.background import BackgroundScheduler as _BGS3
+        from pipeline import run_discovery_job, run_pipeline_daily, run_enrichment_weekly
+        _pipeline_scheduler = _BGS3(timezone="Europe/Prague")
+        _pipeline_scheduler.add_job(run_discovery_job,   "cron", hour=1,  minute=0,  id="pipeline_discovery")
+        _pipeline_scheduler.add_job(run_pipeline_daily,  "cron", hour=2,  minute=30, id="pipeline_tier1")
+        _pipeline_scheduler.add_job(run_enrichment_weekly, "cron", day_of_week="sun",
+                                    hour=3, minute=0, id="pipeline_tier2")
+        _pipeline_scheduler.start()
+        print("✓ Pipeline scheduler started (discovery 01:00, Tier1 02:30, Tier2 Sun 03:00)")
+    except Exception as e:
+        print(f"Pipeline scheduler init failed: {e}")
     yield
 
 app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
@@ -4107,14 +4120,9 @@ def _build_map_data() -> dict:
             }
         country_data[cc]["domains"] = max(country_data[cc]["domains"], len(domains))
 
-    # ── Overlay: real scan results from outreach_prospects ─────────────────────
-    try:
-        rows = db.table("outreach_prospects")\
-            .select("domain,country,max_cvss,scanned_at")\
-            .execute()
-
-        scan_counts: dict = {}  # cc -> {domains, scanned, cvss_list}
-        for r in (rows.data or []):
+    # ── Overlay: real scan results — scan_results (primary) + outreach_prospects (fallback) ──
+    def _merge_scan_rows(rows_data, scan_counts):
+        for r in (rows_data or []):
             cc = (r.get("country") or "").upper().strip()
             if not cc or cc in ("EU", "??", ""):
                 cc = tld_to_country(r.get("domain", "unknown.com"))
@@ -4123,32 +4131,52 @@ def _build_map_data() -> dict:
             if cc not in scan_counts:
                 scan_counts[cc] = {"domains": 0, "scanned": 0, "cvss": []}
             scan_counts[cc]["domains"] += 1
-            if r.get("scanned_at"):
+            if r.get("last_scanned_at") or r.get("scanned_at"):
                 scan_counts[cc]["scanned"] += 1
-            if r.get("max_cvss") is not None:
+            cvss_val = r.get("max_cvss")
+            if cvss_val is not None:
                 try:
-                    scan_counts[cc]["cvss"].append(float(r["max_cvss"]))
+                    scan_counts[cc]["cvss"].append(float(cvss_val))
                 except (ValueError, TypeError):
                     pass
 
-        for cc, sc in scan_counts.items():
-            if cc not in country_data:
-                country_data[cc] = {
-                    "country": cc, "domains": 0, "scanned": 0,
-                    "avg_risk": 0, "high_risk_domains": 0, "critical_findings": 0,
-                    "_cvss_sum": 0.0, "_cvss_count": 0,
-                }
-            # Real scan data overrides domain count
-            country_data[cc]["domains"]  = max(country_data[cc]["domains"], sc["domains"])
-            country_data[cc]["scanned"]  = sc["scanned"]
-            if sc["cvss"]:
-                avg_cvss = sum(sc["cvss"]) / len(sc["cvss"])
-                country_data[cc]["avg_risk"]          = round(avg_cvss * 10, 1)
-                country_data[cc]["high_risk_domains"] = sum(1 for s in sc["cvss"] if s >= 7.0)
-                country_data[cc]["critical_findings"] = sum(1 for s in sc["cvss"] if s >= 9.0)
+    scan_counts: dict = {}
 
+    # Primary source: unified scan_results table (all tiers)
+    try:
+        sr_rows = db.table("scan_results")\
+            .select("domain,country,max_cvss,last_scanned_at")\
+            .execute()
+        _merge_scan_rows(sr_rows.data, scan_counts)
+    except Exception as e:
+        print(f"[map] scan_results query failed: {e}")
+
+    # Fallback/supplement: outreach_prospects (for data not yet in scan_results)
+    try:
+        op_rows = db.table("outreach_prospects")\
+            .select("domain,country,max_cvss,scanned_at")\
+            .execute()
+        # Only add domains not already counted from scan_results
+        sr_domains = {r.get("domain") for r in (sr_rows.data if 'sr_rows' in dir() else [])}
+        filtered = [r for r in (op_rows.data or []) if r.get("domain") not in sr_domains]
+        _merge_scan_rows(filtered, scan_counts)
     except Exception as e:
         print(f"[map] outreach_prospects query failed: {e}")
+
+    for cc, sc in scan_counts.items():
+        if cc not in country_data:
+            country_data[cc] = {
+                "country": cc, "domains": 0, "scanned": 0,
+                "avg_risk": 0, "high_risk_domains": 0, "critical_findings": 0,
+                "_cvss_sum": 0.0, "_cvss_count": 0,
+            }
+        country_data[cc]["domains"]  = max(country_data[cc]["domains"], sc["domains"])
+        country_data[cc]["scanned"]  = sc["scanned"]
+        if sc["cvss"]:
+            avg_cvss = sum(sc["cvss"]) / len(sc["cvss"])
+            country_data[cc]["avg_risk"]          = round(avg_cvss * 10, 1)
+            country_data[cc]["high_risk_domains"] = sum(1 for s in sc["cvss"] if s >= 7.0)
+            country_data[cc]["critical_findings"] = sum(1 for s in sc["cvss"] if s >= 9.0)
 
     # Strip internal keys, drop countries with 0 domains
     result = []
@@ -4244,13 +4272,13 @@ def map_country_top_domains(code: str):
         from outreach import get_db as outreach_get_db
         db = outreach_get_db()
 
-        # ── 1. Outreach prospects — fetch ALL scanned rows, filter by country/TLD ──
-        all_prospects = db.table("outreach_prospects")\
-            .select("domain,country,max_cvss,scanned_at")\
-            .not_.is_("scanned_at", "null")\
+        # ── 1. Primary: scan_results (unified pipeline database) ──────────────
+        sr_rows = db.table("scan_results")\
+            .select("domain,country,risk_score,max_cvss,last_scanned_at,scan_tier,source")\
+            .not_.is_("last_scanned_at", "null")\
             .execute()
 
-        for r in (all_prospects.data or []):
+        for r in (sr_rows.data or []):
             dom = r.get("domain", "")
             cc = (r.get("country") or "").upper().strip()
             if not cc or cc in ("EU", "??", ""):
@@ -4260,14 +4288,40 @@ def map_country_top_domains(code: str):
             if dom in seen:
                 continue
             seen.add(dom)
+            risk_score = r.get("risk_score") or 0
+            domain_rows.append({
+                "domain":     dom,
+                "risk_score": risk_score,
+                "scanned_at": fmt_date(r.get("last_scanned_at")),
+                "max_cvss":   round(float(r.get("max_cvss") or 0), 1),
+                "source":     r.get("source") or "pipeline",
+                "tier":       r.get("scan_tier", 1),
+            })
+
+        # ── 2. Supplement: outreach_prospects (domains not yet in scan_results) ──
+        all_prospects = db.table("outreach_prospects")\
+            .select("domain,country,max_cvss,scanned_at")\
+            .not_.is_("scanned_at", "null")\
+            .execute()
+
+        for r in (all_prospects.data or []):
+            dom = r.get("domain", "")
+            if dom in seen:
+                continue
+            cc = (r.get("country") or "").upper().strip()
+            if not cc or cc in ("EU", "??", ""):
+                cc = tld_to_country(dom)
+            if cc != code:
+                continue
+            seen.add(dom)
             cvss = r.get("max_cvss") or 0
             risk_score = min(100, int(round(cvss * 10)))
             domain_rows.append({
-                "domain": dom,
+                "domain":     dom,
                 "risk_score": risk_score,
                 "scanned_at": fmt_date(r.get("scanned_at")),
-                "max_cvss": round(cvss, 1),
-                "source": "outreach",
+                "max_cvss":   round(cvss, 1),
+                "source":     "outreach",
             })
 
         # Sort by risk_score desc, limit 100
@@ -4288,6 +4342,59 @@ def map_country_top_domains(code: str):
         summary = {"error": str(exc)}
 
     return {"country": code, "domains": domain_rows, "total": len(domain_rows), "summary": summary}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GLOBAL PIPELINE — status and admin endpoints
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/pipeline/status")
+def pipeline_status():
+    """Public: live statistics for the global domain security pipeline."""
+    try:
+        from pipeline import get_pipeline_status
+        return get_pipeline_status()
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/pipeline/run-discovery")
+def pipeline_run_discovery(authorization: str = Header(None)):
+    """Admin: manually trigger global domain discovery (Cloudflare Radar + CT logs)."""
+    require_admin(authorization)
+    try:
+        from pipeline import run_discovery_job
+        import threading
+        threading.Thread(target=run_discovery_job, daemon=True).start()
+        return {"status": "discovery started"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/pipeline/run-tier1")
+def pipeline_run_tier1(authorization: str = Header(None)):
+    """Admin: manually trigger Tier 1 batch scan of queued domains."""
+    require_admin(authorization)
+    try:
+        from pipeline import run_pipeline_daily
+        import threading
+        threading.Thread(target=run_pipeline_daily, daemon=True).start()
+        return {"status": "tier1 batch started"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/pipeline/run-tier2")
+def pipeline_run_tier2(authorization: str = Header(None)):
+    """Admin: manually trigger weekly Tier 2 enrichment scan."""
+    require_admin(authorization)
+    try:
+        from pipeline import run_enrichment_weekly
+        import threading
+        threading.Thread(target=run_enrichment_weekly, daemon=True).start()
+        return {"status": "tier2 enrichment started"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -745,6 +745,12 @@ def _run_scan_job():
                         else:
                             email_body = _fallback_email(result)
                         upsert_prospect(result, email_body, db=db)
+                        # Dual-write to unified scan_results (Phase 1 pipeline)
+                        try:
+                            from pipeline import upsert_scan_result
+                            upsert_scan_result({**result, "email_body": email_body, "source": "outreach"}, db=db)
+                        except Exception:
+                            pass
                         found += 1
                         _scan_progress["found"]  += 1
                         _scan_progress["country_stats"][country]["found"] += 1
