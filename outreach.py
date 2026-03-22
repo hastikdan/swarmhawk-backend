@@ -461,12 +461,28 @@ def detect_software(domain: str) -> list[dict]:
     return found
 
 
+# Module-level NVD response cache — keyed by "product:version", TTL 24h.
+# Eliminates repeated API calls for the same software across thousands of domains.
+_NVD_CACHE: dict = {}
+_NVD_CACHE_TTL = 86400  # seconds
+
+
 def query_nvd(product: str, version: str) -> list[dict]:
+    """Query NVD for CVEs matching product+version.
+
+    Results are cached in-memory for 24h.  The same nginx/1.14 across 10,000
+    domains produces exactly one NVD API call instead of 10,000.
+    """
+    cache_key = f"{product}:{version}"
+    entry = _NVD_CACHE.get(cache_key)
+    if entry and (time.time() - entry["ts"]) < _NVD_CACHE_TTL:
+        return entry["data"]
+
     NVD = "https://services.nvd.nist.gov/rest/json/cves/2.0"
     KW  = {"nginx": "nginx", "Apache": "apache http server", "PHP": "php",
             "WordPress": "wordpress", "Drupal": "drupal", "IIS": "microsoft iis"}
     kw  = KW.get(product, product.lower())
-    time.sleep(0.5)
+    time.sleep(0.5)   # NVD rate limit (5 req/30s without API key)
     try:
         r = req.get(NVD, params={
             "keywordSearch": f"{kw} {version}",
@@ -486,8 +502,11 @@ def query_nvd(product: str, version: str) -> list[dict]:
                 score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
             if score:
                 cves.append({"id": cve["id"], "cvss": score, "product": product, "version": version})
-        return sorted(cves, key=lambda x: x["cvss"], reverse=True)
+        result = sorted(cves, key=lambda x: x["cvss"], reverse=True)
+        _NVD_CACHE[cache_key] = {"data": result, "ts": time.time()}
+        return result
     except Exception:
+        _NVD_CACHE[cache_key] = {"data": [], "ts": time.time()}
         return []
 
 

@@ -30,7 +30,7 @@ Over time: scan_results grows into world's largest domain security database.
 Every domain ever discovered gets weekly vulnerability tracking.
 """
 
-import os, re, json, time, logging, io, zipfile
+import os, re, json, time, logging, io, zipfile, socket
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -106,11 +106,13 @@ def infer_country(domain: str) -> str:
     return TLD_COUNTRY.get(extract_tld(domain), "GLOBAL")
 
 
-def compute_unified_risk(max_cvss: float, checks: list, software: list) -> int:
+def compute_unified_risk(max_cvss: float, checks: list, software: list,
+                         enrichment: Optional[dict] = None) -> int:
     """Unified 0-100 risk score across both scan tiers.
 
-    Tier 1 (no checks list): score from CVE + software only.
-    Tier 2 (full checks): adds penalty from check results.
+    Tier 1 (no checks list): score from CVE + software + enrichment penalties.
+    Tier 2 (full checks): adds penalty from all 22 check results.
+    Enrichment penalties: missing DMARC/SPF, blacklisted, new domain, bad IP.
     """
     cve_score = min(60, int(max_cvss * 6))
     check_score = 0
@@ -119,7 +121,29 @@ def compute_unified_risk(max_cvss: float, checks: list, software: list) -> int:
         warnings = sum(1 for c in checks if c.get("status") == "warning")
         check_score = min(20, critical * 5 + warnings * 2)
     sw_score = min(20, len(software) * 5) if software else 0
-    return min(100, cve_score + check_score + sw_score)
+    enrich_score = 0
+    if enrichment:
+        try:
+            from enrichment import enrichment_risk_penalty
+            enrich_score = min(30, max(-10, enrichment_risk_penalty(enrichment)))
+        except Exception:
+            pass
+    return min(100, max(0, cve_score + check_score + sw_score + enrich_score))
+
+
+def _is_domain_reachable(domain: str, timeout: float = 3.0) -> bool:
+    """Quick TCP reachability check on port 443 (fallback 80).
+
+    Eliminates dead/parked domains before wasting a full scan slot.
+    A 10s HTTP timeout × 600 dead domains = 100 minutes saved per batch.
+    """
+    for port in (443, 80):
+        try:
+            with socket.create_connection((domain, port), timeout=timeout):
+                return True
+        except (socket.timeout, socket.error, OSError):
+            continue
+    return False
 
 
 # ── Database I/O ─────────────────────────────────────────────────────────────
@@ -149,10 +173,11 @@ def upsert_scan_result(result: dict, db=None):
     tier     = result.get("scan_tier", 1)
     next_scan = (datetime.now(timezone.utc) + timedelta(days=TIER_RESCAN_DAYS[tier])).isoformat()
 
-    checks   = result.get("checks") or []
-    software = result.get("software") or []
-    cves     = result.get("cves") or []
-    risk     = result.get("risk_score") or compute_unified_risk(max_cvss, checks, software)
+    checks     = result.get("checks") or []
+    software   = result.get("software") or []
+    cves       = result.get("cves") or []
+    enrichment = result.get("enrichment") or {}
+    risk       = result.get("risk_score") or compute_unified_risk(max_cvss, checks, software, enrichment)
 
     if max_cvss >= 9:       priority = "CRITICAL"
     elif max_cvss >= 7:     priority = "HIGH"
@@ -161,22 +186,33 @@ def upsert_scan_result(result: dict, db=None):
     else:                   priority = "INFO"
 
     scan_data = {
-        "tld":             tld,
-        "country":         country,
-        "risk_score":      risk,
-        "critical":        result.get("critical", 0),
-        "warnings":        result.get("warnings", 0),
-        "checks":          json.dumps(checks),
-        "software":        json.dumps(software),
-        "cves":            json.dumps(cves[:10]),
-        "max_cvss":        max_cvss,
-        "scan_tier":       tier,
-        "source":          result.get("source", "unknown"),
-        "contact_email":   result.get("contact_email") or "",
-        "contact_emails":  json.dumps(result.get("contact_emails") or []),
-        "priority":        priority,
-        "last_scanned_at": now,
-        "next_scan_at":    next_scan,
+        "tld":              tld,
+        "country":          country,
+        "risk_score":       risk,
+        "critical":         result.get("critical", 0),
+        "warnings":         result.get("warnings", 0),
+        "checks":           json.dumps(checks),
+        "software":         json.dumps(software),
+        "cves":             json.dumps(cves[:10]),
+        "max_cvss":         max_cvss,
+        "scan_tier":        tier,
+        "source":           result.get("source", "unknown"),
+        "contact_email":    result.get("contact_email") or "",
+        "contact_emails":   json.dumps(result.get("contact_emails") or []),
+        "priority":         priority,
+        "last_scanned_at":  now,
+        "next_scan_at":     next_scan,
+        # Enrichment columns (populated by Tier 1.5 fast enrichment)
+        "spf_status":       enrichment.get("spf_status")      or result.get("spf_status"),
+        "dmarc_status":     enrichment.get("dmarc_status")    or result.get("dmarc_status"),
+        "dkim_status":      enrichment.get("dkim_status")     or result.get("dkim_status"),
+        "domain_age_days":  enrichment.get("domain_age_days") or result.get("domain_age_days"),
+        "registrar":        enrichment.get("registrar")       or result.get("registrar"),
+        "blacklisted":      enrichment.get("blacklisted",     result.get("blacklisted", False)),
+        "blacklist_hits":   json.dumps(enrichment.get("blacklist_hits") or result.get("blacklist_hits") or []),
+        "urlhaus_status":   enrichment.get("urlhaus_status")  or result.get("urlhaus_status"),
+        "ip_reputation":    enrichment.get("ip_reputation")   or result.get("ip_reputation"),
+        "waf_detected":     enrichment.get("waf_detected",    result.get("waf_detected", False)),
     }
 
     try:
@@ -457,7 +493,19 @@ def fetch_majestic_million(limit: int = BULK_LIMIT) -> list[str]:
 # ── Scan workers ──────────────────────────────────────────────────────────────
 
 def _tier1_scan_one(domain: str, country: str, source: str) -> Optional[dict]:
-    """Run Tier 1 passive scan on a single domain. Returns result dict or None."""
+    """Run Tier 1 passive scan + Tier 1.5 fast enrichment on a single domain.
+
+    Steps:
+    1. Reachability check (3s TCP) — skip dead domains immediately
+    2. Passive scan: software detection + NVD CVE lookup (cached)
+    3. Fast enrichment: SPF/DMARC, WHOIS age, Spamhaus, URLhaus, IP intel (parallel)
+    4. Compute unified risk score including enrichment penalties
+    """
+    # Step 1: Dead domain pre-filter — skip 10s HTTP timeout for unreachable hosts
+    if not _is_domain_reachable(domain):
+        log.debug(f"[tier1] {domain}: unreachable — skipping")
+        return None
+
     try:
         from outreach import scan_domain_passive
         result = scan_domain_passive(domain, country)
@@ -465,8 +513,18 @@ def _tier1_scan_one(domain: str, country: str, source: str) -> Optional[dict]:
             return None
         result["scan_tier"] = 1
         result["source"]    = source
+
+        # Step 3: Fast enrichment in parallel with no extra wait
+        try:
+            from enrichment import run_fast_enrichment
+            enrichment = run_fast_enrichment(domain)
+            result["enrichment"] = enrichment
+        except Exception as e:
+            log.debug(f"[tier1] {domain} enrichment failed: {e}")
+            enrichment = {}
+
         result["risk_score"] = compute_unified_risk(
-            result.get("max_cvss", 0), [], result.get("software") or []
+            result.get("max_cvss", 0), [], result.get("software") or [], enrichment
         )
         return result
     except Exception as e:
@@ -559,6 +617,34 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
 
     if not queue:
         log.info("[tier1_batch] all queued domains already scanned")
+        return 0
+
+    # Pre-filter dead domains with fast TCP check (3s vs 10s HTTP timeout)
+    # Runs at 2× workers since socket checks are near-zero CPU
+    reachable_queue = []
+    dead_ids = []
+    with ThreadPoolExecutor(max_workers=min(PIPELINE_WORKERS * 2, 200)) as ex:
+        reach_futures = {ex.submit(_is_domain_reachable, row["domain"]): row for row in queue}
+        for fut in as_completed(reach_futures):
+            row = reach_futures[fut]
+            try:
+                if fut.result():
+                    reachable_queue.append(row)
+                else:
+                    dead_ids.append(row["id"])
+            except Exception:
+                reachable_queue.append(row)  # on error assume reachable
+
+    if dead_ids:
+        try:
+            db.table("domain_queue").delete().in_("id", dead_ids).execute()
+        except Exception:
+            pass
+        log.info(f"[tier1_batch] pre-filter: {len(dead_ids)} dead domains removed, "
+                 f"{len(reachable_queue)} reachable queued")
+    queue = reachable_queue
+    if not queue:
+        log.info("[tier1_batch] no reachable domains in batch")
         return 0
 
     log.info(f"[tier1_batch] processing {len(queue)} domains with {PIPELINE_WORKERS} workers")
