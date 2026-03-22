@@ -1234,42 +1234,95 @@ async def prospects_stats(authorization: str = Header(None)):
 
 @router.get("/prospects")
 async def list_prospects(
-    status:      str   = "pending",
-    country:     str   = "",
-    min_cvss:    float = 0,
-    limit:       int   = 200,
-    authorization: str = Header(None),
+    status:        str   = "pending",
+    country:       str   = "",
+    min_cvss:      float = 0,
+    limit:         int   = 200,
+    authorization: str   = Header(None),
 ):
-    """List prospects sorted by CVSS. Filter by status/country/min_cvss."""
+    """List prospects sorted by CVSS. Reads scan_results as primary source,
+    supplements with outreach_prospects for legacy data not yet in scan_results."""
     require_admin(authorization)
     db = get_db()
-    q  = db.table("outreach_prospects").select("*")
-    if status != "all":
-        q = q.eq("status", status)
-    if country:
-        q = q.eq("country", country)
-    if min_cvss > 0:
-        q = q.gte("max_cvss", min_cvss)
-    result = q.order("max_cvss", desc=True).limit(limit).execute()
-
     rows = []
-    for r in (result.data or []):
-        rows.append({
-            **r,
-            "software": json.loads(r["software"]) if isinstance(r["software"], str) else (r["software"] or []),
-            "cves":     json.loads(r["cves"]) if isinstance(r["cves"], str) else (r["cves"] or []),
-        })
-    return {"prospects": rows, "total": len(rows)}
+
+    # ── Primary: scan_results (pipeline data) ────────────────────────────────
+    try:
+        q = db.table("scan_results").select("*")
+        if status != "all":
+            q = q.eq("outreach_status", status)
+        else:
+            q = q.not_.is_("outreach_status", "null")
+        if country:
+            q = q.eq("country", country)
+        if min_cvss > 0:
+            q = q.gte("max_cvss", min_cvss)
+        sr_result = q.order("max_cvss", desc=True).limit(limit).execute()
+        sr_domains: set[str] = set()
+        for r in (sr_result.data or []):
+            sr_domains.add(r["domain"])
+            rows.append({
+                **r,
+                "status":   r.get("outreach_status"),   # normalise field name
+                "software": json.loads(r["software"]) if isinstance(r["software"], str) else (r["software"] or []),
+                "cves":     json.loads(r["cves"])     if isinstance(r["cves"],     str) else (r["cves"]     or []),
+                "_source":  "scan_results",
+            })
+    except Exception as e:
+        log.warning(f"[prospects] scan_results query failed: {e}")
+        sr_domains = set()
+
+    # ── Supplement: outreach_prospects (legacy, not yet in scan_results) ─────
+    remaining = limit - len(rows)
+    if remaining > 0:
+        try:
+            q2 = db.table("outreach_prospects").select("*")
+            if status != "all":
+                q2 = q2.eq("status", status)
+            if country:
+                q2 = q2.eq("country", country)
+            if min_cvss > 0:
+                q2 = q2.gte("max_cvss", min_cvss)
+            op_result = q2.order("max_cvss", desc=True).limit(remaining + len(sr_domains)).execute()
+            for r in (op_result.data or []):
+                if r["domain"] not in sr_domains:
+                    rows.append({
+                        **r,
+                        "software": json.loads(r["software"]) if isinstance(r["software"], str) else (r["software"] or []),
+                        "cves":     json.loads(r["cves"])     if isinstance(r["cves"],     str) else (r["cves"]     or []),
+                        "_source":  "outreach_prospects",
+                    })
+                    if len(rows) >= limit:
+                        break
+        except Exception as e:
+            log.warning(f"[prospects] outreach_prospects fallback failed: {e}")
+
+    rows.sort(key=lambda r: float(r.get("max_cvss") or 0), reverse=True)
+    return {"prospects": rows[:limit], "total": len(rows[:limit])}
+
+
+def _prospect_update(db, prospect_id: str, sr_data: dict, op_data: dict):
+    """Update prospect by id — tries scan_results first, falls back to outreach_prospects."""
+    try:
+        res = db.table("scan_results").update(sr_data).eq("id", prospect_id).execute()
+        if res.data:
+            return
+    except Exception:
+        pass
+    try:
+        db.table("outreach_prospects").update(op_data).eq("id", prospect_id).execute()
+    except Exception:
+        pass
 
 
 @router.patch("/prospects/{prospect_id}/email")
 async def update_email(prospect_id: str, body: EmailUpdate, authorization: str = Header(None)):
     require_admin(authorization)
     db = get_db()
-    db.table("outreach_prospects").update({
-        "email_body": body.email_body,
-        "edited":     True,
-    }).eq("id", prospect_id).execute()
+    _prospect_update(db, prospect_id,
+        sr_data={"email_body": body.email_body, "edited": True},
+        op_data={"email_body": body.email_body, "edited": True},
+    )
     return {"status": "saved"}
 
 
@@ -1281,7 +1334,10 @@ async def update_contact(prospect_id: str, body: dict, authorization: str = Head
     if not email or "@" not in email:
         raise HTTPException(400, "Invalid email")
     db = get_db()
-    db.table("outreach_prospects").update({"contact_email": email}).eq("id", prospect_id).execute()
+    _prospect_update(db, prospect_id,
+        sr_data={"contact_email": email},
+        op_data={"contact_email": email},
+    )
     return {"status": "saved", "contact_email": email}
 
 
@@ -1289,7 +1345,11 @@ async def update_contact(prospect_id: str, body: dict, authorization: str = Head
 async def approve_prospect(prospect_id: str, authorization: str = Header(None)):
     require_admin(authorization)
     db = get_db()
-    db.table("outreach_prospects").update({"status": "approved"}).eq("id", prospect_id).execute()
+    now = datetime.now(timezone.utc).isoformat()
+    _prospect_update(db, prospect_id,
+        sr_data={"outreach_status": "approved", "approved_at": now},
+        op_data={"status": "approved", "approved_at": now},
+    )
     return {"status": "approved"}
 
 
@@ -1297,7 +1357,10 @@ async def approve_prospect(prospect_id: str, authorization: str = Header(None)):
 async def skip_prospect(prospect_id: str, authorization: str = Header(None)):
     require_admin(authorization)
     db = get_db()
-    db.table("outreach_prospects").update({"status": "skipped"}).eq("id", prospect_id).execute()
+    _prospect_update(db, prospect_id,
+        sr_data={"outreach_status": "skipped"},
+        op_data={"status": "skipped"},
+    )
     return {"status": "skipped"}
 
 
@@ -1305,7 +1368,10 @@ async def skip_prospect(prospect_id: str, authorization: str = Header(None)):
 async def unapprove_prospect(prospect_id: str, authorization: str = Header(None)):
     require_admin(authorization)
     db = get_db()
-    db.table("outreach_prospects").update({"status": "pending"}).eq("id", prospect_id).execute()
+    _prospect_update(db, prospect_id,
+        sr_data={"outreach_status": "pending"},
+        op_data={"status": "pending"},
+    )
     return {"status": "pending"}
 
 
@@ -1313,8 +1379,12 @@ async def unapprove_prospect(prospect_id: str, authorization: str = Header(None)
 async def bulk_approve(body: BulkApprove, authorization: str = Header(None)):
     require_admin(authorization)
     db = get_db()
+    now = datetime.now(timezone.utc).isoformat()
     for pid in body.ids:
-        db.table("outreach_prospects").update({"status": "approved"}).eq("id", pid).execute()
+        _prospect_update(db, pid,
+            sr_data={"outreach_status": "approved", "approved_at": now},
+            op_data={"status": "approved", "approved_at": now},
+        )
     return {"approved": len(body.ids)}
 
 

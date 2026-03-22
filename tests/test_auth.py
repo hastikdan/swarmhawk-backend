@@ -95,7 +95,8 @@ def test_is_admin_false_no_admin_email(db_mock):
     ("GET",   "/admin/portkey/usage",   None),
     ("POST",  "/pipeline/run-discovery",None),
     ("POST",  "/pipeline/run-tier1",    None),
-    ("POST",  "/pipeline/run-tier2",    None),
+    ("POST",  "/pipeline/run-tier2",         None),
+    ("POST",  "/pipeline/run-bulk-discovery",None),
 ])
 def test_protected_endpoints_require_auth(client, method, path, body):
     kwargs = {"json": body} if body else {}
@@ -112,6 +113,7 @@ def test_protected_endpoints_require_auth(client, method, path, body):
     ("POST", "/pipeline/run-discovery"),
     ("POST", "/pipeline/run-tier1"),
     ("POST", "/pipeline/run-tier2"),
+    ("POST", "/pipeline/run-bulk-discovery"),
 ])
 def test_admin_endpoints_reject_regular_users(client, user_token, method, path):
     r = client.request(method, path, headers={"Authorization": user_token})

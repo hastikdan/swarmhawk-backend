@@ -6,19 +6,23 @@ Architecture:
   1. Discovery (daily 01:00 Prague)
        Cloudflare Radar — top-N domains per country, ALL ~60 countries
        Certificate Transparency logs — crt.sh, newly issued certs
-       Umbrella/Tranco — top-1M filtered by TLD (weekly)
+       Majestic Million — top-1M by referring subnets (daily)
        → New domains inserted into domain_queue
 
-  2. Tier 1 scan (daily 02:00 Prague, immediately after discovery)
+  2. Bulk Discovery (weekly, Saturday 00:00 Prague)
+       Tranco top-1M list (research-grade, deduplicated)
+       Cisco Umbrella top-1M (DNS-query ranked)
+       → ~2M+ new domains per week ingested into domain_queue
+
+  3. Tier 1 scan (every 4 hours, 50 parallel workers)
        Process domain_queue: software detection + NVD CVE lookup (2 checks)
-       50 parallel workers
        → Results upserted into scan_results
        → Domains with CVSS >= threshold also written to outreach_prospects (dual-write)
 
-  3. Tier 2 enrichment (weekly, Sunday 03:00 Prague)
+  4. Tier 2 enrichment (weekly, Sunday 03:00 Prague)
        Pick oldest last_scanned_at domains from scan_results
        Run full 22-check scan_domain() engine on each
-       5000 domains per run, 50 parallel workers
+       2000 domains per run, 50 parallel workers
        → Update scan_results in-place (risk_score, checks, critical, warnings)
        → Preserve outreach_status (never reset approved/sent)
 
@@ -26,7 +30,7 @@ Over time: scan_results grows into world's largest domain security database.
 Every domain ever discovered gets weekly vulnerability tracking.
 """
 
-import os, re, json, time, logging
+import os, re, json, time, logging, io, zipfile
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -38,10 +42,11 @@ log = logging.getLogger(__name__)
 # ── Config ────────────────────────────────────────────────────────────────────
 CLOUDFLARE_TOKEN      = os.getenv("CLOUDFLARE_API_TOKEN", "")
 PIPELINE_WORKERS      = int(os.getenv("PIPELINE_WORKERS", "50"))
-TIER1_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER1_BATCH", "500"))
+TIER1_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER1_BATCH", "2000"))   # 4× increase from Phase 1
 TIER2_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER2_BATCH", "2000"))
-RADAR_LIMIT           = int(os.getenv("PIPELINE_RADAR_LIMIT", "100"))   # per country
-CT_LIMIT              = int(os.getenv("PIPELINE_CT_LIMIT", "500"))
+RADAR_LIMIT           = int(os.getenv("PIPELINE_RADAR_LIMIT", "200"))    # 2× from Phase 1
+CT_LIMIT              = int(os.getenv("PIPELINE_CT_LIMIT", "1000"))
+BULK_LIMIT            = int(os.getenv("PIPELINE_BULK_LIMIT", "250000"))  # domains per bulk source
 CVSS_THRESHOLD        = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
 TIMEOUT               = 15
 UA                    = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Pipeline/1.0)"}
@@ -200,63 +205,69 @@ def upsert_scan_result(result: dict, db=None):
         log.warning(f"[pipeline] upsert_scan_result failed for {domain}: {e}")
 
 
-def ingest_domains(domains: list[str], source: str, country: Optional[str] = None, db=None):
+def ingest_domains(domains: list[str], source: str, country: Optional[str] = None,
+                   db=None, skip_scan_check: bool = False):
     """Bulk-insert new domains into domain_queue.
 
-    Skips domains already present in scan_results or domain_queue.
+    For small lists (radar, ct_logs): checks scan_results to avoid re-queuing.
+    For large lists (tranco, umbrella, majestic): pass skip_scan_check=True to
+    skip the expensive lookup and rely on DB-level ON CONFLICT dedup instead.
+    run_tier1_batch will skip domains already in scan_results before scanning.
+
     Returns count of newly queued domains.
     """
     db = db or _get_db()
     if not domains:
         return 0
 
-    # Fetch existing domains from scan_results to avoid re-queuing
-    try:
-        existing_sr = {
-            r["domain"] for r in
-            db.table("scan_results").select("domain").in_("domain", domains).execute().data or []
-        }
-    except Exception:
-        existing_sr = set()
-
     _domain_re = re.compile(r'^[a-z0-9][a-z0-9\-\.]{1,253}[a-z0-9]$')
+
+    # Normalise and deduplicate input first
     seen: set[str] = set()
-    new_domains = []
+    clean: list[str] = []
     for d in domains:
         d = d.lower().strip()
-        if d and d not in existing_sr and d not in seen and _domain_re.match(d) and "." in d:
+        if d and d not in seen and _domain_re.match(d) and "." in d:
             seen.add(d)
-            new_domains.append(d)
+            clean.append(d)
+    if not clean:
+        return 0
+
+    # Check scan_results in chunks of 500 to avoid massive IN clauses
+    existing_sr: set[str] = set()
+    if not skip_scan_check:
+        for i in range(0, len(clean), 500):
+            chunk = clean[i:i + 500]
+            try:
+                rows = db.table("scan_results").select("domain").in_("domain", chunk).execute().data or []
+                existing_sr.update(r["domain"] for r in rows)
+            except Exception:
+                pass
+
+    new_domains = [d for d in clean if d not in existing_sr]
     if not new_domains:
         return 0
+
+    PRIORITY = {"radar": 3, "ct_logs": 3, "tranco": 4, "majestic": 4, "umbrella": 5}
+    priority = PRIORITY.get(source, 5)
 
     rows = []
     for d in new_domains:
         cc = country or infer_country(d)
-        rows.append({
-            "domain":   d,
-            "country":  cc,
-            "source":   source,
-            "priority": 3 if source == "radar" else 5,
-        })
+        rows.append({"domain": d, "country": cc, "source": source, "priority": priority})
 
-    # Batch upsert — ignore conflicts (domain already queued)
-    try:
-        db.table("domain_queue").upsert(rows, on_conflict="domain", ignore_duplicates=True).execute()
-    except Exception as e:
-        log.warning(f"[pipeline] ingest_domains bulk upsert failed: {e}")
-        # Fall back to individual inserts
-        queued = 0
-        for row in rows:
-            try:
-                db.table("domain_queue").insert(row).execute()
-                queued += 1
-            except Exception:
-                pass
-        return queued
+    # Upsert in batches of 1000 — ON CONFLICT (domain) DO NOTHING
+    inserted = 0
+    for i in range(0, len(rows), 1000):
+        batch = rows[i:i + 1000]
+        try:
+            db.table("domain_queue").upsert(batch, on_conflict="domain", ignore_duplicates=True).execute()
+            inserted += len(batch)
+        except Exception as e:
+            log.warning(f"[pipeline] ingest_domains batch upsert failed (source={source}): {e}")
 
-    log.info(f"[pipeline] ingest_domains: queued {len(new_domains)} new domains (source={source})")
-    return len(new_domains)
+    log.info(f"[pipeline] ingest_domains: queued {inserted:,} domains (source={source})")
+    return inserted
 
 
 # ── Discovery sources ─────────────────────────────────────────────────────────
@@ -314,7 +325,8 @@ def fetch_ct_logs_recent(tlds: list[str] | None = None, limit: int = CT_LIMIT) -
     Covers newly registered domains that appear in certificate transparency logs.
     """
     if tlds is None:
-        tlds = ["com", "net", "org", "io", "ai"]  # gTLDs with highest new registration volume
+        # gTLDs with high registration volume + key ccTLDs
+        tlds = ["com", "net", "org", "io", "ai", "de", "uk", "fr", "pl", "cz"]
 
     domains: set[str] = set()
     domain_re = re.compile(r'^[a-z0-9][a-z0-9\-\.]{1,253}[a-z0-9]$')
@@ -348,6 +360,98 @@ def fetch_ct_logs_recent(tlds: list[str] | None = None, limit: int = CT_LIMIT) -
     result = list(domains)[:limit]
     log.info(f"[ct_logs] fetched {len(result)} new domains from CT logs")
     return result
+
+
+def fetch_tranco_top1m(limit: int = BULK_LIMIT) -> list[str]:
+    """Download the Tranco top-1M domain list (research-grade, de-noised).
+
+    ~50MB zipped CSV. Returns up to `limit` domain names.
+    Published weekly at https://tranco-list.eu/
+    """
+    try:
+        r = req.get(
+            "https://tranco-list.eu/top-1m.csv.zip",
+            headers=UA, timeout=120,
+        )
+        if r.status_code != 200:
+            log.warning(f"[tranco] HTTP {r.status_code}")
+            return []
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            name = z.namelist()[0]
+            with z.open(name) as f:
+                lines = f.read().decode(errors="ignore").splitlines()
+        domains = []
+        for line in lines[:limit]:
+            parts = line.split(",")
+            if len(parts) >= 2:
+                d = parts[1].strip().lower()
+                if d:
+                    domains.append(d)
+        log.info(f"[tranco] fetched {len(domains):,} domains")
+        return domains
+    except Exception as e:
+        log.warning(f"[tranco] failed: {e}")
+        return []
+
+
+def fetch_umbrella_top1m(limit: int = BULK_LIMIT) -> list[str]:
+    """Download Cisco Umbrella top-1M (DNS-query ranked) domain list.
+
+    ~30MB zipped CSV. Returns up to `limit` domain names.
+    """
+    try:
+        r = req.get(
+            "http://s3-us-west-1.amazonaws.com/umbrella-static/top-1m.csv.zip",
+            headers=UA, timeout=120,
+        )
+        if r.status_code != 200:
+            log.warning(f"[umbrella] HTTP {r.status_code}")
+            return []
+        with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+            name = z.namelist()[0]
+            with z.open(name) as f:
+                lines = f.read().decode(errors="ignore").splitlines()
+        domains = []
+        for line in lines[:limit]:
+            parts = line.split(",")
+            if len(parts) >= 2:
+                d = parts[1].strip().lower()
+                if d:
+                    domains.append(d)
+        log.info(f"[umbrella] fetched {len(domains):,} domains")
+        return domains
+    except Exception as e:
+        log.warning(f"[umbrella] failed: {e}")
+        return []
+
+
+def fetch_majestic_million(limit: int = BULK_LIMIT) -> list[str]:
+    """Download Majestic Million (ranked by referring subnets) domain list.
+
+    CSV with header. Domain is in column index 2 (GlobalRank,TldRank,Domain,...).
+    Updated daily.
+    """
+    try:
+        r = req.get(
+            "https://downloads.majestic.com/majestic_million.csv",
+            headers=UA, timeout=60,
+        )
+        if r.status_code != 200:
+            log.warning(f"[majestic] HTTP {r.status_code}")
+            return []
+        lines = r.text.splitlines()[1:]  # skip header
+        domains = []
+        for line in lines[:limit]:
+            parts = line.split(",")
+            if len(parts) >= 3:
+                d = parts[2].strip().lower()
+                if d:
+                    domains.append(d)
+        log.info(f"[majestic] fetched {len(domains):,} domains")
+        return domains
+    except Exception as e:
+        log.warning(f"[majestic] failed: {e}")
+        return []
 
 
 # ── Scan workers ──────────────────────────────────────────────────────────────
@@ -432,6 +536,29 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
 
     if not queue:
         log.info("[tier1_batch] queue is empty")
+        return 0
+
+    # Discard domains already in scan_results — Tier 2 will handle re-enrichment
+    domain_list = [row["domain"] for row in queue]
+    already_scanned: set[str] = set()
+    for i in range(0, len(domain_list), 500):
+        chunk = domain_list[i:i + 500]
+        try:
+            rows = db.table("scan_results").select("domain").in_("domain", chunk).execute().data or []
+            already_scanned.update(r["domain"] for r in rows)
+        except Exception:
+            pass
+    if already_scanned:
+        stale_ids = [r["id"] for r in queue if r["domain"] in already_scanned]
+        try:
+            db.table("domain_queue").delete().in_("id", stale_ids).execute()
+        except Exception:
+            pass
+        queue = [r for r in queue if r["domain"] not in already_scanned]
+        log.info(f"[tier1_batch] skipped {len(stale_ids)} already-scanned domains")
+
+    if not queue:
+        log.info("[tier1_batch] all queued domains already scanned")
         return 0
 
     log.info(f"[tier1_batch] processing {len(queue)} domains with {PIPELINE_WORKERS} workers")
@@ -538,18 +665,16 @@ def _dual_write_outreach(result: dict, db):
 def run_discovery_job():
     """Daily discovery job (01:00 Prague).
 
-    1. Fetch top-N domains per country from Cloudflare Radar (all ~60 countries)
-    2. Fetch recently issued certs from CT logs
-    3. Ingest new domains into domain_queue
+    Sources: Cloudflare Radar (all countries), CT logs, Majestic Million (daily).
+    Bulk sources (Tranco, Umbrella) run separately on Saturdays via run_bulk_discovery_job().
     """
-    log.info("[discovery] starting global domain discovery")
+    log.info("[discovery] starting daily domain discovery")
     db = _get_db()
     total_queued = 0
 
     # ── Source 1: Cloudflare Radar (primary, country-aware) ─────────────────
     radar_results = fetch_radar_global(limit_per_country=RADAR_LIMIT)
     if radar_results:
-        # Group by country for efficient ingest
         by_country: dict[str, list[str]] = {}
         for domain, cc in radar_results:
             by_country.setdefault(cc, []).append(domain)
@@ -561,7 +686,40 @@ def run_discovery_job():
     if ct_domains:
         total_queued += ingest_domains(ct_domains, source="ct_logs", db=db)
 
-    log.info(f"[discovery] done — {total_queued} new domains queued")
+    # ── Source 3: Majestic Million (daily updated) ───────────────────────────
+    majestic_domains = fetch_majestic_million(limit=BULK_LIMIT)
+    if majestic_domains:
+        total_queued += ingest_domains(majestic_domains, source="majestic",
+                                       db=db, skip_scan_check=True)
+
+    log.info(f"[discovery] done — {total_queued:,} new domains queued")
+    return total_queued
+
+
+def run_bulk_discovery_job():
+    """Weekly bulk discovery job (Saturday 00:00 Prague).
+
+    Downloads Tranco top-1M and Cisco Umbrella top-1M.
+    Together ~500k–2M net-new domains per week.
+    Uses skip_scan_check=True for performance — DB-level dedup handles conflicts.
+    """
+    log.info("[bulk_discovery] starting weekly bulk domain discovery")
+    db = _get_db()
+    total_queued = 0
+
+    # ── Source 4: Tranco top-1M (research-grade, de-noised) ─────────────────
+    tranco_domains = fetch_tranco_top1m(limit=BULK_LIMIT)
+    if tranco_domains:
+        total_queued += ingest_domains(tranco_domains, source="tranco",
+                                       db=db, skip_scan_check=True)
+
+    # ── Source 5: Cisco Umbrella top-1M (DNS-query ranked) ──────────────────
+    umbrella_domains = fetch_umbrella_top1m(limit=BULK_LIMIT)
+    if umbrella_domains:
+        total_queued += ingest_domains(umbrella_domains, source="umbrella",
+                                       db=db, skip_scan_check=True)
+
+    log.info(f"[bulk_discovery] done — {total_queued:,} domains queued from Tranco + Umbrella")
     return total_queued
 
 
@@ -622,15 +780,28 @@ def get_pipeline_status(db=None) -> dict:
     except Exception:
         pending_outreach = -1
 
+    try:
+        by_source = {}
+        for src in ("radar", "ct_logs", "majestic", "tranco", "umbrella", "outreach"):
+            try:
+                n = db.table("scan_results").select("id", count="exact").eq("source", src).execute().count or 0
+                by_source[src] = n
+            except Exception:
+                pass
+    except Exception:
+        by_source = {}
+
     return {
         "queue_pending":      queue_count,
         "total_domains":      total,
         "tier2_enriched":     tier2_count,
         "high_risk_domains":  high_risk,
         "pending_outreach":   pending_outreach,
+        "by_source":          by_source,
         "workers":            PIPELINE_WORKERS,
         "tier1_batch_size":   TIER1_BATCH_SIZE,
         "tier2_batch_size":   TIER2_BATCH_SIZE,
         "radar_limit":        RADAR_LIMIT,
         "radar_countries":    len(RADAR_COUNTRIES),
+        "bulk_limit":         BULK_LIMIT,
     }
