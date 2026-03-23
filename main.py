@@ -1924,6 +1924,13 @@ async def discover_domain_contacts(domain_id: str, authorization: str = Header(N
     # Set primary_contact to best discovered address if not already set
     primary = d.get("primary_contact") or (contacts[0] if contacts else None)
 
+    # Also enrich scan_results with the discovered contacts
+    if contacts:
+        sr_update = {"contact_emails": json.dumps(contacts)}
+        if contacts[0]:
+            sr_update["contact_email"] = contacts[0]
+        db.table("scan_results").update(sr_update).eq("domain", d["domain"]).execute()
+
     return {
         "domain":          d["domain"],
         "primary_contact": primary,

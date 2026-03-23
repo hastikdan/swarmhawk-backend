@@ -337,74 +337,98 @@ def discover_all_contacts(domain: str) -> list[str]:
 
       1. security.txt  (RFC 9116 — most authoritative)
       2. WHOIS registrant / admin / tech contacts
-      3. Website scrape: homepage + /contact, /impressum, /about …
+      3. Website scrape: homepage + /contact, /impressum, /about …  (parallel)
       4. Common pattern guesses (security@, info@, …) as last resort
-    """
-    seen: set[str] = set()
-    verified: list[str] = []   # real emails found in external sources
-    guesses:  list[str] = []   # pattern-derived fallbacks
 
-    def _add(email: str, *, is_guess: bool = False):
+    All HTTP requests run in parallel — total wall time ~5-8s max.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    raw_verified: list[str] = []
+    raw_guesses:  list[str] = []
+
+    def _collect(emails: list[str], *, is_guess: bool = False):
+        target = raw_guesses if is_guess else raw_verified
+        target.extend(emails)
+
+    def _fetch_security_txt() -> list[str]:
+        found = []
+        for path in ["/.well-known/security.txt", "/security.txt"]:
+            try:
+                r = req.get(f"https://{domain}{path}", timeout=5, headers=UA, verify=False)
+                if r.status_code == 200 and "Contact:" in r.text:
+                    for m in re.finditer(
+                        r"Contact:\s*(?:mailto:)?([^\s]+@[^\s]+)", r.text, re.IGNORECASE
+                    ):
+                        found.append(m.group(1))
+            except Exception:
+                pass
+        return found
+
+    def _fetch_whois() -> list[str]:
+        try:
+            import whois
+            w = whois.whois(domain)
+            raw = w.emails if isinstance(w.emails, list) else ([w.emails] if w.emails else [])
+            return [str(e) for e in raw if e]
+        except Exception:
+            return []
+
+    def _fetch_page(path: str) -> list[str]:
+        try:
+            r = req.get(
+                f"https://{domain}{path}",
+                timeout=5, headers=UA, verify=False, allow_redirects=True,
+            )
+            if r.status_code == 200:
+                return _extract_emails_from_html(r.text[:80_000], domain)
+        except Exception:
+            pass
+        return []
+
+    # ── Run all sources in parallel (max 15s total wall time) ────────────────
+    futures = {}
+    with ThreadPoolExecutor(max_workers=14) as pool:
+        futures["security_txt"] = pool.submit(_fetch_security_txt)
+        futures["whois"]        = pool.submit(_fetch_whois)
+        for path in _CONTACT_PAGES:
+            futures[f"page:{path}"] = pool.submit(_fetch_page, path)
+
+        for key, fut in futures.items():
+            try:
+                emails = fut.result(timeout=12)
+                _collect(emails)
+            except Exception:
+                pass
+
+    # ── 4. Pattern guesses (last resort) ─────────────────────────────────────
+    for prefix in ["security", "info", "contact", "webmaster", "admin"]:
+        raw_guesses.append(f"{prefix}@{domain}")
+
+    # Deduplicate, filter junk, own-domain first
+    seen: set[str] = set()
+    result: list[str] = []
+
+    def _clean_add(email: str):
         e = email.strip().lower().rstrip(".")
         if not e or "@" not in e:
             return
         host = e.split("@")[1]
         if "." not in host or host in _JUNK_EMAIL_DOMAINS:
             return
-        if e in seen:
+        if any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg", ".css", ".js")):
             return
-        seen.add(e)
-        if is_guess:
-            guesses.append(e)
-        else:
-            verified.append(e)
+        if e not in seen:
+            seen.add(e)
+            result.append(e)
 
-    # ── 1. security.txt ──────────────────────────────────────────────────────
-    for path in ["/.well-known/security.txt", "/security.txt"]:
-        try:
-            r = req.get(f"https://{domain}{path}", timeout=5, headers=UA, verify=False)
-            if r.status_code == 200 and "Contact:" in r.text:
-                for m in re.finditer(
-                    r"Contact:\s*(?:mailto:)?([^\s]+@[^\s]+)", r.text, re.IGNORECASE
-                ):
-                    _add(m.group(1))
-        except Exception:
-            pass
+    # Own-domain verified addresses first, then other verified, then guesses
+    own     = [e for e in raw_verified if f"@{domain}" in e.lower()]
+    other   = [e for e in raw_verified if f"@{domain}" not in e.lower()]
+    for e in own + other + raw_guesses:
+        _clean_add(e)
 
-    # ── 2. WHOIS ─────────────────────────────────────────────────────────────
-    try:
-        import whois  # python-whois
-        w = whois.whois(domain)
-        raw_emails = w.emails if isinstance(w.emails, list) else (
-            [w.emails] if w.emails else []
-        )
-        for e in raw_emails:
-            if e:
-                _add(str(e))
-    except Exception:
-        pass
-
-    # ── 3. Website scraping ──────────────────────────────────────────────────
-    for path in _CONTACT_PAGES:
-        try:
-            r = req.get(
-                f"https://{domain}{path}",
-                timeout=7, headers=UA, verify=False, allow_redirects=True,
-            )
-            if r.status_code == 200:
-                for e in _extract_emails_from_html(r.text[:80_000], domain):
-                    _add(e)
-        except Exception:
-            pass
-        if len(verified) >= 5:   # enough real contacts found — stop scraping
-            break
-
-    # ── 4. Pattern guesses (last resort) ─────────────────────────────────────
-    for prefix in ["security", "info", "contact", "webmaster", "admin"]:
-        _add(f"{prefix}@{domain}", is_guess=True)
-
-    # Real verified addresses first, then guesses
-    return (verified + guesses)[:10]
+    return result[:10]
 
 
 def discover_contact_email(domain: str) -> str:
