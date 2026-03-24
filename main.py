@@ -27,7 +27,7 @@ import stripe
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks, Query, APIRouter
+from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks, Query, APIRouter, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -4408,6 +4408,103 @@ def pipeline_run_tier2(authorization: str = Header(None)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/admin/batch-upload")
+async def admin_batch_upload(
+    authorization: str = Header(None),
+    file: UploadFile = File(...),
+):
+    """Admin: upload a .txt or .json file of domains to inject into the pipeline queue.
+
+    .txt  — one domain per line (blank lines and # comments ignored)
+    .json — JSON array of strings  ["example.com", ...]
+          OR array of objects      [{"domain": "example.com"}, ...]
+
+    Domains are queued at priority 1 (highest) with source='batch_upload'.
+    Returns {total_submitted, queued, duplicates_skipped, invalid, sample_invalid}.
+    """
+    require_admin(authorization)
+
+    content = await file.read()
+    filename = (file.filename or "").lower()
+
+    raw_domains: list[str] = []
+
+    if filename.endswith(".json"):
+        try:
+            data = json.loads(content.decode("utf-8", errors="replace"))
+            if not isinstance(data, list):
+                raise HTTPException(400, "JSON must be a top-level array")
+            for item in data:
+                if isinstance(item, str):
+                    raw_domains.append(item.strip())
+                elif isinstance(item, dict):
+                    d = item.get("domain") or item.get("Domain") or item.get("url") or ""
+                    if d:
+                        raw_domains.append(str(d).strip())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, f"Invalid JSON: {exc}")
+
+    elif filename.endswith(".txt"):
+        for line in content.decode("utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                raw_domains.append(line)
+    else:
+        raise HTTPException(400, "Only .txt and .json files are supported")
+
+    if not raw_domains:
+        raise HTTPException(400, "No domains found in file")
+
+    total_submitted = len(raw_domains)
+
+    # Validate format before handing to ingest_domains
+    _domain_re = re.compile(r'^[a-z0-9][a-z0-9\-\.]{1,253}[a-z0-9]$')
+    valid, invalid = [], []
+    for d in raw_domains:
+        d = d.lower().strip().rstrip(".")
+        # Strip http(s):// scheme if accidentally included
+        for prefix in ("https://", "http://"):
+            if d.startswith(prefix):
+                d = d[len(prefix):]
+        d = d.split("/")[0]  # strip any path
+        if d and _domain_re.match(d) and "." in d:
+            valid.append(d)
+        else:
+            invalid.append(d)
+
+    sample_invalid = invalid[:10]
+
+    from pipeline import ingest_domains as _ingest
+    db = get_db()
+
+    # Count what's already in scan_results (duplicates)
+    already_scanned: set[str] = set()
+    for i in range(0, len(valid), 500):
+        chunk = valid[i:i + 500]
+        try:
+            rows = db.table("scan_results").select("domain").in_("domain", chunk).execute().data or []
+            already_scanned.update(r["domain"] for r in rows)
+        except Exception:
+            pass
+
+    queued = _ingest(valid, source="batch_upload", db=db, skip_scan_check=False)
+    duplicates_skipped = len(already_scanned)
+
+    log.info(
+        f"[batch_upload] total={total_submitted} valid={len(valid)} "
+        f"queued={queued} dupes={duplicates_skipped} invalid={len(invalid)}"
+    )
+
+    return {
+        "total_submitted":   total_submitted,
+        "valid":             len(valid),
+        "queued":            queued,
+        "duplicates_skipped": duplicates_skipped,
+        "invalid":           len(invalid),
+        "sample_invalid":    sample_invalid,
+    }
+
+
 @app.post("/pipeline/run-bulk-discovery")
 def pipeline_run_bulk_discovery(authorization: str = Header(None)):
     """Admin: manually trigger weekly bulk discovery (Tranco + Umbrella ~2M domains)."""
@@ -4419,6 +4516,147 @@ def pipeline_run_bulk_discovery(authorization: str = Header(None)):
         return {"status": "bulk discovery started (Tranco + Umbrella)"}
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTERPRISE — Organization Graph + Breach Path + CTEM
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/enterprise/stats")
+def enterprise_stats(authorization: str = Header(None)):
+    """Enterprise-wide stats: orgs, entry points, breach paths, choke points."""
+    get_user_from_header(authorization)
+    db = get_db()
+    try:
+        orgs = db.table("organizations").select("org_risk_score,entry_points,critical_assets,choke_points,attack_paths,domain_count", count="exact").execute()
+        total_orgs  = orgs.count or 0
+        rows        = orgs.data or []
+        total_entry = sum(r.get("entry_points", 0) for r in rows)
+        total_crit  = sum(r.get("critical_assets", 0) for r in rows)
+        total_paths = sum(r.get("attack_paths", 0) for r in rows)
+        total_choke = sum(r.get("choke_points", 0) for r in rows)
+        total_doms  = sum(r.get("domain_count", 0) for r in rows)
+        avg_risk    = round(sum(r.get("org_risk_score", 0) for r in rows) / max(total_orgs, 1))
+        pipeline    = db.table("scan_results").select("id", count="exact").execute()
+        return {
+            "total_organizations":  total_orgs,
+            "total_domains_mapped": total_doms,
+            "total_entry_points":   total_entry,
+            "total_critical_assets":total_crit,
+            "total_attack_paths":   total_paths,
+            "total_choke_points":   total_choke,
+            "avg_org_risk_score":   avg_risk,
+            "total_scan_results":   pipeline.count or 0,
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/enterprise/orgs")
+def enterprise_list_orgs(
+    authorization: str = Header(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=200),
+    sort: str = Query("risk"),          # risk | domains | paths | name
+    min_risk: int = Query(0, ge=0),
+    country: str = Query(None),
+):
+    """List organizations sorted by risk score, domain count, or attack paths."""
+    get_user_from_header(authorization)
+    db = get_db()
+    try:
+        q = db.table("organizations").select(
+            "id,registered_domain,name,domain_count,org_risk_score,"
+            "entry_points,critical_assets,choke_points,attack_paths,country,last_computed"
+        ).gte("org_risk_score", min_risk)
+        if country:
+            q = q.eq("country", country)
+        col = {"risk": "org_risk_score", "domains": "domain_count",
+               "paths": "attack_paths", "name": "registered_domain"}.get(sort, "org_risk_score")
+        q = q.order(col, desc=(sort != "name"))
+        offset = (page - 1) * limit
+        rows = q.range(offset, offset + limit - 1).execute().data or []
+        total = db.table("organizations").select("id", count="exact").gte("org_risk_score", min_risk).execute().count or 0
+        return {"organizations": rows, "total": total, "page": page, "limit": limit}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/enterprise/orgs/{org_id}")
+def enterprise_get_org(org_id: str, authorization: str = Header(None)):
+    """Full organization detail including asset_graph (nodes, edges, paths, choke_points)."""
+    get_user_from_header(authorization)
+    db = get_db()
+    row = db.table("organizations").select("*").eq("id", org_id).execute()
+    if not row.data:
+        raise HTTPException(404, "Organization not found")
+    org = row.data[0]
+    # Also fetch the individual domain records for this org
+    domains = db.table("scan_results").select(
+        "domain,risk_score,max_cvss,scan_tier,priority,blacklisted,"
+        "spf_status,dmarc_status,waf_detected,ip_reputation,last_scanned_at"
+    ).eq("registered_domain", org["registered_domain"]).order("risk_score", desc=True).limit(100).execute().data or []
+    org["domains"] = domains
+    return org
+
+
+@app.post("/enterprise/orgs/{org_id}/recompute")
+def enterprise_recompute_org(org_id: str, authorization: str = Header(None)):
+    """Recompute breach paths for a single organization."""
+    require_admin(authorization)
+    try:
+        from org_graph import compute_org_graph_job
+        import threading
+        threading.Thread(target=compute_org_graph_job, kwargs={"org_id": org_id}, daemon=True).start()
+        return {"status": "recompute started", "org_id": org_id}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.post("/enterprise/compute")
+def enterprise_compute_all(authorization: str = Header(None)):
+    """Admin: run full org clustering + breach path computation across all scan_results."""
+    require_admin(authorization)
+    try:
+        from org_graph import compute_org_graph_job
+        import threading
+        threading.Thread(target=compute_org_graph_job, daemon=True).start()
+        return {"status": "full org graph computation started"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/enterprise/breach-paths")
+def enterprise_breach_paths(
+    authorization: str = Header(None),
+    min_paths: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+):
+    """List organizations with the most breach paths — highest priority targets."""
+    get_user_from_header(authorization)
+    db = get_db()
+    try:
+        rows = db.table("organizations").select(
+            "id,registered_domain,name,org_risk_score,attack_paths,choke_points,entry_points,critical_assets,country"
+        ).gte("attack_paths", min_paths).order("attack_paths", desc=True).limit(limit).execute().data or []
+        return {"organizations": rows}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/enterprise/orgs/by-domain/{domain}")
+def enterprise_org_by_domain(domain: str, authorization: str = Header(None)):
+    """Look up which organization a domain belongs to."""
+    get_user_from_header(authorization)
+    db = get_db()
+    sr = db.table("scan_results").select("registered_domain").eq("domain", domain.lower()).execute()
+    if not sr.data or not sr.data[0].get("registered_domain"):
+        raise HTTPException(404, "Domain not found or not yet tagged with organization")
+    reg = sr.data[0]["registered_domain"]
+    org = db.table("organizations").select("*").eq("registered_domain", reg).execute()
+    if not org.data:
+        raise HTTPException(404, "Organization not yet computed for this domain")
+    return org.data[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
