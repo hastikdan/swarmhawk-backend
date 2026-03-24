@@ -773,10 +773,10 @@ def check_sca(domain: str) -> CheckResult:
     return _check_sca(domain)
 
 
-def check_dast(domain: str) -> CheckResult:
-    """DAST — probe for exposed admin panels, API docs, and misconfigurations."""
-    from cee_scanner.skills.dast import check_dast as _check_dast
-    return _check_dast(domain)
+def check_agentic_dast(domain: str) -> CheckResult:
+    """DAST — Shannon-inspired multi-agent DAST. Probes + 3 parallel Claude agents."""
+    from cee_scanner.skills.agentic_dast import check_agentic_dast as _check_agentic_dast
+    return _check_agentic_dast(domain)
 
 
 def check_iac(domain: str) -> CheckResult:
@@ -922,7 +922,7 @@ ALL_CHECKS = [
     # ── AppSec checks ──
     check_sast,                 # exposed source code, .env, debug pages
     check_sca,                  # exposed dependency manifests + NVD CVEs
-    check_dast,                 # admin panels, API docs, open redirects
+    check_agentic_dast,         # Shannon-inspired multi-agent DAST (admin panels, API docs, injection analysis)
     check_iac,                  # Terraform state, K8s configs, CI/CD files
     # ── IP Intelligence ──
     check_ip_intel,             # IP reputation, blocklists, Shodan, AbuseIPDB, co-hosted domains
