@@ -1855,6 +1855,54 @@ def delete_domain(domain_id: str, authorization: str = Header(None)):
     return {"deleted": domain_id}
 
 
+@app.get("/domains/{domain_id}/scan-status")
+def get_scan_status(domain_id: str, authorization: str = Header(None)):
+    """Return live scan progress for a domain.
+
+    While scanning: estimated percentage, current check index (0-21), elapsed seconds.
+    When idle:      scanning=false, pct=100.
+    """
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("user_id,domain").eq("id", domain_id).execute()
+    if not row.data or row.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found or not your domain")
+
+    TOTAL_CHECKS     = 22
+    ESTIMATED_SECS   = 90.0   # typical full scan duration
+
+    if domain_id in _active_scans:
+        info    = _active_scans[domain_id]
+        started = info.get("started_at", "")
+        elapsed = 0
+        if started:
+            try:
+                from dateutil import parser as dtparse
+                elapsed = (datetime.now(timezone.utc) - dtparse.parse(started)).total_seconds()
+            except Exception:
+                pass
+        pct       = min(95, int((elapsed / ESTIMATED_SECS) * 100))
+        check_idx = min(TOTAL_CHECKS - 1, int((elapsed / ESTIMATED_SECS) * TOTAL_CHECKS))
+        remaining = max(0, int(ESTIMATED_SECS - elapsed))
+        return {
+            "scanning":       True,
+            "pct":            pct,
+            "check_idx":      check_idx,       # 0-indexed current check (0–21)
+            "total_checks":   TOTAL_CHECKS,
+            "elapsed_seconds": int(elapsed),
+            "remaining_seconds": remaining,
+        }
+
+    return {
+        "scanning":       False,
+        "pct":            100,
+        "check_idx":      TOTAL_CHECKS,
+        "total_checks":   TOTAL_CHECKS,
+        "elapsed_seconds": 0,
+        "remaining_seconds": 0,
+    }
+
+
 @app.post("/domains/{domain_id}/rescan")
 def rescan_domain(domain_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Trigger a fresh scan for an existing domain."""
