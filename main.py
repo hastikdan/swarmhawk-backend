@@ -5527,6 +5527,16 @@ def get_user_plan(authorization: str = Header(None)):
     domain_count = db.table("domains").select("id", count="exact").eq("user_id", uid).execute()
     count = domain_count.count or 0
 
+    # Admin users get unlimited access regardless of purchases
+    if is_admin(uid):
+        return {
+            "plan_id":      "admin",
+            "plan_name":    "Admin",
+            "domain_limit": None,
+            "domain_count": count,
+            "bulk_upload":  True,
+        }
+
     # Check purchases to infer plan
     purchases = db.table("purchases").select("amount_usd,paid_at").eq("user_id", uid)\
         .not_.is_("paid_at", "null").execute()
