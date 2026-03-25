@@ -2206,8 +2206,9 @@ def download_report_pdf(domain_id: str, authorization: str = Header(None)):
     except Exception as e:
         raise HTTPException(500, f"PDF generation failed: {e}")
 
-    date_str = (latest.get("scanned_at") or "")[:10] or "report"
-    filename  = f"swarmhawk-{d['domain']}-{date_str}.pdf"
+    date_str   = (latest.get("scanned_at") or "")[:10] or "report"
+    user_slug  = _user_slug(user["sub"], db)
+    filename   = f"swarmhawk-{d['domain']}-{date_str}-{user_slug}.pdf"
     return _Resp(
         content=pdf_bytes,
         media_type="application/pdf",
@@ -2253,6 +2254,21 @@ def _pdf_safe(text: str) -> str:
         text = text.replace(src, dst)
     # Strip any remaining non-Latin-1 characters
     return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _user_slug(uid: str, db) -> str:
+    """Derive a short safe filename slug from the user's name or email."""
+    import re as _re
+    try:
+        row = db.table("users").select("name,email").eq("id", uid).single().execute()
+        if row.data:
+            raw = (row.data.get("name") or row.data.get("email") or "user").split()[0]
+            raw = raw.split("@")[0]
+            slug = _re.sub(r'[^a-zA-Z0-9_\-]', '', raw).lower()[:20]
+            return slug or "user"
+    except Exception:
+        pass
+    return "user"
 
 
 def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -> bytes:
@@ -2437,8 +2453,9 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
     except Exception as e:
         raise HTTPException(500, f"PDF generation failed: {e}")
 
-    pdf_b64 = base64.b64encode(pdf_bytes).decode()
-    filename = f"swarmhawk-report-{d['domain']}-{scanned_at[:10]}.pdf"
+    pdf_b64   = base64.b64encode(pdf_bytes).decode()
+    user_slug = _user_slug(user["sub"], db)
+    filename  = f"swarmhawk-report-{d['domain']}-{scanned_at[:10]}-{user_slug}.pdf"
 
     score_label = "HIGH RISK" if risk_score >= 60 else "MEDIUM RISK" if risk_score >= 30 else "LOW RISK"
     non_ai = [c for c in checks if c.get("check") != "ai_summary"]
