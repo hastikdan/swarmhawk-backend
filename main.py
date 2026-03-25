@@ -5376,3 +5376,290 @@ def v2_get_api_plan(authorization: str = Header(None)):
     return get_api_plan(authorization)
 
 app.include_router(_v2)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLANS CATALOG
+# ══════════════════════════════════════════════════════════════════════════════
+
+PLANS = [
+    {
+        "id":           "free",
+        "name":         "Free",
+        "price_usd":    0,
+        "period":       None,
+        "domain_limit": 10,
+        "api_access":   False,
+        "bulk_upload":  False,
+        "features": [
+            "10 domains",
+            "22-check passive scan",
+            "Risk dashboard",
+            "Basic report",
+        ],
+        "cta_label": "Current plan",
+        "checkout_url": None,
+    },
+    {
+        "id":           "starter",
+        "name":         "Starter",
+        "price_usd":    490,
+        "period":       "month",
+        "domain_limit": 500,
+        "api_access":   True,
+        "bulk_upload":  True,
+        "features": [
+            "500 domains",
+            "22-check scan engine",
+            "Risk dashboard & alerts",
+            "API access",
+            "Bulk domain upload",
+            "Email reports",
+        ],
+        "cta_label": "Upgrade to Starter",
+        "checkout_url": None,  # Stripe link added client-side
+    },
+    {
+        "id":           "enterprise",
+        "name":         "Enterprise",
+        "price_usd":    2400,
+        "period":       "month",
+        "domain_limit": 10000,
+        "api_access":   True,
+        "bulk_upload":  True,
+        "features": [
+            "10,000 domains",
+            "Breach path visualization",
+            "Org graph clustering",
+            "Choke point analysis",
+            "CTEM workflow (5 stages)",
+            "Webhook & REST API",
+            "5 workspaces",
+            "Priority support",
+        ],
+        "cta_label": "Upgrade to Enterprise",
+        "checkout_url": None,
+    },
+    {
+        "id":           "platform",
+        "name":         "Platform",
+        "price_usd":    None,
+        "period":       None,
+        "domain_limit": None,
+        "api_access":   True,
+        "bulk_upload":  True,
+        "features": [
+            "Unlimited domains",
+            "White-label licensing",
+            "XDR integration",
+            "STIX/TAXII feeds",
+            "On-premise deployment",
+            "Dedicated success manager",
+        ],
+        "cta_label": "Contact sales",
+        "checkout_url": None,
+    },
+]
+
+
+@app.get("/plans")
+def list_plans():
+    """Public: return all available plans and their features."""
+    return {"plans": PLANS}
+
+
+@app.get("/me/plan")
+def get_user_plan(authorization: str = Header(None)):
+    """Return the current user's active plan ID and domain usage."""
+    user = get_user_from_header(authorization)
+    db   = get_admin_db()
+    uid  = user["sub"]
+
+    # Count owned domains
+    domain_count = db.table("domains").select("id", count="exact").eq("user_id", uid).execute()
+    count = domain_count.count or 0
+
+    # Check purchases to infer plan
+    purchases = db.table("purchases").select("amount_usd,paid_at").eq("user_id", uid)\
+        .not_.is_("paid_at", "null").execute()
+    total_paid = sum(p.get("amount_usd") or 0 for p in (purchases.data or []))
+
+    if total_paid >= 2400:
+        plan_id = "enterprise"
+    elif total_paid >= 490:
+        plan_id = "starter"
+    elif total_paid > 0:
+        plan_id = "starter"
+    else:
+        plan_id = "free"
+
+    plan = next((p for p in PLANS if p["id"] == plan_id), PLANS[0])
+    return {
+        "plan_id":      plan_id,
+        "plan_name":    plan["name"],
+        "domain_limit": plan["domain_limit"],
+        "domain_count": count,
+        "bulk_upload":  plan["bulk_upload"],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# BULK DOMAIN IMPORT (user-facing)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class BulkDomainsRequest(BaseModel):
+    domains: list[str]
+
+
+@app.post("/domains/bulk")
+async def bulk_add_domains(
+    body: BulkDomainsRequest,
+    background_tasks: BackgroundTasks,
+    authorization: str = Header(None),
+):
+    """Add multiple domains at once (JSON list). Respects plan domain limit.
+
+    Body: {"domains": ["a.com", "b.com", ...]}
+    Returns: {queued, skipped_duplicates, skipped_invalid, errors}
+    """
+    import re as _re
+    user = get_user_from_header(authorization)
+    db   = get_admin_db()
+    uid  = user["sub"]
+
+    # Determine plan limit
+    user_plan = get_user_plan(f"Bearer {body.domains[0]}" if False else authorization)
+    remaining = (user_plan["domain_limit"] or 999999) - user_plan["domain_count"]
+
+    domain_re = _re.compile(
+        r'^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$'
+    )
+
+    queued = []
+    skipped_duplicates = []
+    skipped_invalid = []
+
+    for raw in body.domains[:500]:  # hard cap per request
+        domain = raw.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
+        if not domain_re.match(domain):
+            skipped_invalid.append(raw)
+            continue
+
+        if len(queued) >= remaining:
+            break
+
+        # Check not already owned
+        existing = db.table("domains").select("id").eq("user_id", uid).eq("domain", domain).execute()
+        if existing.data:
+            skipped_duplicates.append(domain)
+            continue
+
+        try:
+            dom_result = db.table("domains").insert({
+                "user_id":    uid,
+                "domain":     domain,
+                "country":    tld_to_country(domain),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }).execute()
+            if dom_result.data:
+                d = dom_result.data[0]
+                background_tasks.add_task(run_scan_background, d["id"], domain)
+                queued.append(domain)
+        except Exception:
+            skipped_duplicates.append(domain)  # likely unique constraint
+
+    return {
+        "queued":              len(queued),
+        "queued_domains":      queued,
+        "skipped_duplicates":  len(skipped_duplicates),
+        "skipped_invalid":     len(skipped_invalid),
+        "limit_remaining":     max(0, remaining - len(queued)),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN ACTIVITY — scans-per-day for dashboard chart
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/admin/activity")
+def admin_activity(days: int = 30, authorization: str = Header(None)):
+    """Admin: scans per day for the last N days (default 30). For activity chart."""
+    require_admin(authorization)
+    db  = get_admin_db()
+    from datetime import timedelta
+
+    now    = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=days)).isoformat()
+
+    scans = db.table("scans").select("scanned_at").gte("scanned_at", cutoff).execute()
+    users = db.table("users").select("created_at").gte("created_at", cutoff).execute()
+
+    # Build day buckets
+    buckets: dict[str, dict] = {}
+    for i in range(days):
+        day = (now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
+        buckets[day] = {"date": day, "scans": 0, "new_users": 0}
+
+    for s in (scans.data or []):
+        day = (s.get("scanned_at") or "")[:10]
+        if day in buckets:
+            buckets[day]["scans"] += 1
+
+    for u in (users.data or []):
+        day = (u.get("created_at") or "")[:10]
+        if day in buckets:
+            buckets[day]["new_users"] += 1
+
+    return {"activity": list(buckets.values())}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN LOGS — recent scan events
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/admin/logs")
+def admin_logs(limit: int = 100, authorization: str = Header(None)):
+    """Admin: recent scan events with domain, user, risk score, timestamp."""
+    require_admin(authorization)
+    db = get_admin_db()
+
+    scans = db.table("scans")\
+        .select("id,domain_id,risk_score,critical,warnings,scanned_at")\
+        .order("scanned_at", desc=True)\
+        .limit(min(limit, 200))\
+        .execute()
+
+    # Build domain_id → domain name map
+    domain_ids = list({s["domain_id"] for s in (scans.data or []) if s.get("domain_id")})
+    domain_map: dict = {}
+    user_map:   dict = {}
+
+    if domain_ids:
+        domains = db.table("domains").select("id,domain,user_id").in_("id", domain_ids).execute()
+        for d in (domains.data or []):
+            domain_map[d["id"]] = d["domain"]
+            user_map[d["id"]]   = d.get("user_id", "")
+
+    # Fetch user emails
+    user_ids = list(set(user_map.values()) - {""})
+    email_map: dict = {}
+    if user_ids:
+        users = db.table("users").select("id,email").in_("id", user_ids).execute()
+        for u in (users.data or []):
+            email_map[u["id"]] = u["email"]
+
+    logs = []
+    for s in (scans.data or []):
+        did = s.get("domain_id", "")
+        uid = user_map.get(did, "")
+        logs.append({
+            "scan_id":    s["id"],
+            "domain":     domain_map.get(did, "—"),
+            "user_email": email_map.get(uid, "—"),
+            "risk_score": s.get("risk_score"),
+            "critical":   s.get("critical", 0),
+            "warnings":   s.get("warnings", 0),
+            "scanned_at": s.get("scanned_at", ""),
+        })
+
+    return {"logs": logs, "total": len(logs)}
