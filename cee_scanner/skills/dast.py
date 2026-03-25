@@ -109,11 +109,13 @@ def _check_open_redirect(domain: str) -> str | None:
                 url, timeout=TIMEOUT, headers=HEADERS,
                 allow_redirects=False, verify=False,
             )
-            # 3xx redirect to evil.com = open redirect
+            # 3xx redirect to external domain = open redirect
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location", "")
                 if "evil.com" in loc:
-                    return f"Open redirect via {path}"
+                    m = re.search(r'\?(\w+)=', path)
+                    param = f"?{m.group(1)}" if m else "redirect parameter"
+                    return f"Open Redirect — server follows attacker-controlled URLs (via '{param}' parameter)"
         except Exception:
             pass
     return None
@@ -220,9 +222,36 @@ def check_dast(domain: str) -> "CheckResult":
 
     detail = ""
     if critical_findings:
-        detail += "Critical:\n" + "\n".join(f"  • {f}" for f in critical_findings) + "\n"
+        detail += "Critical findings:\n" + "\n".join(f"  • {f}" for f in critical_findings) + "\n\n"
     if warning_findings:
-        detail += "Warnings:\n" + "\n".join(f"  • {f}" for f in warning_findings)
+        detail += "Warnings:\n" + "\n".join(f"  • {f}" for f in warning_findings) + "\n\n"
+
+    # Build recommended actions based on what was found
+    actions = []
+    all_lower = " ".join(all_findings).lower()
+    if any("open redirect" in f.lower() for f in all_findings):
+        actions.append("Validate redirect targets against an explicit allowlist; reject external URLs")
+    if any(kw in all_lower for kw in ("phpmyadmin", "adminer", "elasticsearch", "solr")):
+        actions.append("Block public access to database admin interfaces using firewall rules or authentication")
+    if "actuator" in all_lower:
+        actions.append("Restrict Spring Boot Actuator endpoints to internal/private network only")
+    if any(kw in all_lower for kw in ("admin panel", "administrator", "wordpress admin", "admin login")):
+        actions.append("Require strong multi-factor authentication on all admin interfaces")
+    if any(kw in all_lower for kw in ("swagger", "api docs", "openapi", "graphql")):
+        actions.append("Restrict API documentation and GraphQL introspection to authenticated users only")
+    if "robots.txt" in all_lower:
+        actions.append("Remove sensitive paths from robots.txt — this file is public and used by attackers for reconnaissance")
+    if any(kw in all_lower for kw in ("directory listing", "uploads directory", "backup directory")):
+        actions.append("Disable directory listing in your web server (Apache: Options -Indexes, Nginx: autoindex off)")
+    if any(kw in all_lower for kw in ("stack trace", "error page")):
+        actions.append("Configure a generic error page in production; disable stack traces and verbose error output")
+    if any(kw in all_lower for kw in ("jenkinsfile", "travis", "dockerfile", "docker-compose")):
+        actions.append("Remove CI/CD configuration files from web root; do not expose build artifacts publicly")
+    if any(kw in all_lower for kw in ("prometheus", "metrics")):
+        actions.append("Restrict metrics endpoints to internal monitoring systems only")
+
+    if actions:
+        detail += "Recommended Actions:\n" + "\n".join(f"  ✓ {a}" for a in actions)
 
     if critical_findings:
         return result.critical(
