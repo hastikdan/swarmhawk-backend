@@ -2167,6 +2167,54 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     }
 
 
+@app.get("/domains/{domain_id}/report/pdf")
+def download_report_pdf(domain_id: str, authorization: str = Header(None)):
+    """Download the latest scan report as a PDF attachment."""
+    from fastapi.responses import Response as _Resp
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    domain_row = db.table("domains")\
+        .select("*, scans(*)")\
+        .eq("id", domain_id)\
+        .eq("user_id", user["sub"])\
+        .single()\
+        .execute()
+
+    if not domain_row.data:
+        raise HTTPException(404, "Domain not found")
+
+    d = domain_row.data
+    scans = sorted(d.get("scans", []), key=lambda s: s.get("scanned_at") or "", reverse=True)
+    if not scans:
+        raise HTTPException(400, "No scan data yet — run a scan first")
+
+    latest = scans[0]
+    raw = latest.get("checks", [])
+    if isinstance(raw, str):
+        try: raw = json.loads(raw)
+        except Exception: raw = []
+    checks = raw if isinstance(raw, list) else []
+
+    try:
+        pdf_bytes = _generate_pdf(
+            d["domain"],
+            latest.get("risk_score") or 0,
+            latest.get("scanned_at", ""),
+            checks,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"PDF generation failed: {e}")
+
+    date_str = (latest.get("scanned_at") or "")[:10] or "report"
+    filename  = f"swarmhawk-{d['domain']}-{date_str}.pdf"
+    return _Resp(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/domains/{domain_id}/history")
 def get_domain_history(domain_id: str, authorization: str = Header(None)):
     """Return full scan history for a domain (owner only)."""
