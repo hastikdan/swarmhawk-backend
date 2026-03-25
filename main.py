@@ -359,9 +359,9 @@ class LoginRequest(BaseModel):
     password: str
 
 class CheckoutRequest(BaseModel):
-    domain_id: str
-    domain: str
-    plan: str = "one_time"   # "one_time" ($10) | "annual" ($50/year subscription)
+    domain_id: str | None = None  # required for scan/one_time; optional for professional (account-level)
+    domain: str | None = None
+    plan: str = "scan"  # "scan" ($5/scan) | "professional" ($588/yr) | legacy: "one_time" | "annual"
 
 class DomainContactRequest(BaseModel):
     primary_contact: str
@@ -1801,8 +1801,8 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
     if existing.data:
         raise HTTPException(status_code=409, detail="Domain already added")
 
-    # Free tier: 10 domains max unless user has an active paid plan or is admin
-    FREE_DOMAIN_LIMIT = 10
+    # Free tier: 1 domain max unless user has an active paid plan or is admin
+    FREE_DOMAIN_LIMIT = 1
     if not is_admin(user["sub"]):
         domain_count = db.table("domains").select("id", count="exact").eq("user_id", user["sub"]).execute()
         if (domain_count.count or 0) >= FREE_DOMAIN_LIMIT:
@@ -1814,7 +1814,7 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
             if not paid.data:
                 raise HTTPException(
                     status_code=403,
-                    detail=f"Free accounts are limited to {FREE_DOMAIN_LIMIT} domains. Upgrade to Annual ($50/year) to monitor unlimited domains."
+                    detail="Free accounts include 1 domain with 1 free scan. Upgrade to Professional ($49/mo, billed yearly) to monitor up to 10 domains."
                 )
 
     # Resolve country — use provided value only when it's a real ISO code
@@ -2662,8 +2662,10 @@ def checkout_preflight(authorization: str = Header(None)):
 def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     """
     Create a Stripe Checkout session.
-    plan=one_time  → $10 one-time payment, unlocks full report permanently.
-    plan=annual    → $50/year subscription, monthly auto-scans + reports.
+    plan=scan           → $5/scan one-time payment per domain.
+    plan=professional   → $588/year subscription (= $49/mo billed annually), up to 10 domains.
+    plan=one_time       → legacy $10 one-time (kept for backward compat).
+    plan=annual         → legacy $50/year (kept for backward compat).
     """
     if not STRIPE_SECRET_KEY:
         raise HTTPException(503, "Stripe not configured — set STRIPE_SECRET_KEY in environment")
@@ -2675,37 +2677,89 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
     u_row = db.table("users").select("email").eq("id", user["sub"]).execute()
     user_email = u_row.data[0]["email"] if u_row.data else ""
 
-    if body.plan not in ("one_time", "annual"):
-        raise HTTPException(400, "plan must be 'one_time' or 'annual'")
+    if body.plan not in ("scan", "professional", "one_time", "annual"):
+        raise HTTPException(400, "plan must be 'scan' or 'professional'")
 
-    domain_row = db.table("domains")\
-        .select("id, domain")\
-        .eq("id", body.domain_id)\
-        .eq("user_id", user["sub"])\
-        .limit(1)\
-        .execute()
-
-    if not domain_row.data:
-        raise HTTPException(404, "Domain not found")
+    # For scan/one_time plans, domain_id is required
+    if body.plan in ("scan", "one_time"):
+        domain_row = db.table("domains")\
+            .select("id, domain")\
+            .eq("id", body.domain_id)\
+            .eq("user_id", user["sub"])\
+            .limit(1)\
+            .execute()
+        if not domain_row.data:
+            raise HTTPException(404, "Domain not found")
+        domain_name = domain_row.data[0]["domain"]
+    else:
+        domain_name = body.domain or "your domains"
 
     meta = {
         "user_id":   str(user["sub"]),
-        "domain_id": str(body.domain_id),
-        "domain":    body.domain,
+        "domain_id": str(body.domain_id or ""),
+        "domain":    domain_name,
         "plan":      body.plan,
     }
 
     try:
-        if body.plan == "one_time":
+        if body.plan == "scan":
+            # $5/scan — one-time per domain
+            price_id = os.getenv("STRIPE_SCAN_PRICE_ID", "")
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="payment",
+                line_items=[{"price": price_id, "quantity": 1}] if price_id else [{
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": 500,     # $5.00
+                        "product_data": {
+                            "name": f"Security Scan — {domain_name}",
+                            "description": "Full 22-check security scan with AI analysis. One-time payment.",
+                        },
+                    },
+                    "quantity": 1,
+                }],
+                success_url=f"{FRONTEND_URL}?payment=success&domain_id={body.domain_id}",
+                cancel_url=f"{FRONTEND_URL}?payment=cancelled",
+                metadata=meta,
+                customer_email=user_email,
+            )
+        elif body.plan == "professional":
+            # $588/year (= $49/mo billed annually), up to 10 domains
+            price_id = os.getenv("STRIPE_PROFESSIONAL_PRICE_ID", "")
+            line_items = [{"price": price_id, "quantity": 1}] if price_id else [{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": 58800,   # $588.00/year
+                    "recurring": {"interval": "year"},
+                    "product_data": {
+                        "name": "SwarmHawk Professional — Annual Plan",
+                        "description": "Up to 10 domains, 10 scans per domain per year. Billed annually.",
+                    },
+                },
+                "quantity": 1,
+            }]
+            session = stripe.checkout.Session.create(
+                payment_method_types=["card"],
+                mode="subscription",
+                line_items=line_items,
+                success_url=f"{FRONTEND_URL}?payment=success&plan=professional",
+                cancel_url=f"{FRONTEND_URL}?payment=cancelled",
+                metadata=meta,
+                customer_email=user_email,
+                subscription_data={"metadata": meta},
+            )
+        elif body.plan == "one_time":
+            # Legacy: $10 one-time
             session = stripe.checkout.Session.create(
                 payment_method_types=["card"],
                 mode="payment",
                 line_items=[{
                     "price_data": {
                         "currency": "usd",
-                        "unit_amount": 1000,        # $10.00
+                        "unit_amount": 1000,
                         "product_data": {
-                            "name": f"Security Report — {body.domain}",
+                            "name": f"Security Report — {domain_name}",
                             "description": "Full 22-check security report with AI threat analysis. One-time purchase.",
                         },
                     },
@@ -2716,26 +2770,17 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                 metadata=meta,
                 customer_email=user_email,
             )
-        else:  # annual subscription
-            # Use a pre-created Price ID if set, otherwise create dynamically
+        else:  # annual — legacy $50/year
             annual_price_id = os.getenv("STRIPE_ANNUAL_PRICE_ID", "")
-            if annual_price_id:
-                line_items = [{"price": annual_price_id, "quantity": 1}]
-            else:
-                # Dynamic price — works without pre-creating a product in dashboard
-                line_items = [{
-                    "price_data": {
-                        "currency": "usd",
-                        "unit_amount": 5000,        # $50.00
-                        "recurring": {"interval": "year"},
-                        "product_data": {
-                            "name": "SwarmHawk Annual — Security Monitoring",
-                            "description": f"Monthly automated scans + PDF reports for {body.domain}. Cancel anytime.",
-                        },
-                    },
-                    "quantity": 1,
-                }]
-
+            line_items = [{"price": annual_price_id, "quantity": 1}] if annual_price_id else [{
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": 5000,
+                    "recurring": {"interval": "year"},
+                    "product_data": {"name": "SwarmHawk Annual — Security Monitoring"},
+                },
+                "quantity": 1,
+            }]
             session = stripe.checkout.Session.create(
                 payment_method_types=["card"],
                 mode="subscription",
@@ -5501,56 +5546,42 @@ PLANS = [
         "name":         "Free",
         "price_usd":    0,
         "period":       None,
-        "domain_limit": 10,
+        "billing":      None,
+        "domain_limit": 1,
+        "scan_limit":   1,
         "api_access":   False,
         "bulk_upload":  False,
         "features": [
-            "10 domains",
-            "22-check passive scan",
-            "Risk dashboard",
-            "Basic report",
+            "1 domain",
+            "1 full security scan — free",
+            "Additional scans — $5/scan",
+            "Risk score dashboard",
+            "Basic PDF report",
         ],
-        "cta_label": "Current plan",
+        "cta_label": "Get Started Free",
         "checkout_url": None,
     },
     {
-        "id":           "starter",
-        "name":         "Starter",
-        "price_usd":    490,
-        "period":       "month",
-        "domain_limit": 500,
+        "id":           "professional",
+        "name":         "Professional",
+        "price_usd":    49,
+        "period":       "mo",
+        "billing":      "yearly",
+        "annual_total": 588,
+        "domain_limit": 10,
+        "scan_limit":   10,
         "api_access":   True,
         "bulk_upload":  True,
         "features": [
-            "500 domains",
-            "22-check scan engine",
-            "Risk dashboard & alerts",
-            "API access",
+            "2–10 domains",
+            "10 scans per domain per year",
+            "22-check full scan engine",
+            "Risk dashboard & email alerts",
+            "PDF report + email delivery",
             "Bulk domain upload",
-            "Email reports",
-        ],
-        "cta_label": "Upgrade to Starter",
-        "checkout_url": None,  # Stripe link added client-side
-    },
-    {
-        "id":           "enterprise",
-        "name":         "Enterprise",
-        "price_usd":    2400,
-        "period":       "month",
-        "domain_limit": 10000,
-        "api_access":   True,
-        "bulk_upload":  True,
-        "features": [
-            "10,000 domains",
-            "Breach path visualization",
-            "Org graph clustering",
-            "Choke point analysis",
-            "CTEM workflow (5 stages)",
-            "Webhook & REST API",
-            "5 workspaces",
             "Priority support",
         ],
-        "cta_label": "Upgrade to Enterprise",
+        "cta_label": "Upgrade to Professional",
         "checkout_url": None,
     },
     {
@@ -5558,18 +5589,21 @@ PLANS = [
         "name":         "Platform",
         "price_usd":    None,
         "period":       None,
+        "billing":      None,
         "domain_limit": None,
+        "scan_limit":   None,
         "api_access":   True,
         "bulk_upload":  True,
         "features": [
             "Unlimited domains",
-            "White-label licensing",
-            "XDR integration",
-            "STIX/TAXII feeds",
-            "On-premise deployment",
-            "Dedicated success manager",
+            "Pay per request / domain scan",
+            "Custom scan volume & pricing",
+            "White-label dashboard",
+            "API integration & webhooks",
+            "Dedicated account manager",
+            "Custom SLA",
         ],
-        "cta_label": "Contact sales",
+        "cta_label": "Talk to Sales",
         "checkout_url": None,
     },
 ]
@@ -5603,18 +5637,19 @@ def get_user_plan(authorization: str = Header(None)):
         }
 
     # Check purchases to infer plan
-    purchases = db.table("purchases").select("amount_usd,paid_at").eq("user_id", uid)\
+    purchases = db.table("purchases").select("amount_usd,paid_at,plan").eq("user_id", uid)\
         .not_.is_("paid_at", "null").execute()
-    total_paid = sum(p.get("amount_usd") or 0 for p in (purchases.data or []))
 
-    if total_paid >= 2400:
-        plan_id = "enterprise"
-    elif total_paid >= 490:
-        plan_id = "starter"
-    elif total_paid > 0:
-        plan_id = "starter"
+    # Prefer explicit plan column if present; fall back to amount heuristic
+    plan_ids_paid = {p.get("plan") for p in (purchases.data or []) if p.get("plan")}
+    if "professional" in plan_ids_paid or "platform" in plan_ids_paid:
+        plan_id = "professional" if "platform" not in plan_ids_paid else "platform"
+    elif plan_ids_paid - {"free", None}:
+        # Legacy plan IDs (starter, enterprise, annual, one_time) → treat as professional
+        plan_id = "professional"
     else:
-        plan_id = "free"
+        total_paid = sum(p.get("amount_usd") or 0 for p in (purchases.data or []))
+        plan_id = "professional" if total_paid >= 49 else "free"
 
     plan = next((p for p in PLANS if p["id"] == plan_id), PLANS[0])
     return {
