@@ -275,22 +275,26 @@ async def lifespan(app):
     except Exception as e:
         print(f"Breach Monday scheduler init failed: {e}")
     # Global domain discovery pipeline
-    try:
-        from apscheduler.schedulers.background import BackgroundScheduler as _BGS3
-        from pipeline import run_discovery_job, run_pipeline_daily, run_enrichment_weekly, run_bulk_discovery_job
-        _pipeline_scheduler = _BGS3(timezone="Europe/Prague")
-        # Daily: Radar + CT logs + Majestic at 01:00
-        _pipeline_scheduler.add_job(run_discovery_job,      "cron", hour=1,  minute=0,  id="pipeline_discovery")
-        # Every 4 hours: Tier 1 batch scan (00:30, 04:30, 08:30, 12:30, 16:30, 20:30)
-        _pipeline_scheduler.add_job(run_pipeline_daily,     "cron", hour="0,4,8,12,16,20", minute=30, id="pipeline_tier1")
-        # Weekly Sunday: full 22-check Tier 2 enrichment
-        _pipeline_scheduler.add_job(run_enrichment_weekly,  "cron", day_of_week="sun",  hour=3,  minute=0,  id="pipeline_tier2")
-        # Weekly Saturday: bulk discovery — Tranco + Umbrella (~2M domains)
-        _pipeline_scheduler.add_job(run_bulk_discovery_job, "cron", day_of_week="sat",  hour=0,  minute=0,  id="pipeline_bulk_discovery")
-        _pipeline_scheduler.start()
-        print("✓ Pipeline scheduler started (daily discovery 01:00, Tier1 every 4h, Tier2 Sun 03:00, bulk discovery Sat 00:00)")
-    except Exception as e:
-        print(f"Pipeline scheduler init failed: {e}")
+    # Skip if PIPELINE_WORKER_ENABLED=true — scheduling is handled by pipeline_worker.py
+    if os.getenv("PIPELINE_WORKER_ENABLED", "").lower() not in ("1", "true", "yes"):
+        try:
+            from apscheduler.schedulers.background import BackgroundScheduler as _BGS3
+            from pipeline import run_discovery_job, run_pipeline_daily, run_enrichment_weekly, run_bulk_discovery_job
+            _pipeline_scheduler = _BGS3(timezone="Europe/Prague")
+            # Daily: Radar + CT logs + Majestic at 01:00
+            _pipeline_scheduler.add_job(run_discovery_job,      "cron", hour=1,  minute=0,  id="pipeline_discovery")
+            # Every 4 hours: Tier 1 batch scan (00:30, 04:30, 08:30, 12:30, 16:30, 20:30)
+            _pipeline_scheduler.add_job(run_pipeline_daily,     "cron", hour="0,4,8,12,16,20", minute=30, id="pipeline_tier1")
+            # Weekly Sunday: full 22-check Tier 2 enrichment
+            _pipeline_scheduler.add_job(run_enrichment_weekly,  "cron", day_of_week="sun",  hour=3,  minute=0,  id="pipeline_tier2")
+            # Weekly Saturday: bulk discovery — Tranco + Umbrella (~2M domains)
+            _pipeline_scheduler.add_job(run_bulk_discovery_job, "cron", day_of_week="sat",  hour=0,  minute=0,  id="pipeline_bulk_discovery")
+            _pipeline_scheduler.start()
+            print("✓ Pipeline scheduler started (daily discovery 01:00, Tier1 every 4h, Tier2 Sun 03:00, bulk discovery Sat 00:00)")
+        except Exception as e:
+            print(f"Pipeline scheduler init failed: {e}")
+    else:
+        print("↷ Pipeline scheduler skipped — PIPELINE_WORKER_ENABLED is set (handled by worker process)")
     yield
 
 app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
