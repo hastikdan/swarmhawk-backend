@@ -58,6 +58,29 @@ except ImportError as e:
     log.error(f"Failed to import pipeline.py: {e}")
     sys.exit(1)
 
+try:
+    import sonar_import as _sonar
+    def run_sonar_monthly():
+        log.info("[sonar] Starting monthly Rapid7 HTTPS import (limit=500k)…")
+        try:
+            file_url = _sonar.get_latest_file_url("https")
+            db = _sonar.get_db()
+            batch, total = [], 0
+            for rec in _sonar.stream_sonar_https(file_url, None, 500_000):
+                batch.append(_sonar._make_row(rec))
+                if len(batch) >= _sonar.BATCH_SIZE:
+                    total += _sonar.upsert_batch(db, batch, dry_run=False)
+                    batch = []
+            if batch:
+                total += _sonar.upsert_batch(db, batch, dry_run=False)
+            log.info(f"[sonar] Done — {total:,} domains upserted")
+        except Exception as exc:
+            log.error(f"[sonar] Import failed: {exc}")
+    _SONAR_AVAILABLE = True
+except ImportError:
+    log.warning("sonar_import.py not found — monthly Sonar job disabled")
+    _SONAR_AVAILABLE = False
+
 # ── Scheduler ─────────────────────────────────────────────────────────────────
 try:
     from apscheduler.schedulers.blocking import BlockingScheduler
@@ -107,6 +130,17 @@ scheduler.add_job(
     max_instances=1,
     misfire_grace_time=7200,
 )
+
+# Monthly 1st of month 02:00 — Rapid7 Sonar bulk import
+if _SONAR_AVAILABLE:
+    scheduler.add_job(
+        run_sonar_monthly,
+        CronTrigger(day=1, hour=2, minute=0),
+        id="sonar_import",
+        name="Monthly Rapid7 Sonar import",
+        max_instances=1,
+        misfire_grace_time=7200,
+    )
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
 def _heartbeat():

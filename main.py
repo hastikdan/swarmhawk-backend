@@ -4680,6 +4680,49 @@ def pipeline_run_bulk_discovery(authorization: str = Header(None)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/pipeline/run-sonar-import")
+def pipeline_run_sonar_import(
+    authorization: str = Header(None),
+    source: str = "https",
+    limit: int = 500000,
+    tlds: str = "",
+):
+    """Admin: stream Rapid7 Project Sonar dump and bulk-upsert into scan_results.
+
+    source: 'https' (TLS cert scans) or 'fdns' (forward DNS A records)
+    limit:  max domains to import (default 500 000)
+    tlds:   comma-separated TLD filter, e.g. 'cz,de,pl' (empty = all TLDs)
+    """
+    require_admin(authorization)
+    import threading
+
+    def _run():
+        try:
+            import sys
+            import os as _os
+            # sonar_import lives alongside main.py
+            sys.path.insert(0, _os.path.dirname(__file__))
+            import sonar_import
+            tld_filter = set(tlds.lower().split(",")) - {""} if tlds else None
+            file_url = sonar_import.get_latest_file_url(source)
+            stream_fn = sonar_import.stream_sonar_https if source == "https" else sonar_import.stream_sonar_fdns
+            db = sonar_import.get_db()
+            batch, total = [], 0
+            for rec in stream_fn(file_url, tld_filter, limit):
+                batch.append(sonar_import._make_row(rec))
+                if len(batch) >= sonar_import.BATCH_SIZE:
+                    total += sonar_import.upsert_batch(db, batch, dry_run=False)
+                    batch = []
+            if batch:
+                total += sonar_import.upsert_batch(db, batch, dry_run=False)
+            print(f"[sonar-import] Done — {total:,} domains upserted from Rapid7 {source}")
+        except Exception as exc:
+            print(f"[sonar-import] ERROR: {exc}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return {"status": f"sonar import started (source={source}, limit={limit}, tlds='{tlds or 'all'}')"}
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ENTERPRISE — Organization Graph + Breach Path + CTEM
 # ══════════════════════════════════════════════════════════════════════════════
