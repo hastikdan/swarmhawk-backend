@@ -4447,7 +4447,7 @@ def map_country_top_domains(code: str):
         from outreach import get_db as outreach_get_db
         db = outreach_get_db()
 
-        # ── 1. Primary: scan_results (unified pipeline database) ──────────────
+        # ── 1. Primary: scan_results — ALL scanned domains, any CVSS ────────────
         sr_rows = db.table("scan_results")\
             .select("domain,country,risk_score,max_cvss,last_scanned_at,scan_tier,source")\
             .not_.is_("last_scanned_at", "null")\
@@ -4473,7 +4473,7 @@ def map_country_top_domains(code: str):
                 "tier":       r.get("scan_tier", 1),
             })
 
-        # ── 2. Supplement: outreach_prospects (domains not yet in scan_results) ──
+        # ── 2. Supplement: outreach_prospects (legacy, not yet in scan_results) ─
         all_prospects = db.table("outreach_prospects")\
             .select("domain,country,max_cvss,scanned_at")\
             .not_.is_("scanned_at", "null")\
@@ -4499,18 +4499,48 @@ def map_country_top_domains(code: str):
                 "source":     "outreach",
             })
 
-        # Sort by risk_score desc, limit 100
-        domain_rows.sort(key=lambda x: x["risk_score"], reverse=True)
-        domain_rows = domain_rows[:100]
+        # ── 3. Supplement: domain_queue — discovered but not yet scanned ─────
+        try:
+            dq_rows = db.table("domain_queue")\
+                .select("domain,country,added_at")\
+                .execute()
+            for r in (dq_rows.data or []):
+                dom = r.get("domain", "")
+                if dom in seen:
+                    continue
+                cc = (r.get("country") or "").upper().strip()
+                if not cc or cc in ("EU", "??", ""):
+                    cc = tld_to_country(dom)
+                if cc != code:
+                    continue
+                seen.add(dom)
+                domain_rows.append({
+                    "domain":     dom,
+                    "risk_score": 0,
+                    "scanned_at": "",
+                    "max_cvss":   0.0,
+                    "source":     "queued",
+                    "status":     "pending scan",
+                })
+        except Exception:
+            pass
 
-        scanned_count = len(domain_rows)
+        # Total discovered (before limiting)
+        total_discovered = len(domain_rows)
+        scanned_rows = [d for d in domain_rows if d.get("scanned_at")]
+        scanned_count = len(scanned_rows)
+
+        # Sort: scanned first (by risk desc), then queued at bottom
+        domain_rows.sort(key=lambda x: (1 if x.get("scanned_at") else 0, x["risk_score"]), reverse=True)
+        domain_rows = domain_rows[:500]
+
         high_risk = sum(1 for d in domain_rows if d["risk_score"] >= 70)
-        avg_risk = int(sum(d["risk_score"] for d in domain_rows) / scanned_count) if scanned_count else 0
+        avg_risk = int(sum(d["risk_score"] for d in scanned_rows) / scanned_count) if scanned_count else 0
         summary = {
-            "total_tracked": scanned_count,
-            "scanned": scanned_count,
-            "avg_risk": avg_risk,
-            "high_risk": high_risk,
+            "total_tracked": total_discovered,
+            "scanned":       scanned_count,
+            "avg_risk":      avg_risk,
+            "high_risk":     high_risk,
         }
 
     except Exception as exc:
