@@ -1431,6 +1431,90 @@ async def skip_prospect(prospect_id: str, authorization: str = Header(None)):
     return {"status": "skipped"}
 
 
+@router.post("/prospects/{prospect_id}/discover-contact")
+async def discover_prospect_contact(prospect_id: str, authorization: str = Header(None)):
+    """Run multi-source email discovery for a single prospect and save the result."""
+    require_admin(authorization)
+    db = get_db()
+
+    # Resolve domain from scan_results or outreach_prospects
+    domain = None
+    source_table = None
+    try:
+        r = db.table("scan_results").select("id,domain,contact_email").eq("id", prospect_id).limit(1).execute()
+        if r.data:
+            domain = r.data[0]["domain"]
+            source_table = "scan_results"
+    except Exception:
+        pass
+    if not domain:
+        try:
+            r = db.table("outreach_prospects").select("id,domain,contact_email").eq("id", prospect_id).limit(1).execute()
+            if r.data:
+                domain = r.data[0]["domain"]
+                source_table = "outreach_prospects"
+        except Exception:
+            pass
+    if not domain:
+        raise HTTPException(404, "Prospect not found")
+
+    emails = discover_all_contacts(domain)
+    primary = emails[0] if emails else None
+
+    if primary:
+        _prospect_update(db, prospect_id,
+            sr_data={"contact_email": primary},
+            op_data={"contact_email": primary},
+        )
+
+    return {
+        "domain":  domain,
+        "emails":  emails,
+        "primary": primary,
+        "source":  source_table,
+    }
+
+
+@router.post("/prospects/discover-all")
+async def discover_all_prospect_contacts(background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Bulk: discover contact emails for all pending prospects that have no contact_email."""
+    require_admin(authorization)
+
+    def _run():
+        db = get_db()
+        # Fetch pending with no contact_email from both tables
+        to_process = []
+        try:
+            r = db.table("scan_results").select("id,domain").eq("outreach_status", "pending").is_("contact_email", "null").limit(100).execute()
+            to_process += [(row["id"], row["domain"]) for row in (r.data or [])]
+        except Exception:
+            pass
+        try:
+            r = db.table("outreach_prospects").select("id,domain").eq("status", "pending").is_("contact_email", "null").limit(100).execute()
+            seen_domains = {d for _, d in to_process}
+            to_process += [(row["id"], row["domain"]) for row in (r.data or []) if row["domain"] not in seen_domains]
+        except Exception:
+            pass
+
+        enriched = 0
+        for pid, domain in to_process:
+            try:
+                emails = discover_all_contacts(domain)
+                if emails:
+                    _prospect_update(db, pid,
+                        sr_data={"contact_email": emails[0]},
+                        op_data={"contact_email": emails[0]},
+                    )
+                    enriched += 1
+                    log.info(f"[discover-all] {domain} → {emails[0]}")
+            except Exception as e:
+                log.warning(f"[discover-all] {domain}: {e}")
+        log.info(f"[discover-all] done — {enriched}/{len(to_process)} enriched")
+
+    background_tasks.add_task(_run)
+    return {"status": "discovery started in background"}
+
+
 @router.post("/prospects/{prospect_id}/send")
 async def send_single_prospect(prospect_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Send email to a single approved prospect immediately."""
