@@ -1407,6 +1407,79 @@ async def skip_prospect(prospect_id: str, authorization: str = Header(None)):
     return {"status": "skipped"}
 
 
+@router.post("/prospects/{prospect_id}/send")
+async def send_single_prospect(prospect_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Send email to a single approved prospect immediately."""
+    require_admin(authorization)
+    if not RESEND_API_KEY:
+        raise HTTPException(503, "RESEND_API_KEY not configured")
+    db = get_db()
+
+    # Fetch from scan_results first, fallback to outreach_prospects
+    row = None
+    try:
+        r = db.table("scan_results").select("*").eq("id", prospect_id).limit(1).execute()
+        if r.data:
+            row = r.data[0]
+            domain     = row["domain"]
+            email_body = row.get("email_draft") or row.get("email_body") or ""
+            to_email   = row.get("contact_email") or f"security@{domain}"
+    except Exception:
+        pass
+
+    if not row:
+        try:
+            r = db.table("outreach_prospects").select("*").eq("id", prospect_id).limit(1).execute()
+            if r.data:
+                row = r.data[0]
+                domain     = row["domain"]
+                email_body = row.get("email_body") or ""
+                to_email   = row.get("contact_email") or f"security@{domain}"
+        except Exception:
+            pass
+
+    if not row:
+        raise HTTPException(404, "Prospect not found")
+
+    lines   = email_body.strip().splitlines()
+    subject = f"Security vulnerability detected on {domain}"
+    body    = email_body
+    if lines and lines[0].lower().startswith("subject:"):
+        subject = lines[0][8:].strip()
+        body    = "\n".join(lines[2:]).strip()
+
+    try:
+        r = req.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    f"{FROM_NAME} <{FROM_EMAIL}>",
+                "to":      [to_email],
+                "subject": subject,
+                "text":    body,
+                "html":    _text_to_html(body, domain),
+            },
+            timeout=15,
+        )
+        if r.status_code not in (200, 201):
+            raise HTTPException(502, f"Resend error {r.status_code}: {r.text[:200]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, str(e))
+
+    now = datetime.now(timezone.utc).isoformat()
+    _prospect_update(db, prospect_id,
+        sr_data={"outreach_status": "sent", "sent_at": now, "sent_to": to_email},
+        op_data={"status": "sent", "sent_at": now, "sent_to": to_email},
+    )
+    try:
+        db.table("outreach_log").insert({"event": "email_sent", "domain": domain, "to": to_email, "ran_at": now}).execute()
+    except Exception:
+        pass
+    return {"status": "sent", "to": to_email, "domain": domain}
+
+
 @router.post("/prospects/{prospect_id}/unapprove")
 async def unapprove_prospect(prospect_id: str, authorization: str = Header(None)):
     require_admin(authorization)
@@ -1539,19 +1612,37 @@ def _send_approved_job():
 
 
 def _text_to_html(text: str, domain: str) -> str:
+    import urllib.parse
+    signup_url = "https://www.swarmhawk.com/register?ref=outreach&domain=" + urllib.parse.quote(domain)
+    report_url = "https://www.swarmhawk.com/app/?domain=" + urllib.parse.quote(domain)
     paragraphs = "".join(f"<p style='margin:0 0 14px 0'>{p.strip()}</p>"
                          for p in text.split("\n\n") if p.strip())
     return f"""<!DOCTYPE html>
-<html><body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;margin:0 auto;padding:24px">
-  <div style="border-left:3px solid #CBFF00;padding-left:16px;margin-bottom:24px">
-    <strong style="font-family:monospace;font-size:16px;color:#0E0D12;background:#CBFF00;padding:4px 10px">SWARMHAWK</strong>
+<html>
+<body style="font-family:Arial,sans-serif;font-size:14px;color:#222;max-width:600px;margin:0 auto;padding:0;background:#f5f5f5">
+  <div style="background:#0E0D12;padding:24px 32px;border-bottom:3px solid #CBFF00">
+    <strong style="font-family:monospace;font-size:18px;color:#CBFF00;letter-spacing:2px">SWARMHAWK</strong>
+    <div style="font-size:11px;color:#888;margin-top:4px;font-family:monospace">Domain Security Intelligence</div>
   </div>
-  {paragraphs}
-  <hr style="border:none;border-top:1px solid #eee;margin:24px 0">
-  <p style="font-size:11px;color:#999">
-    This is an automated security notification. To unsubscribe reply with "unsubscribe".<br>
-    SwarmHawk Security Intelligence · swarmhawk.com
-  </p>
+  <div style="background:#fff;padding:32px">
+    {paragraphs}
+    <div style="margin:32px 0;text-align:center">
+      <a href="{signup_url}" style="display:inline-block;background:#CBFF00;color:#0E0D12;font-weight:700;font-family:monospace;padding:14px 32px;border-radius:6px;text-decoration:none;font-size:14px;letter-spacing:.5px">
+        ▸ Claim Your Free Security Report
+      </a>
+      <div style="font-size:11px;color:#999;margin-top:8px">No credit card required · Takes 60 seconds</div>
+    </div>
+    <div style="background:#f9f9f9;border:1px solid #eee;border-radius:6px;padding:16px;font-size:12px;color:#666">
+      <strong style="color:#333">What you get for free:</strong><br>
+      Full vulnerability scan of {domain} · CVE timeline · AI risk report · NIS2 compliance check
+      <br><br>
+      <a href="{report_url}" style="color:#0066cc;text-decoration:none">Preview your domain report →</a>
+    </div>
+  </div>
+  <div style="background:#f5f5f5;padding:16px 32px;font-size:11px;color:#999;text-align:center">
+    This is an automated security notification from SwarmHawk.<br>
+    To unsubscribe reply with "unsubscribe" · <a href="https://www.swarmhawk.com" style="color:#999">swarmhawk.com</a>
+  </div>
 </body></html>"""
 
 
