@@ -1596,13 +1596,15 @@ def get_me(authorization: str = Header(None)):
     if not result.data:
         raise HTTPException(404, "User not found")
     u = result.data[0]
+    admin = is_admin(u["id"])
     return {
-        "id":       u["id"],
-        "email":    u["email"],
-        "name":     u.get("name", ""),
-        "avatar":   u.get("avatar", ""),
-        "is_admin": is_admin(u["id"]),
-        "auth_type": u.get("auth_type", "google"),
+        "id":            u["id"],
+        "email":         u["email"],
+        "name":          u.get("name", ""),
+        "avatar":        u.get("avatar", ""),
+        "is_admin":      admin,
+        "is_super_admin": admin,   # currently same as is_admin (owner only); extend later for multi-admin tiers
+        "auth_type":     u.get("auth_type", "google"),
     }
 
 
