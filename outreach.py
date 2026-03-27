@@ -1281,6 +1281,8 @@ async def list_prospects(
     country:       str   = "",
     min_cvss:      float = 0,
     limit:         int   = 200,
+    page:          int   = 1,
+    per_page:      int   = 0,    # if set, overrides limit and enables pagination
     authorization: str   = Header(None),
 ):
     """List prospects sorted by CVSS. Reads scan_results as primary source,
@@ -1304,11 +1306,16 @@ async def list_prospects(
         sr_domains: set[str] = set()
         for r in (sr_result.data or []):
             sr_domains.add(r["domain"])
+            def _j(v):
+                if isinstance(v, str):
+                    try: return json.loads(v)
+                    except Exception: return []
+                return v or []
             rows.append({
                 **r,
-                "status":   r.get("outreach_status"),   # normalise field name
-                "software": json.loads(r["software"]) if isinstance(r["software"], str) else (r["software"] or []),
-                "cves":     json.loads(r["cves"])     if isinstance(r["cves"],     str) else (r["cves"]     or []),
+                "status":   r.get("outreach_status"),
+                "software": _j(r.get("software")),
+                "cves":     _j(r.get("cves")),
                 "_source":  "scan_results",
             })
     except Exception as e:
@@ -1329,10 +1336,15 @@ async def list_prospects(
             op_result = q2.order("max_cvss", desc=True).limit(remaining + len(sr_domains)).execute()
             for r in (op_result.data or []):
                 if r["domain"] not in sr_domains:
+                    def _j2(v):
+                        if isinstance(v, str):
+                            try: return json.loads(v)
+                            except Exception: return []
+                        return v or []
                     rows.append({
                         **r,
-                        "software": json.loads(r["software"]) if isinstance(r["software"], str) else (r["software"] or []),
-                        "cves":     json.loads(r["cves"])     if isinstance(r["cves"],     str) else (r["cves"]     or []),
+                        "software": _j2(r.get("software")),
+                        "cves":     _j2(r.get("cves")),
                         "_source":  "outreach_prospects",
                     })
                     if len(rows) >= limit:
@@ -1341,7 +1353,14 @@ async def list_prospects(
             log.warning(f"[prospects] outreach_prospects fallback failed: {e}")
 
     rows.sort(key=lambda r: float(r.get("max_cvss") or 0), reverse=True)
-    return {"prospects": rows[:limit], "total": len(rows[:limit])}
+
+    total = len(rows)
+    if per_page > 0:
+        start = (page - 1) * per_page
+        rows  = rows[start:start + per_page]
+    else:
+        rows  = rows[:limit]
+    return {"prospects": rows, "total": total}
 
 
 def _prospect_update(db, prospect_id: str, sr_data: dict, op_data: dict):
