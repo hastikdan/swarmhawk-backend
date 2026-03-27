@@ -41,9 +41,9 @@ log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLOUDFLARE_TOKEN      = os.getenv("CLOUDFLARE_API_TOKEN", "")
-PIPELINE_WORKERS      = int(os.getenv("PIPELINE_WORKERS", "50"))
-TIER1_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER1_BATCH", "2000"))   # 4× increase from Phase 1
-TIER2_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER2_BATCH", "2000"))
+PIPELINE_WORKERS      = int(os.getenv("PIPELINE_WORKERS", "15"))     # 50 causes OOM on Render free tier
+TIER1_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER1_BATCH", "500"))  # safe default; scale up on paid tier
+TIER2_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER2_BATCH", "200"))
 RADAR_LIMIT           = int(os.getenv("PIPELINE_RADAR_LIMIT", "200"))    # 2× from Phase 1
 CT_LIMIT              = int(os.getenv("PIPELINE_CT_LIMIT", "1000"))
 BULK_LIMIT            = int(os.getenv("PIPELINE_BULK_LIMIT", "250000"))  # domains per bulk source
