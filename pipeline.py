@@ -868,7 +868,7 @@ def get_pipeline_status(db=None) -> dict:
 
     try:
         by_source = {}
-        for src in ("radar", "ct_logs", "majestic", "tranco", "umbrella", "outreach"):
+        for src in ("radar", "ct_logs", "majestic", "tranco", "umbrella", "outreach", "sonar"):
             try:
                 n = db.table("scan_results").select("id", count="exact").eq("source", src).execute().count or 0
                 by_source[src] = n

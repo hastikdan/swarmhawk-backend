@@ -4545,14 +4545,18 @@ def pipeline_run_discovery(authorization: str = Header(None)):
 
 
 @app.post("/pipeline/run-tier1")
-def pipeline_run_tier1(authorization: str = Header(None)):
-    """Admin: manually trigger Tier 1 batch scan of queued domains."""
+def pipeline_run_tier1(authorization: str = Header(None), batch_size: int = 0):
+    """Admin: manually trigger Tier 1 batch scan of queued domains.
+
+    batch_size: override default batch size (0 = use default from env/config)
+    """
     require_admin(authorization)
     try:
-        from pipeline import run_pipeline_daily
+        from pipeline import run_tier1_batch
         import threading
-        threading.Thread(target=run_pipeline_daily, daemon=True).start()
-        return {"status": "tier1 batch started"}
+        kwargs = {"batch_size": batch_size} if batch_size > 0 else {}
+        threading.Thread(target=run_tier1_batch, kwargs=kwargs, daemon=True).start()
+        return {"status": "tier1 batch started", "batch_size": batch_size or "default"}
     except Exception as e:
         raise HTTPException(500, str(e))
 
