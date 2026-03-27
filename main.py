@@ -2173,6 +2173,116 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     }
 
 
+@app.get("/domains/{domain_id}/typosquat")
+def get_domain_typosquat(domain_id: str, authorization: str = Header(None)):
+    """
+    Return full typosquat analysis for a domain:
+    - registered: candidates that resolve via DNS (threats)
+    - available:  candidates not registered (buy suggestions)
+    """
+    import socket as _socket
+    import concurrent.futures as _cf
+    import urllib.parse as _up
+
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    domain_row = db.table("domains").select("domain").eq("id", domain_id).eq("user_id", user["sub"]).single().execute()
+    if not domain_row.data:
+        raise HTTPException(404, "Domain not found")
+
+    domain = domain_row.data["domain"].lower().strip()
+    parts  = domain.split(".")
+    if len(parts) < 2:
+        return {"domain": domain, "registered": [], "available": []}
+
+    name = parts[0]
+    tld  = ".".join(parts[1:])
+
+    candidates: set = set()
+
+    # 1. Character substitutions (leet + homoglyphs)
+    subs = {"a": ["4", "@"], "e": ["3"], "i": ["1", "l"], "o": ["0"], "s": ["5", "$"], "l": ["1"]}
+    for i, c in enumerate(name):
+        for alt in subs.get(c, []):
+            candidates.add(f"{name[:i]}{alt}{name[i+1:]}.{tld}")
+
+    # 2. Missing / doubled characters
+    for i in range(len(name)):
+        candidates.add(f"{name[:i]+name[i+1:]}.{tld}")
+        candidates.add(f"{name[:i]+name[i]+name[i]+name[i+1:]}.{tld}")
+
+    # 3. Adjacent keyboard transpositions
+    for i in range(len(name) - 1):
+        t = list(name); t[i], t[i+1] = t[i+1], t[i]
+        candidates.add("".join(t) + "." + tld)
+
+    # 4. TLD variations
+    for alt_tld in ["com", "net", "org", "io", "eu", "co", "app", "dev", "security"]:
+        if alt_tld != tld:
+            candidates.add(f"{name}.{alt_tld}")
+
+    # 5. Hyphen insertion
+    for i in range(1, len(name)):
+        candidates.add(f"{name[:i]}-{name[i:]}.{tld}")
+
+    # 6. Common prefix/suffix squats
+    tld_base = tld.split(".")[0]
+    for affix in [f"{name}-{tld_base}", f"{tld_base}-{name}", f"{name}online",
+                  f"{name}secure", f"my{name}", f"{name}app", f"get{name}", f"{name}help"]:
+        candidates.add(f"{affix}.com")
+
+    # Remove the original domain itself
+    candidates.discard(domain)
+    # Keep max 60 unique candidates
+    candidates = list(candidates)[:60]
+
+    # Check DNS (registered) + RDAP (available) in parallel
+    def _check(candidate):
+        registered = False
+        available  = False
+        try:
+            _socket.getaddrinfo(candidate, None, _socket.AF_INET, _socket.SOCK_STREAM)
+            registered = True
+        except _socket.gaierror:
+            # Not in DNS — check RDAP for availability
+            try:
+                r = requests.get(
+                    f"https://rdap.org/domain/{candidate}",
+                    timeout=5, allow_redirects=True,
+                    headers={"Accept": "application/json", "User-Agent": "SwarmHawk/1.0"},
+                )
+                if r.status_code in (404, 400):
+                    available = True
+            except Exception:
+                pass
+        return candidate, registered, available
+
+    registered_list = []
+    available_list  = []
+
+    with _cf.ThreadPoolExecutor(max_workers=20) as ex:
+        for cand, is_registered, is_available in ex.map(_check, candidates):
+            if is_registered:
+                registered_list.append(cand)
+            elif is_available:
+                available_list.append(cand)
+
+    # Sort — shorter / most similar first
+    registered_list.sort(key=len)
+    available_list.sort(key=len)
+
+    def _buy_url(d):
+        return "https://www.namecheap.com/domains/registration/results/?domain=" + _up.quote(d)
+
+    return {
+        "domain":     domain,
+        "registered": registered_list,
+        "available":  [{"domain": d, "buy_url": _buy_url(d)} for d in available_list[:20]],
+        "total_checked": len(candidates),
+    }
+
+
 @app.get("/domains/{domain_id}/report/pdf")
 def download_report_pdf(domain_id: str, authorization: str = Header(None)):
     """Download the latest scan report as a PDF attachment."""
