@@ -19,9 +19,11 @@ Tables needed (run schema_outreach.sql in Supabase):
   outreach_log
 """
 
-import os, re, time, json, hashlib, io, csv, zipfile
+import os, re, time, json, hashlib, io, csv, zipfile, logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 import httpx
 import requests as req
@@ -1437,32 +1439,64 @@ async def discover_prospect_contact(prospect_id: str, authorization: str = Heade
     require_admin(authorization)
     db = get_db()
 
-    # Resolve domain from scan_results or outreach_prospects
+    # Resolve domain — try by id, then by domain column, then treat id as domain
     domain = None
+    resolved_id = prospect_id  # actual DB id for the update
     source_table = None
+
+    # 1) lookup by id in scan_results
     try:
         r = db.table("scan_results").select("id,domain,contact_email").eq("id", prospect_id).limit(1).execute()
         if r.data:
             domain = r.data[0]["domain"]
             source_table = "scan_results"
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"[discover-contact] scan_results id-lookup failed for {prospect_id}: {e}")
+
+    # 2) lookup by id in outreach_prospects
     if not domain:
         try:
             r = db.table("outreach_prospects").select("id,domain,contact_email").eq("id", prospect_id).limit(1).execute()
             if r.data:
                 domain = r.data[0]["domain"]
                 source_table = "outreach_prospects"
+        except Exception as e:
+            log.warning(f"[discover-contact] outreach_prospects id-lookup failed for {prospect_id}: {e}")
+
+    # 3) prospect_id might itself be a domain name (when p.id was null in JS)
+    if not domain and "." in prospect_id and not prospect_id.startswith("http"):
+        domain_candidate = prospect_id.lower().strip()
+        # Try to find actual DB id by domain for the update
+        try:
+            r = db.table("scan_results").select("id,domain,contact_email").eq("domain", domain_candidate).limit(1).execute()
+            if r.data:
+                domain = r.data[0]["domain"]
+                resolved_id = r.data[0]["id"]
+                source_table = "scan_results"
         except Exception:
             pass
+        if not domain:
+            try:
+                r = db.table("outreach_prospects").select("id,domain,contact_email").eq("domain", domain_candidate).limit(1).execute()
+                if r.data:
+                    domain = r.data[0]["domain"]
+                    resolved_id = r.data[0]["id"]
+                    source_table = "outreach_prospects"
+            except Exception:
+                pass
+        if not domain:
+            # Use as domain directly — discovery will still work even if we can't persist
+            domain = domain_candidate
+            source_table = "domain_direct"
+
     if not domain:
-        raise HTTPException(404, "Prospect not found")
+        raise HTTPException(404, f"Prospect {prospect_id} not found")
 
     emails = discover_all_contacts(domain)
     primary = emails[0] if emails else None
 
     if primary:
-        _prospect_update(db, prospect_id,
+        _prospect_update(db, resolved_id,
             sr_data={"contact_email": primary},
             op_data={"contact_email": primary},
         )
