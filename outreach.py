@@ -56,6 +56,21 @@ UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
 
 # ── Portkey-aware Anthropic call helper ───────────────────────────────────────
 
+def _safe_json_list(val) -> list:
+    """Safely parse a value that should be a JSON list."""
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, str):
+        try:
+            parsed = json.loads(val)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+
 def _anthropic_url() -> str:
     return "https://api.portkey.ai/v1/messages" if PORTKEY_API_KEY else "https://api.anthropic.com/v1/messages"
 
@@ -1306,16 +1321,11 @@ async def list_prospects(
         sr_domains: set[str] = set()
         for r in (sr_result.data or []):
             sr_domains.add(r["domain"])
-            def _j(v):
-                if isinstance(v, str):
-                    try: return json.loads(v)
-                    except Exception: return []
-                return v or []
             rows.append({
                 **r,
                 "status":   r.get("outreach_status"),
-                "software": _j(r.get("software")),
-                "cves":     _j(r.get("cves")),
+                "software": _safe_json_list(r.get("software")),
+                "cves":     _safe_json_list(r.get("cves")),
                 "_source":  "scan_results",
             })
     except Exception as e:
@@ -1336,15 +1346,10 @@ async def list_prospects(
             op_result = q2.order("max_cvss", desc=True).limit(remaining + len(sr_domains)).execute()
             for r in (op_result.data or []):
                 if r["domain"] not in sr_domains:
-                    def _j2(v):
-                        if isinstance(v, str):
-                            try: return json.loads(v)
-                            except Exception: return []
-                        return v or []
                     rows.append({
                         **r,
-                        "software": _j2(r.get("software")),
-                        "cves":     _j2(r.get("cves")),
+                        "software": _safe_json_list(r.get("software")),
+                        "cves":     _safe_json_list(r.get("cves")),
                         "_source":  "outreach_prospects",
                     })
                     if len(rows) >= limit:
