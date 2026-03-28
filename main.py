@@ -58,6 +58,7 @@ ADMIN_EMAIL         = os.getenv("ADMIN_EMAIL", "hastikdan@gmail.com")  # super-a
 PORTKEY_API_KEY      = os.getenv("PORTKEY_API_KEY", "")                 # Portkey AI gateway key
 PORTKEY_WORKSPACE    = os.getenv("PORTKEY_WORKSPACE_SLUG", "")          # Portkey workspace slug
 PARANOIDLAB_API_KEY = os.getenv("PARANOIDLAB_API_KEY", "")              # paranoidlab.com leak intel
+SHODAN_API_KEY      = os.getenv("SHODAN_API_KEY", "")                   # shodan.io attack surface intel
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("OUTREACH_FROM", "hello@swarmhawk.com")       # verified Resend domain
 REPORT_FROM_EMAIL   = os.getenv("REPORT_FROM_EMAIL", "reports@swarmhawk.com") # user-facing reports
@@ -6015,6 +6016,228 @@ def admin_logs(limit: int = 100, authorization: str = Header(None)):
         })
 
     return {"logs": logs, "total": len(logs)}
+
+
+# ── Attack Surface / Attacker View ────────────────────────────────────────────
+@app.get("/domains/{domain_id}/attack-surface")
+async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
+    """
+    Authenticated — full attack surface analysis for a domain.
+    Combines Shodan port/banner/CVE data, ParanoidLab breach intel,
+    existing scan results, and an AI-generated attack narrative.
+    """
+    import socket as _sock
+    import json as _json
+
+    user = get_user_from_header(authorization)
+    db   = get_db()
+
+    d = db.table("domains").select("id,user_id,domain").eq("id", domain_id).execute()
+    if not d.data or d.data[0]["user_id"] != user["sub"]:
+        raise HTTPException(403, "Not found")
+    domain = d.data[0]["domain"]
+
+    # ── Existing scan results ──────────────────────────────────────────────────
+    scan = db.table("scan_results").select(
+        "risk_score,max_cvss,checks,last_scanned_at,spf_status,dmarc_status,blacklisted,waf_detected"
+    ).eq("domain", domain).order("last_scanned_at", desc=True).limit(1).execute()
+    scan_data = scan.data[0] if scan.data else {}
+
+    raw_checks = scan_data.get("checks") or []
+    if isinstance(raw_checks, str):
+        try: raw_checks = _json.loads(raw_checks)
+        except: raw_checks = []
+    checks = raw_checks if isinstance(raw_checks, list) else []
+
+    # ── Resolve domain → IPs ──────────────────────────────────────────────────
+    ips = []
+    try:
+        info = _sock.getaddrinfo(domain, None)
+        ips = list(dict.fromkeys(
+            i[4][0] for i in info if ":" not in i[4][0]
+        ))[:3]
+    except Exception:
+        pass
+
+    # ── Shodan lookup per IP ──────────────────────────────────────────────────
+    shodan_results = []
+    if SHODAN_API_KEY and ips:
+        for ip in ips[:2]:
+            try:
+                r = requests.get(
+                    f"https://api.shodan.io/shodan/host/{ip}",
+                    params={"key": SHODAN_API_KEY},
+                    timeout=15,
+                )
+                if r.status_code == 200:
+                    sh = r.json()
+                    services = []
+                    for item in (sh.get("data") or []):
+                        services.append({
+                            "port":      item.get("port"),
+                            "transport": item.get("transport", "tcp"),
+                            "product":   item.get("product", ""),
+                            "version":   item.get("version", ""),
+                            "banner":    (item.get("data") or "")[:200],
+                            "vulns":     list((item.get("vulns") or {}).keys()),
+                        })
+                    shodan_results.append({
+                        "ip":         ip,
+                        "org":        sh.get("org", ""),
+                        "isp":        sh.get("isp", ""),
+                        "os":         sh.get("os", ""),
+                        "country":    sh.get("country_name", ""),
+                        "open_ports": sh.get("ports", []),
+                        "services":   services,
+                        "vulns":      {k: v for k, v in (sh.get("vulns") or {}).items()},
+                        "hostnames":  sh.get("hostnames", []),
+                        "tags":       sh.get("tags", []),
+                        "last_update": sh.get("last_update", ""),
+                    })
+                elif r.status_code == 404:
+                    shodan_results.append({"ip": ip, "note": "not in Shodan index"})
+            except Exception as e:
+                shodan_results.append({"ip": ip, "error": str(e)})
+
+    # ── ParanoidLab breach data ───────────────────────────────────────────────
+    leaks_data: dict = {}
+    try:
+        leaks_data = paranoidlab_leaks(domain, limit=10)
+    except Exception:
+        pass
+
+    leak_total = leaks_data.get("total", 0)
+
+    # ── Build attack graph (nodes + edges) ────────────────────────────────────
+    risk_score = scan_data.get("risk_score") or 0
+    graph_nodes = [{
+        "id": "domain", "label": domain,
+        "type": "domain",
+        "risk": "critical" if risk_score >= 80 else "high" if risk_score >= 60 else "medium",
+    }]
+    graph_edges = []
+
+    for sh in shodan_results:
+        ip = sh.get("ip", "")
+        if not ip or sh.get("error") or sh.get("note"):
+            continue
+        ip_id = f"ip_{ip}"
+        graph_nodes.append({"id": ip_id, "label": ip, "type": "ip", "risk": "medium"})
+        graph_edges.append({"from": "domain", "to": ip_id})
+
+        for svc in (sh.get("services") or [])[:6]:
+            port = svc.get("port")
+            svc_id = f"svc_{ip}_{port}"
+            label = f":{port} {(svc.get('product') or svc.get('transport') or '')}".strip()
+            has_vulns = bool(svc.get("vulns"))
+            graph_nodes.append({
+                "id": svc_id, "label": label,
+                "type": "service", "risk": "critical" if has_vulns else "low",
+            })
+            graph_edges.append({"from": ip_id, "to": svc_id})
+
+            for cve in (svc.get("vulns") or [])[:2]:
+                cve_id = f"cve_{cve}"
+                if not any(n["id"] == cve_id for n in graph_nodes):
+                    graph_nodes.append({"id": cve_id, "label": cve, "type": "cve", "risk": "critical"})
+                graph_edges.append({"from": svc_id, "to": cve_id})
+
+    if leak_total > 0:
+        graph_nodes.append({
+            "id": "leaks", "label": f"{leak_total} Leaks",
+            "type": "breach", "risk": "critical",
+        })
+        graph_edges.append({"from": "domain", "to": "leaks"})
+
+    # ── AI attack narrative ───────────────────────────────────────────────────
+    narrative: dict = {"summary": "", "attack_chain": [], "fix_priority": []}
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+
+    if api_key:
+        port_summary = []
+        all_cves = []
+        for sh in shodan_results:
+            for svc in (sh.get("services") or [])[:5]:
+                label = f":{svc['port']} {svc.get('product','')} {svc.get('version','')}".strip()
+                port_summary.append(label)
+            for cve_id, cve_info in list((sh.get("vulns") or {}).items())[:4]:
+                cvss = (cve_info or {}).get("cvss", "?")
+                all_cves.append(f"{cve_id} (CVSS {cvss})")
+
+        critical_checks = [c.get("check","") for c in checks if isinstance(c, dict) and c.get("status") == "critical"]
+
+        prompt = (
+            f"Domain: {domain}\n"
+            f"Risk Score: {risk_score}/100  |  Max CVSS: {scan_data.get('max_cvss', 0)}\n"
+            f"Resolved IPs: {', '.join(ips) or 'none'}\n"
+            f"Open ports/services: {', '.join(port_summary[:8]) or 'none detected by Shodan'}\n"
+            f"CVEs on this host: {', '.join(all_cves[:5]) or 'none'}\n"
+            f"Credential leaks: {leak_total} records found in breach databases\n"
+            f"WAF detected: {scan_data.get('waf_detected', False)}\n"
+            f"SPF: {scan_data.get('spf_status','?')}  DMARC: {scan_data.get('dmarc_status','?')}\n"
+            f"Critical security gaps: {', '.join(critical_checks[:6]) or 'none'}\n\n"
+            f"Write a realistic penetration tester's assessment with exactly these sections:\n\n"
+            f"ATTACK SUMMARY\n"
+            f"2-3 sentences describing the overall attack opportunity for this domain.\n\n"
+            f"ATTACK CHAIN\n"
+            f"4 numbered steps showing a realistic attack progression for this specific domain "
+            f"(reconnaissance → initial access → exploitation → impact). Each step one sentence.\n\n"
+            f"FIX PRIORITY\n"
+            f"5 numbered remediation actions in priority order. Each on its own line starting with the number.\n"
+        )
+        try:
+            result = _call_claude_sync(
+                api_key=api_key,
+                model="claude-haiku-4-5-20251001",
+                max_tokens=900,
+                system=(
+                    "You are a senior penetration tester. Be direct and technical. "
+                    "Base your assessment only on the evidence provided. "
+                    "Never invent CVEs or IP addresses. If data is missing, say so briefly."
+                ),
+                messages=[{"role": "user", "content": prompt}],
+                metadata={"report_type": "attack_surface", "_user": user["sub"], "domain": domain},
+            )
+            full_text = result.get("content", [{}])[0].get("text", "")
+            current = None
+            for line in full_text.split("\n"):
+                t = line.strip()
+                if not t:
+                    continue
+                if "ATTACK SUMMARY" in t.upper():
+                    current = "summary"; continue
+                if "ATTACK CHAIN" in t.upper():
+                    current = "chain"; continue
+                if "FIX PRIORITY" in t.upper():
+                    current = "fix"; continue
+                if current == "summary":
+                    narrative["summary"] += t + " "
+                elif current == "chain" and t and t[0].isdigit():
+                    narrative["attack_chain"].append(t)
+                elif current == "fix" and t and t[0].isdigit():
+                    narrative["fix_priority"].append(t)
+            narrative["summary"] = narrative["summary"].strip()
+        except Exception as e:
+            narrative["summary"] = f"AI narrative unavailable: {e}"
+
+    return {
+        "domain":      domain,
+        "ips":         ips,
+        "risk_score":  risk_score,
+        "max_cvss":    scan_data.get("max_cvss", 0),
+        "shodan":      shodan_results,
+        "leaks":       {"total": leak_total, "items": (leaks_data.get("items") or [])[:5]},
+        "graph":       {"nodes": graph_nodes, "edges": graph_edges},
+        "narrative":   narrative,
+        "scan_findings": {
+            "critical": [c for c in checks if isinstance(c, dict) and c.get("status") == "critical"],
+            "warnings":  [c for c in checks if isinstance(c, dict) and c.get("status") == "warning"],
+        },
+        "meta": {
+            "shodan_available": bool(SHODAN_API_KEY),
+            "paranoidlab_available": bool(PARANOIDLAB_API_KEY),
+        },
+    }
 
 
 # ── Public contact form ────────────────────────────────────────────────────────
