@@ -4364,7 +4364,7 @@ def domain_death_predictor(domain_id: str, authorization: str = Header(None)):
 # ══════════════════════════════════════════════════════════════════════════════
 
 _map_cache: dict = {"data": None, "built_at": None}
-_MAP_CACHE_TTL = 3600  # 1 hour
+_MAP_CACHE_TTL = 900  # 15 minutes — refresh faster as worker scans more
 
 
 def _build_map_data() -> dict:
