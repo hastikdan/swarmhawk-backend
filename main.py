@@ -6108,12 +6108,27 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
 
     leak_total = leaks_data.get("total", 0)
 
-    # ── Build attack graph (nodes + edges) ────────────────────────────────────
+    # ── Build attack graph (nodes + edges) — solutions-page taxonomy ─────────
+    # node types: entry (red)=CVE services/breach, pivot (amber)=IPs/clean svc,
+    #             critical (lime)=the domain target, safe (blue)=no-risk services
     risk_score = scan_data.get("risk_score") or 0
+
+    # MITRE ATT&CK technique by port
+    _mitre = {
+        22: "T1021.004", 23: "T1021", 3389: "T1021.001",
+        21: "T1021", 2049: "T1021",
+        25: "T1566", 465: "T1566", 587: "T1566",
+        80: "T1190", 443: "T1190", 8080: "T1190", 8443: "T1190",
+        3306: "T1190", 5432: "T1190", 1433: "T1190", 27017: "T1190",
+        6379: "T1190", 9200: "T1190", 11211: "T1190",
+        6667: "T1102", 4444: "T1059",
+    }
+
     graph_nodes = [{
-        "id": "domain", "label": domain,
-        "type": "domain",
-        "risk": "critical" if risk_score >= 80 else "high" if risk_score >= 60 else "medium",
+        "id": "domain_root", "label": domain,
+        "type": "critical",
+        "detail": f"Target domain\nRisk score: {risk_score}/100\nAll breach paths converge here",
+        "cvss": 0,
     }]
     graph_edges = []
 
@@ -6122,32 +6137,56 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
         if not ip or sh.get("error") or sh.get("note"):
             continue
         ip_id = f"ip_{ip}"
-        graph_nodes.append({"id": ip_id, "label": ip, "type": "ip", "risk": "medium"})
-        graph_edges.append({"from": "domain", "to": ip_id})
+        org = sh.get("org") or sh.get("isp") or ""
+        graph_nodes.append({
+            "id": ip_id, "label": ip, "type": "pivot",
+            "detail": f"IP: {ip}\n{org}\nT1590 Gather Network Info",
+            "cvss": 0,
+        })
+        # pivot IP → critical domain
+        graph_edges.append({"from": ip_id, "to": "domain_root", "label": "T1590"})
 
         for svc in (sh.get("services") or [])[:6]:
             port = svc.get("port")
             svc_id = f"svc_{ip}_{port}"
-            label = f":{port} {(svc.get('product') or svc.get('transport') or '')}".strip()
-            has_vulns = bool(svc.get("vulns"))
-            graph_nodes.append({
-                "id": svc_id, "label": label,
-                "type": "service", "risk": "critical" if has_vulns else "low",
-            })
-            graph_edges.append({"from": ip_id, "to": svc_id})
+            product = (svc.get("product") or svc.get("transport") or "").strip()
+            version = (svc.get("version") or "").strip()
+            label = f":{port} {product}".strip()
+            vulns = svc.get("vulns") or []
+            mitre = _mitre.get(port, "T1190")
 
-            for cve in (svc.get("vulns") or [])[:2]:
-                cve_id = f"cve_{cve}"
-                if not any(n["id"] == cve_id for n in graph_nodes):
-                    graph_nodes.append({"id": cve_id, "label": cve, "type": "cve", "risk": "critical"})
-                graph_edges.append({"from": svc_id, "to": cve_id})
+            if vulns:
+                cve_summary = ", ".join(vulns[:3])
+                detail = f"{product} {version}\n{cve_summary}\n{mitre} Exploit Public-Facing App"
+                graph_nodes.append({
+                    "id": svc_id, "label": label, "type": "entry",
+                    "detail": detail, "cvss": 8.0,
+                })
+                # entry service → pivot IP → critical domain
+                graph_edges.append({"from": svc_id, "to": ip_id, "label": mitre})
+            elif port in _mitre:
+                detail = f"{product} {version}\n{mitre} Lateral Movement pivot"
+                graph_nodes.append({
+                    "id": svc_id, "label": label, "type": "pivot",
+                    "detail": detail, "cvss": 0,
+                })
+                graph_edges.append({"from": svc_id, "to": ip_id, "label": "T1046"})
+            else:
+                detail = f"{product} {version}\nNo known vulnerabilities"
+                graph_nodes.append({
+                    "id": svc_id, "label": label, "type": "safe",
+                    "detail": detail, "cvss": 0,
+                })
+                graph_edges.append({"from": svc_id, "to": ip_id, "label": "T1046"})
 
     if leak_total > 0:
         graph_nodes.append({
-            "id": "leaks", "label": f"{leak_total} Leaks",
-            "type": "breach", "risk": "critical",
+            "id": "leaks", "label": f"{leak_total} Creds",
+            "type": "entry",
+            "detail": f"{leak_total} leaked credentials found\nT1078 Valid Accounts\nDirect domain access via cred stuffing",
+            "cvss": 7.0,
         })
-        graph_edges.append({"from": "domain", "to": "leaks"})
+        graph_edges.append({"from": "leaks", "to": "domain_root", "label": "T1078"})
 
     # ── AI attack narrative ───────────────────────────────────────────────────
     narrative: dict = {"summary": "", "attack_chain": [], "fix_priority": []}
