@@ -4480,6 +4480,7 @@ def _build_map_data() -> dict:
         "total_domains": sum(r["domains"] for r in result),
         "total_scanned": sum(r["scanned"] for r in result),
         "generated_at":  now,
+        "last_updated":  now,
     }
 
 
