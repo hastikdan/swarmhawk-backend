@@ -6015,3 +6015,78 @@ def admin_logs(limit: int = 100, authorization: str = Header(None)):
         })
 
     return {"logs": logs, "total": len(logs)}
+
+
+# ── Public contact form ────────────────────────────────────────────────────────
+class ContactFormRequest(BaseModel):
+    first: str
+    last: str
+    email: str
+    company: str = ""
+    topic: str
+    message: str
+
+@app.post("/contact")
+def submit_contact_form(body: ContactFormRequest):
+    """Public: receive contact form submission and forward to hello@swarmhawk.com via Resend."""
+    if not RESEND_API_KEY:
+        raise HTTPException(503, "Email service not configured")
+
+    # Basic validation
+    if not body.first.strip() or not body.last.strip() or not body.email.strip() or not body.message.strip():
+        raise HTTPException(400, "Required fields missing")
+    if len(body.message) > 2000:
+        raise HTTPException(400, "Message too long")
+
+    topic_labels = {
+        "sales": "Sales & Pricing Enquiry",
+        "technical": "Technical Support Request",
+        "api": "API & Integration Question",
+        "enterprise": "Enterprise / Partnership",
+        "security": "Security Vulnerability Report",
+        "gdpr": "Privacy / GDPR Request",
+        "media": "Press & Media Enquiry",
+        "other": "General Enquiry",
+    }
+
+    to_email = (
+        "security@swarmhawk.com"   if body.topic == "security"   else
+        "privacy@swarmhawk.com"    if body.topic == "gdpr"        else
+        "enterprise@swarmhawk.com" if body.topic == "enterprise"  else
+        "hello@swarmhawk.com"
+    )
+    subject = f"[SwarmHawk] {topic_labels.get(body.topic, 'Enquiry')} — {body.first} {body.last}"
+
+    html_body = f"""
+    <div style="font-family:sans-serif;max-width:600px;margin:0 auto;background:#0E0D12;color:#fff;padding:32px;border-radius:8px">
+      <div style="color:#CBFF00;font-family:monospace;font-size:18px;font-weight:700;margin-bottom:24px">SWARM<span style="color:#C0392B">HAWK</span> — Contact Form</div>
+      <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+        <tr><td style="padding:8px 0;color:#6B7280;font-size:13px;width:120px">From</td><td style="padding:8px 0;color:#fff;font-size:14px">{body.first} {body.last}</td></tr>
+        <tr><td style="padding:8px 0;color:#6B7280;font-size:13px">Email</td><td style="padding:8px 0"><a href="mailto:{body.email}" style="color:#CBFF00">{body.email}</a></td></tr>
+        {"<tr><td style='padding:8px 0;color:#6B7280;font-size:13px'>Company</td><td style='padding:8px 0;color:#fff;font-size:14px'>" + body.company + "</td></tr>" if body.company else ""}
+        <tr><td style="padding:8px 0;color:#6B7280;font-size:13px">Topic</td><td style="padding:8px 0;color:#CBFF00;font-size:14px">{topic_labels.get(body.topic, body.topic)}</td></tr>
+      </table>
+      <div style="background:#111318;border:1px solid rgba(203,255,0,.1);border-radius:8px;padding:20px;font-size:15px;color:#b0adc0;line-height:1.7;white-space:pre-wrap">{body.message}</div>
+      <div style="margin-top:24px;font-size:12px;color:#3d3c4a">Sent via swarmhawk.com/contact.html</div>
+    </div>
+    """
+
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":     f"SwarmHawk Contact <{FROM_EMAIL}>",
+                "to":       [to_email],
+                "reply_to": [body.email],
+                "subject":  subject,
+                "html":     html_body,
+            },
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            raise HTTPException(502, f"Email delivery failed: {resp.text}")
+    except requests.RequestException as e:
+        raise HTTPException(502, f"Email service unreachable: {e}")
+
+    return {"ok": True, "delivered_to": to_email}
