@@ -791,6 +791,298 @@ def check_ip_intel(domain: str) -> CheckResult:
     return _check_ip_intel(domain)
 
 
+def check_ports(domain: str) -> CheckResult:
+    """Active port scan — TCP connect to 30 common ports, flags dangerously exposed services."""
+    import socket as _sock
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    result = CheckResult("ports", domain)
+
+    try:
+        ip = _sock.gethostbyname(domain)
+    except Exception:
+        return result.error("Could not resolve domain for port scan")
+
+    PORTS = {
+        21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 80: "HTTP",
+        110: "POP3", 143: "IMAP", 443: "HTTPS", 445: "SMB/NetBIOS",
+        993: "IMAPS", 995: "POP3S", 1433: "MSSQL", 1521: "Oracle DB",
+        2375: "Docker API (unencrypted)", 2376: "Docker TLS",
+        3000: "Dev server", 3306: "MySQL", 3389: "RDP",
+        4443: "Alt HTTPS", 5432: "PostgreSQL", 5900: "VNC",
+        6379: "Redis", 8080: "Alt HTTP", 8443: "Alt HTTPS",
+        8888: "Jupyter Notebook", 9200: "Elasticsearch", 9300: "Elasticsearch cluster",
+        27017: "MongoDB", 11211: "Memcached", 6443: "Kubernetes API",
+    }
+    # Services that must never be internet-facing
+    CRITICAL_PORTS = {3306, 5432, 27017, 6379, 1433, 1521, 9200, 9300, 11211, 2375, 5900, 445, 23, 6443}
+    HIGH_RISK_PORTS = {3389, 3000, 8888, 2376}
+
+    open_ports: list[int] = []
+
+    def _probe(port: int) -> int | None:
+        try:
+            s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+            s.settimeout(1.5)
+            r = s.connect_ex((ip, port))
+            s.close()
+            return port if r == 0 else None
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=len(PORTS)) as ex:
+        for p in [f.result() for f in _as_completed({ex.submit(_probe, port) for port in PORTS})]:
+            if p is not None:
+                open_ports.append(p)
+
+    open_ports.sort()
+
+    if not open_ports:
+        return result.ok(
+            "No dangerous ports exposed",
+            f"Scanned {len(PORTS)} common ports — all closed or filtered",
+        )
+
+    labels = [f"{p}/{PORTS[p]}" for p in open_ports]
+    detail = "Open ports: " + ", ".join(labels)
+
+    critical_exposed = [p for p in open_ports if p in CRITICAL_PORTS]
+    high_risk_exposed = [p for p in open_ports if p in HIGH_RISK_PORTS]
+
+    if critical_exposed:
+        c_labels = [f"{p}/{PORTS[p]}" for p in critical_exposed]
+        return result.critical(
+            f"Critical services internet-exposed — {', '.join(c_labels)}",
+            detail + "\nThese services should be firewalled from the public internet.",
+            impact=20,
+        )
+    elif high_risk_exposed:
+        h_labels = [f"{p}/{PORTS[p]}" for p in high_risk_exposed]
+        return result.warn(
+            f"Sensitive ports open — {', '.join(h_labels)}",
+            detail + "\nRestrict access to known IP addresses.",
+            impact=10,
+        )
+    else:
+        non_standard = [p for p in open_ports if p not in {80, 443, 22, 25, 993, 995, 110, 143, 21}]
+        if non_standard:
+            ns_labels = [f"{p}/{PORTS[p]}" for p in non_standard]
+            return result.warn(
+                f"Non-standard ports open — review required",
+                detail + f"\nUnexpected: {', '.join(ns_labels)}",
+                impact=5,
+            )
+        return result.ok(f"{len(open_ports)} standard ports open", detail)
+
+
+def check_subdomains(domain: str) -> CheckResult:
+    """Subdomain enumeration via Certificate Transparency logs (crt.sh) and DNS wordlist."""
+    import socket as _sock
+    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+    result = CheckResult("subdomains", domain)
+
+    # Normalise to root domain
+    parts = domain.lower().lstrip("www.").split(".")
+    base = ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+    WORDLIST = [
+        "www", "mail", "email", "webmail", "smtp", "pop", "imap", "mx", "mx1", "mx2",
+        "ftp", "sftp", "files",
+        "admin", "administrator", "portal", "dashboard", "panel", "cp", "cpanel", "whm",
+        "api", "api2", "v1", "v2", "v3", "graphql", "rest", "ws",
+        "dev", "develop", "development", "staging", "stage", "stg",
+        "test", "testing", "qa", "uat", "beta", "demo", "sandbox", "preview",
+        "app", "app2", "apps", "web", "web2",
+        "cdn", "assets", "static", "media", "images", "img", "files", "uploads",
+        "blog", "shop", "store", "support", "help", "kb", "docs", "wiki",
+        "vpn", "remote", "gateway", "rdp", "ssh", "bastion",
+        "ns1", "ns2", "dns1", "dns2",
+        "git", "gitlab", "github", "bitbucket",
+        "jenkins", "ci", "build", "deploy", "cd",
+        "db", "database", "mysql", "postgres", "redis", "mongo", "elastic",
+        "monitor", "monitoring", "status", "metrics", "grafana", "kibana",
+        "internal", "intranet", "corp", "private",
+        "old", "legacy", "backup",
+        "mobile", "m",
+    ]
+
+    SENSITIVE = {
+        "admin", "administrator", "dev", "develop", "development", "staging", "stage", "stg",
+        "test", "testing", "qa", "uat", "beta", "demo", "sandbox",
+        "git", "gitlab", "github", "bitbucket", "jenkins", "ci", "build", "deploy",
+        "db", "database", "mysql", "postgres", "redis", "mongo", "elastic",
+        "internal", "intranet", "corp", "private", "old", "legacy", "backup",
+        "cpanel", "whm", "panel", "kibana", "grafana",
+    }
+
+    # ── CT log discovery (crt.sh) ─────────────────────────────────────────────
+    ct_subs: set[str] = set()
+    try:
+        r = requests.get(
+            f"https://crt.sh/?q=%.{base}&output=json",
+            timeout=15, headers=HEADERS,
+        )
+        if r.status_code == 200:
+            import re as _re
+            for entry in r.json():
+                for name in entry.get("name_value", "").split("\n"):
+                    name = name.strip().lstrip("*.")
+                    if name.endswith(f".{base}"):
+                        sub = name[: -(len(base) + 1)]
+                        # skip multi-level wildcards like *.foo.example.com
+                        if sub and "." not in sub:
+                            ct_subs.add(sub)
+    except Exception:
+        pass
+
+    all_subs = list(set(WORDLIST) | ct_subs)
+
+    # ── DNS resolution ────────────────────────────────────────────────────────
+    found: list[str] = []
+    sensitive_found: list[str] = []
+
+    def _resolve(sub: str) -> str | None:
+        try:
+            _sock.gethostbyname(f"{sub}.{base}")
+            return sub
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=40) as ex:
+        for sub in [f.result() for f in _as_completed({ex.submit(_resolve, s) for s in all_subs})]:
+            if sub:
+                found.append(sub)
+                if sub in SENSITIVE:
+                    sensitive_found.append(sub)
+
+    found.sort()
+    total = len(found)
+
+    if total == 0:
+        return result.ok(
+            "No exposed subdomains found",
+            f"Checked CT logs + {len(WORDLIST)}-entry wordlist — nothing resolved",
+        )
+
+    detail = f"{total} subdomains discovered: " + ", ".join(found[:25])
+    if total > 25:
+        detail += f" (+{total - 25} more)"
+
+    if sensitive_found:
+        sensitive_found.sort()
+        return result.critical(
+            f"Sensitive subdomains exposed — {', '.join(sensitive_found[:4])}",
+            detail + f"\nSensitive: {', '.join(sensitive_found)}\nThese environments may lack production-grade hardening.",
+            impact=15,
+        )
+    elif total > 15:
+        return result.warn(
+            f"Large subdomain footprint — {total} subdomains",
+            detail + "\nLarge attack surface — audit each subdomain for security posture.",
+            impact=5,
+        )
+    else:
+        return result.ok(
+            f"{total} subdomains found — no sensitive exposure",
+            detail,
+        )
+
+
+def check_cms(domain: str) -> CheckResult:
+    """CMS & technology fingerprinting — detects platform and version strings that aid attackers."""
+    import re as _re
+    result = CheckResult("cms", domain)
+
+    try:
+        r = requests.get(
+            f"https://{domain}", timeout=10, headers=HEADERS, allow_redirects=True,
+        )
+    except Exception:
+        try:
+            r = requests.get(f"http://{domain}", timeout=10, headers=HEADERS, allow_redirects=True)
+        except Exception as e:
+            return result.error("Could not fetch site for CMS fingerprinting", str(e)[:80])
+
+    body = r.text.lower()
+    hdrs = {k.lower(): v for k, v in r.headers.items()}
+    detected: list[str] = []
+    version_strings: list[str] = []
+
+    # ── WordPress ─────────────────────────────────────────────────────────────
+    if "/wp-content/" in body or "/wp-includes/" in body:
+        detected.append("WordPress")
+        m = _re.search(r'<meta name="generator" content="wordpress ([0-9.]+)"', body)
+        if m:
+            version_strings.append(f"WordPress {m.group(1)}")
+        else:
+            m2 = _re.search(r'\?ver=([0-9]+\.[0-9]+[0-9.]*)', body)
+            if m2:
+                version_strings.append(f"WordPress (ver hint: {m2.group(1)})")
+
+    # ── Drupal ────────────────────────────────────────────────────────────────
+    if "drupal" in body or "/sites/default/" in body or hdrs.get("x-generator", "").lower().startswith("drupal"):
+        detected.append("Drupal")
+        m = _re.search(r'<meta name="generator" content="drupal ([0-9]+)', body)
+        if m:
+            version_strings.append(f"Drupal {m.group(1)}")
+
+    # ── Joomla ────────────────────────────────────────────────────────────────
+    if "joomla" in body or "/components/com_" in body or "/media/jui/" in body:
+        detected.append("Joomla")
+
+    # ── Django ────────────────────────────────────────────────────────────────
+    if "csrfmiddlewaretoken" in body or "django" in hdrs.get("x-frame-options", "").lower():
+        detected.append("Django")
+
+    # ── Server header version ─────────────────────────────────────────────────
+    server = hdrs.get("server", "")
+    if "/" in server:
+        version_strings.append(f"Server: {server}")
+        if not any(cms in server.lower() for cms in ("cloudflare", "github", "fastly", "akamai")):
+            detected.append(server.split("/")[0])
+
+    # ── X-Powered-By ──────────────────────────────────────────────────────────
+    xpb = hdrs.get("x-powered-by", "")
+    if xpb:
+        version_strings.append(f"X-Powered-By: {xpb}")
+        detected.append(xpb.split("/")[0])
+
+    # ── X-AspNet-Version ─────────────────────────────────────────────────────
+    aspnet = hdrs.get("x-aspnet-version", "") or hdrs.get("x-aspnetmvc-version", "")
+    if aspnet:
+        version_strings.append(f"ASP.NET: {aspnet}")
+        detected.append(f"ASP.NET {aspnet}")
+
+    # ── Generator meta ────────────────────────────────────────────────────────
+    m = _re.search(r'<meta name="generator" content="([^"]{3,60})"', r.text[:8000], _re.IGNORECASE)
+    if m and "wordpress" not in m.group(1).lower() and "drupal" not in m.group(1).lower():
+        version_strings.append(f"Generator: {m.group(1)}")
+        detected.append(m.group(1))
+
+    if not detected and not version_strings:
+        return result.ok(
+            "No CMS or technology version disclosed",
+            "Stack fingerprinting returned no identifiable strings",
+        )
+
+    # Deduplicate
+    detected = list(dict.fromkeys(detected))
+    version_strings = list(dict.fromkeys(version_strings))
+    tech = ", ".join(detected[:4])
+
+    if version_strings:
+        return result.critical(
+            f"Technology version disclosed — {version_strings[0]}",
+            f"Detected: {tech}\nVersion strings: {'; '.join(version_strings)}\n"
+            "Remove Server/X-Powered-By headers and generator meta tags to prevent targeted CVE attacks.",
+            impact=10,
+        )
+    return result.warn(
+        f"CMS fingerprinted — {tech}",
+        f"Platform detected: {tech}\nHide CMS identity to slow attacker reconnaissance.",
+        impact=5,
+    )
+
+
 def check_paranoidlab(domain: str) -> CheckResult:
     """
     ParanoidLab — dark-web credential & PII leak intelligence.
@@ -928,6 +1220,10 @@ ALL_CHECKS = [
     check_ip_intel,             # IP reputation, blocklists, Shodan, AbuseIPDB, co-hosted domains
     # ── Dark Web Intelligence ──
     check_paranoidlab,          # credential & PII leaks + Telegram dark-web posts
+    # ── Active reconnaissance ──
+    check_ports,                # TCP connect scan of 30 common ports
+    check_subdomains,           # CT log + DNS wordlist subdomain enumeration
+    check_cms,                  # CMS / technology fingerprinting and version disclosure
 ]
 
 
