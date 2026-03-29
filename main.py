@@ -3244,6 +3244,7 @@ async def passive_scan(domain: str, authorization: str = Header(None)):
 
     import re, time
     import requests as req
+    import urllib3; urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     TIMEOUT = 8
     UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
