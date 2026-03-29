@@ -6038,10 +6038,10 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
         raise HTTPException(403, "Not found")
     domain = d.data[0]["domain"]
 
-    # ── Existing scan results ──────────────────────────────────────────────────
-    scan = db.table("scan_results").select(
-        "risk_score,max_cvss,checks,last_scanned_at,spf_status,dmarc_status,blacklisted,waf_detected"
-    ).eq("domain", domain).order("last_scanned_at", desc=True).limit(1).execute()
+    # ── Existing scan results — query scans table (same as all other endpoints) ─
+    scan = db.table("scans").select(
+        "risk_score,checks,scanned_at"
+    ).eq("domain_id", domain_id).order("scanned_at", desc=True).limit(1).execute()
     scan_data = scan.data[0] if scan.data else {}
 
     raw_checks = scan_data.get("checks") or []
@@ -6049,6 +6049,12 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
         try: raw_checks = _json.loads(raw_checks)
         except: raw_checks = []
     checks = raw_checks if isinstance(raw_checks, list) else []
+
+    # Derive enrichment fields from checks array (avoids querying scan_results separately)
+    check_map_quick = {c.get("check"): c for c in checks if isinstance(c, dict)}
+    _spf_status   = check_map_quick.get("spf",   {}).get("status", "unknown")
+    _dmarc_status = check_map_quick.get("dmarc", {}).get("status", "unknown")
+    _waf_detected = check_map_quick.get("waf",   {}).get("status") == "ok"
 
     # ── Resolve domain → IPs ──────────────────────────────────────────────────
     ips = []
@@ -6208,13 +6214,13 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
 
         prompt = (
             f"Domain: {domain}\n"
-            f"Risk Score: {risk_score}/100  |  Max CVSS: {scan_data.get('max_cvss', 0)}\n"
+            f"Risk Score: {risk_score}/100  |  Max CVSS: {max(((cve_info or {}).get('cvss') or 0) for sh in shodan_results for cve_info in (sh.get('vulns') or {}).values()) if any(sh.get('vulns') for sh in shodan_results) else 0}\n"
             f"Resolved IPs: {', '.join(ips) or 'none'}\n"
             f"Open ports/services: {', '.join(port_summary[:8]) or 'none detected by Shodan'}\n"
             f"CVEs on this host: {', '.join(all_cves[:5]) or 'none'}\n"
             f"Credential leaks: {leak_total} records found in breach databases\n"
-            f"WAF detected: {scan_data.get('waf_detected', False)}\n"
-            f"SPF: {scan_data.get('spf_status','?')}  DMARC: {scan_data.get('dmarc_status','?')}\n"
+            f"WAF detected: {_waf_detected}\n"
+            f"SPF: {_spf_status}  DMARC: {_dmarc_status}\n"
             f"Critical security gaps: {', '.join(critical_checks[:6]) or 'none'}\n\n"
             f"Write a realistic penetration tester's assessment with exactly these sections:\n\n"
             f"ATTACK SUMMARY\n"
@@ -6264,7 +6270,7 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
         "domain":      domain,
         "ips":         ips,
         "risk_score":  risk_score,
-        "max_cvss":    scan_data.get("max_cvss", 0),
+        "max_cvss":    max(((cve_info or {}).get("cvss") or 0) for sh in shodan_results for cve_info in (sh.get("vulns") or {}).values()) if any(sh.get("vulns") for sh in shodan_results) else 0,
         "shodan":      shodan_results,
         "leaks":       {"total": leak_total, "items": (leaks_data.get("items") or [])[:5]},
         "graph":       {"nodes": graph_nodes, "edges": graph_edges},
