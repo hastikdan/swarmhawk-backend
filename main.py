@@ -23,7 +23,6 @@ import hashlib
 import secrets
 import asyncio
 import httpx
-import stripe
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -66,7 +65,15 @@ GOOGLE_CLIENT_ID    = os.getenv("GOOGLE_CLIENT_ID", "")
 SITE_URL            = os.getenv("SITE_URL", "https://www.swarmhawk.com")
 API_URL             = os.getenv("API_URL", "https://swarmhawk-backend.onrender.com")
 
-stripe.api_key = STRIPE_SECRET_KEY
+# ── Stripe — lazy import to avoid 4-5s startup cost ─────────────────────────
+_stripe = None
+def _get_stripe():
+    global _stripe
+    if _stripe is None:
+        import stripe as _s
+        _s.api_key = STRIPE_SECRET_KEY
+        _stripe = _s
+    return _stripe
 
 # ── Supabase clients ──────────────────────────────────────────────────────────
 
@@ -2698,7 +2705,7 @@ def _resolve_stripe_customer(db, user_id: str) -> str | None:
     if purchases.data:
         for p in purchases.data:
             try:
-                session = stripe.checkout.Session.retrieve(p["stripe_session_id"])
+                session = _get_stripe().checkout.Session.retrieve(p["stripe_session_id"])
                 if session.customer:
                     return session.customer
             except Exception:
@@ -2707,7 +2714,7 @@ def _resolve_stripe_customer(db, user_id: str) -> str | None:
     u_row = db.table("users").select("email").eq("id", user_id).execute()
     email = u_row.data[0]["email"] if u_row.data else None
     if email:
-        customers = stripe.Customer.list(email=email, limit=1)
+        customers = _get_stripe().Customer.list(email=email, limit=1)
         if customers.data:
             return customers.data[0].id
     return None
@@ -2731,11 +2738,11 @@ def billing_portal(authorization: str = Header(None)):
         customer = _resolve_stripe_customer(db, user["sub"])
         if not customer:
             raise HTTPException(400, "No Stripe customer record found")
-        portal = stripe.billing_portal.Session.create(
+        portal = _get_stripe().billing_portal.Session.create(
             customer=customer, return_url=FRONTEND_URL
         )
         return {"url": portal.url}
-    except stripe.error.StripeError as e:
+    except _get_stripe().error.StripeError as e:
         raise HTTPException(400, str(e))
 
 
@@ -2752,12 +2759,12 @@ def billing_portal_api(authorization: str = Header(None)):
         customer = _resolve_stripe_customer(db, user["sub"])
         if not customer:
             raise HTTPException(400, "No Stripe customer record found — complete a purchase first")
-        portal = stripe.billing_portal.Session.create(
+        portal = _get_stripe().billing_portal.Session.create(
             customer=customer,
             return_url=f"{FRONTEND_URL}?tab=account",
         )
         return {"url": portal.url}
-    except stripe.error.StripeError as e:
+    except _get_stripe().error.StripeError as e:
         raise HTTPException(400, str(e))
 
 
@@ -2823,7 +2830,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
         if body.plan == "scan":
             # $5/scan — one-time per domain
             price_id = os.getenv("STRIPE_SCAN_PRICE_ID", "")
-            session = stripe.checkout.Session.create(
+            session = _get_stripe().checkout.Session.create(
                 payment_method_types=["card"],
                 mode="payment",
                 line_items=[{"price": price_id, "quantity": 1}] if price_id else [{
@@ -2857,7 +2864,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                 },
                 "quantity": 1,
             }]
-            session = stripe.checkout.Session.create(
+            session = _get_stripe().checkout.Session.create(
                 payment_method_types=["card"],
                 mode="subscription",
                 line_items=line_items,
@@ -2869,7 +2876,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
             )
         elif body.plan == "one_time":
             # Legacy: $10 one-time
-            session = stripe.checkout.Session.create(
+            session = _get_stripe().checkout.Session.create(
                 payment_method_types=["card"],
                 mode="payment",
                 line_items=[{
@@ -2899,7 +2906,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
                 },
                 "quantity": 1,
             }]
-            session = stripe.checkout.Session.create(
+            session = _get_stripe().checkout.Session.create(
                 payment_method_types=["card"],
                 mode="subscription",
                 line_items=line_items,
@@ -2912,7 +2919,7 @@ def create_checkout(body: CheckoutRequest, authorization: str = Header(None)):
 
         return {"url": session.url, "session_id": session.id, "plan": body.plan}
 
-    except stripe.error.StripeError as e:
+    except _get_stripe().error.StripeError as e:
         raise HTTPException(400, str(e))
 
 
@@ -2948,8 +2955,8 @@ async def stripe_webhook(request: Request):
     sig_header = request.headers.get("stripe-signature", "")
 
     try:
-        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
-    except stripe.error.SignatureVerificationError:
+        event = _get_stripe().Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except _get_stripe().error.SignatureVerificationError:
         raise HTTPException(400, "Invalid webhook signature")
 
     db = get_db()
@@ -4130,9 +4137,9 @@ async def checkout_msp(body: MSPCheckoutRequest, authorization: str = Header(Non
                 },
                 "quantity": 1,
             }]
-        session = stripe.checkout.Session.create(**create_kwargs)
+        session = _get_stripe().checkout.Session.create(**create_kwargs)
         return {"url": session.url}
-    except stripe.error.StripeError as e:
+    except _get_stripe().error.StripeError as e:
         raise HTTPException(400, str(e))
 
 
@@ -4224,7 +4231,7 @@ def checkout_api_plan(body: ApiPlanCheckoutRequest, authorization: str = Header(
 
     meta = {"user_id": str(user["sub"]), "plan": body.plan}
     try:
-        session = stripe.checkout.Session.create(
+        session = _get_stripe().checkout.Session.create(
             payment_method_types=["card"],
             mode="subscription",
             line_items=line_items,
@@ -4235,7 +4242,7 @@ def checkout_api_plan(body: ApiPlanCheckoutRequest, authorization: str = Header(
             subscription_data={"metadata": meta},
         )
         return {"url": session.url, "plan": body.plan}
-    except stripe.error.StripeError as e:
+    except _get_stripe().error.StripeError as e:
         raise HTTPException(400, str(e))
 
 
