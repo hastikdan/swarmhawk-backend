@@ -104,6 +104,8 @@ def get_admin_db() -> Client:
 
 from contextlib import asynccontextmanager
 
+from integrations import CONNECTORS, CONNECTOR_META, STIXConnector, fire_integrations_sync
+
 SCANNER_AVAILABLE = False  # set True at startup if cee_scanner imports OK
 _active_scans: dict = {}  # domain_id → {domain, started_at, user_id, status}
 
@@ -6088,6 +6090,143 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
 
 
 # ── Public contact form ────────────────────────────────────────────────────────
+# ── XDR / SIEM Integrations ──────────────────────────────────────────────────
+
+class IntegrationConfigRequest(BaseModel):
+    config: dict
+    enabled: bool = True
+
+
+def _mask_config(config: dict) -> dict:
+    """Replace secret values with masked placeholders so they're never returned to the client."""
+    secret_keys = {"hec_token", "shared_key", "api_key", "api_token", "client_secret", "password", "secret"}
+    return {
+        k: ("••••••••" if k in secret_keys and v else v)
+        for k, v in config.items()
+    }
+
+
+@app.get("/integrations")
+def list_integrations(authorization: str = Header(None)):
+    """List all configured integrations for the current user (secrets masked)."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    rows = (
+        db.table("integration_configs")
+        .select("id,service,config,enabled,last_fired_at,error_count,last_error,created_at,updated_at")
+        .eq("user_id", user["sub"])
+        .execute()
+    )
+    result = []
+    for row in (rows.data or []):
+        meta = CONNECTOR_META.get(row["service"], {})
+        result.append({
+            **row,
+            "config":      _mask_config(row.get("config") or {}),
+            "name":        meta.get("name", row["service"]),
+            "logo":        meta.get("logo", "🔌"),
+        })
+    return {"integrations": result, "available": list(CONNECTOR_META.keys())}
+
+
+@app.post("/integrations/{service}")
+def save_integration(service: str, body: IntegrationConfigRequest, authorization: str = Header(None)):
+    """Create or update an integration config for the given service."""
+    if service not in CONNECTORS:
+        raise HTTPException(400, f"Unknown service '{service}'. Valid: {list(CONNECTORS.keys())}")
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    now  = datetime.now(timezone.utc).isoformat()
+
+    existing = (
+        db.table("integration_configs")
+        .select("id")
+        .eq("user_id", user["sub"])
+        .eq("service", service)
+        .execute()
+    )
+    if existing.data:
+        db.table("integration_configs").update({
+            "config":     body.config,
+            "enabled":    body.enabled,
+            "updated_at": now,
+        }).eq("user_id", user["sub"]).eq("service", service).execute()
+    else:
+        db.table("integration_configs").insert({
+            "user_id":    user["sub"],
+            "service":    service,
+            "config":     body.config,
+            "enabled":    body.enabled,
+            "created_at": now,
+            "updated_at": now,
+        }).execute()
+
+    return {"ok": True, "service": service}
+
+
+@app.delete("/integrations/{service}")
+def delete_integration(service: str, authorization: str = Header(None)):
+    """Remove an integration config."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    db.table("integration_configs").delete().eq("user_id", user["sub"]).eq("service", service).execute()
+    return {"ok": True}
+
+
+@app.post("/integrations/{service}/test")
+def test_integration(service: str, body: IntegrationConfigRequest, authorization: str = Header(None)):
+    """Test connectivity for an integration without saving the config."""
+    if service not in CONNECTORS:
+        raise HTTPException(400, f"Unknown service '{service}'")
+    get_user_from_header(authorization)  # auth check only
+    try:
+        connector = CONNECTORS[service](body.config)
+        result = connector.test()
+        return result
+    except Exception as e:
+        return {"ok": False, "message": str(e)}
+
+
+# ── TAXII 2.1 / STIX feed ────────────────────────────────────────────────────
+
+@app.get("/taxii/collections/")
+def taxii_discovery(authorization: str = Header(None)):
+    """TAXII 2.1 collection discovery endpoint."""
+    get_user_from_header(authorization)
+    return {
+        "title":       "SwarmHawk Threat Intel",
+        "description": "Domain security findings as STIX 2.1",
+        "id":          "swarmhawk",
+        "can_read":    True,
+        "can_write":   False,
+        "media_types": ["application/stix+json;version=2.1"],
+    }
+
+
+@app.get("/taxii/collections/swarmhawk/objects/")
+def taxii_objects(
+    authorization: str = Header(None),
+    min_risk: int = Query(70, ge=0, le=100),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """TAXII 2.1 objects endpoint — returns STIX 2.1 bundle of critical domain findings."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    rows = (
+        db.table("scan_results")
+        .select("domain,risk_score,max_cvss,priority,country,cves,created_at,last_scanned_at")
+        .eq("user_id", user["sub"])
+        .gte("risk_score", min_risk)
+        .order("risk_score", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    bundle = STIXConnector.build_bundle(rows.data or [])
+    return bundle
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 class ContactFormRequest(BaseModel):
     first: str
     last: str

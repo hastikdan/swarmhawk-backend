@@ -37,6 +37,8 @@ from typing import Optional
 
 import requests as req
 
+from integrations import fire_integrations_sync
+
 log = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -153,13 +155,15 @@ def _get_db():
     return get_db()
 
 
-def upsert_scan_result(result: dict, db=None):
+def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
     """Write unified scan result to scan_results table.
 
     Rules:
     - Domains with approved/sent outreach_status: only update scan fields, never reset status.
     - New domains: set outreach_status='pending' if max_cvss >= CVSS_THRESHOLD, else NULL.
     - Existing pending domains: update outreach_status if CVSS changed threshold.
+
+    user_id: if provided and risk_score >= 70, fires enabled integrations for that user.
     """
     db = db or _get_db()
     domain = (result.get("domain") or "").lower().strip()
@@ -239,6 +243,15 @@ def upsert_scan_result(result: dict, db=None):
             }).execute()
     except Exception as e:
         log.warning(f"[pipeline] upsert_scan_result failed for {domain}: {e}")
+        return
+
+    # Fire integrations for high-risk findings on user-owned scans
+    if user_id and risk >= 70:
+        fire_integrations_sync(
+            {**scan_data, "domain": domain, "cves": result.get("cves") or []},
+            user_id,
+            db,
+        )
 
 
 def ingest_domains(domains: list[str], source: str, country: Optional[str] = None,
