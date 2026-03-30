@@ -6017,11 +6017,14 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
         except Exception as e:
             narrative["summary"] = f"AI narrative unavailable: {e}"
 
+    _max_cvss = max(((cve_info or {}).get("cvss") or 0) for sh in shodan_results for cve_info in (sh.get("vulns") or {}).values()) if any(sh.get("vulns") for sh in shodan_results) else 0
+    _critical_checks = [c.get("check","") for c in checks if isinstance(c, dict) and c.get("status") == "critical"]
+
     return {
         "domain":      domain,
         "ips":         ips,
         "risk_score":  risk_score,
-        "max_cvss":    max(((cve_info or {}).get("cvss") or 0) for sh in shodan_results for cve_info in (sh.get("vulns") or {}).values()) if any(sh.get("vulns") for sh in shodan_results) else 0,
+        "max_cvss":    _max_cvss,
         "shodan":      shodan_results,
         "leaks":       {"total": leak_total, "items": (leaks_data.get("items") or [])[:5]},
         "graph":       {"nodes": graph_nodes, "edges": graph_edges},
@@ -6033,6 +6036,53 @@ async def get_attack_surface(domain_id: str, authorization: str = Header(None)):
         "meta": {
             "shodan_available": bool(SHODAN_API_KEY),
             "paranoidlab_available": bool(PARANOIDLAB_API_KEY),
+        },
+        "ai_context": {
+            "model": "claude-haiku-4-5-20251001",
+            "system": (
+                "You are a senior penetration tester. Be direct and technical. "
+                "Base your assessment only on the evidence provided. "
+                "Never invent CVEs or IP addresses. If data is missing, say so briefly."
+            ),
+            "evidence": {
+                "domain": domain,
+                "risk_score": risk_score,
+                "max_cvss": _max_cvss,
+                "resolved_ips": ips,
+                "open_ports_services": [
+                    f":{svc['port']} {svc.get('product','')} {svc.get('version','')}".strip()
+                    for sh in shodan_results for svc in (sh.get("services") or [])[:5]
+                ][:8],
+                "cves": [
+                    f"{cve_id} (CVSS {(cve_info or {}).get('cvss','?')})"
+                    for sh in shodan_results
+                    for cve_id, cve_info in list((sh.get("vulns") or {}).items())[:4]
+                ][:5],
+                "credential_leaks": leak_total,
+                "waf_detected": _waf_detected,
+                "spf_status": _spf_status,
+                "dmarc_status": _dmarc_status,
+                "critical_security_gaps": _critical_checks[:6],
+            },
+            "prompt_template": (
+                "Domain: {domain}\n"
+                "Risk Score: {risk_score}/100  |  Max CVSS: {max_cvss}\n"
+                "Resolved IPs: {resolved_ips}\n"
+                "Open ports/services: {open_ports_services}\n"
+                "CVEs on this host: {cves}\n"
+                "Credential leaks: {credential_leaks} records found in breach databases\n"
+                "WAF detected: {waf_detected}\n"
+                "SPF: {spf_status}  DMARC: {dmarc_status}\n"
+                "Critical security gaps: {critical_security_gaps}\n\n"
+                "Write a realistic penetration tester's assessment with exactly these sections:\n\n"
+                "ATTACK SUMMARY\n"
+                "2-3 sentences describing the overall attack opportunity for this domain.\n\n"
+                "ATTACK CHAIN\n"
+                "4 numbered steps showing a realistic attack progression for this specific domain "
+                "(reconnaissance → initial access → exploitation → impact). Each step one sentence.\n\n"
+                "FIX PRIORITY\n"
+                "5 numbered remediation actions in priority order. Each on its own line starting with the number."
+            ),
         },
     }
 
