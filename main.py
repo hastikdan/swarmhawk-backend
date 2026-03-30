@@ -298,7 +298,7 @@ async def lifespan(app):
         print("↷ Pipeline scheduler skipped — PIPELINE_WORKER_ENABLED is set (handled by worker process)")
     yield
 
-app = FastAPI(title="SwarmHawk API", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="SwarmHawk API", version="2.1.0", lifespan=lifespan)
 
 # CORS must be added BEFORE any exception handlers or routers
 app.add_middleware(
@@ -632,7 +632,7 @@ def send_monthly_pdf_email(to_email: str, domain: str, risk_score: int,
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.0.0", "scanner": SCANNER_AVAILABLE}
+    return {"status": "ok", "version": "2.1.0", "scanner": SCANNER_AVAILABLE}
 
 
 
