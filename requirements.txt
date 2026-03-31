@@ -12,3 +12,6 @@ anthropic>=0.25.0
 fpdf2>=2.7.0
 python-dateutil>=2.8.0
 python-whois>=0.8.0
+# Tier 1 & 2 capability enhancements
+certstream>=1.0          # real-time CT log streaming (WebSocket)
+websocket-client>=1.6    # certstream dependency

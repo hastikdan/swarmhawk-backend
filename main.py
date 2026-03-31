@@ -28,7 +28,7 @@ from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Header, Request, BackgroundTasks, Query, APIRouter, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from supabase import create_client, Client
 
@@ -105,6 +105,24 @@ def get_admin_db() -> Client:
 from contextlib import asynccontextmanager
 
 from integrations import CONNECTORS, CONNECTOR_META, STIXConnector, fire_integrations_sync
+
+# ── SSE alert bus (thread-safe: pipeline workers → async SSE clients) ─────────
+_sse_listeners: list[asyncio.Queue] = []
+
+def _notify_sse_clients(event: dict) -> None:
+    """Push an alert event to all connected SSE clients (thread-safe).
+
+    Called from pipeline worker threads via pipeline.register_alert_callback().
+    Uses loop.call_soon_threadsafe so asyncio queues are safe to write from threads.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            snapshot = _sse_listeners[:]
+            for q in snapshot:
+                loop.call_soon_threadsafe(q.put_nowait, event)
+    except Exception:
+        pass
 
 SCANNER_AVAILABLE = False  # set True at startup if cee_scanner imports OK
 _active_scans: dict = {}  # domain_id → {domain, started_at, user_id, status}
@@ -284,12 +302,41 @@ async def lifespan(app):
         print("✓ Breach Monday scheduler started")
     except Exception as e:
         print(f"Breach Monday scheduler init failed: {e}")
+    # Wire up SSE alert callback so pipeline workers can push to dashboard clients
+    try:
+        from pipeline import register_alert_callback
+        register_alert_callback(_notify_sse_clients)
+        print("✓ SSE alert callback registered")
+    except Exception as e:
+        print(f"SSE callback init failed: {e}")
+
+    # Preload CISA KEV cache on startup (avoids first-scan latency)
+    try:
+        from intel_feeds import refresh_intel_feeds
+        import threading as _threading
+        _threading.Thread(target=refresh_intel_feeds, daemon=True, name="kev-preload").start()
+        print("✓ KEV/EPSS preload started in background")
+    except Exception as e:
+        print(f"KEV preload failed: {e}")
+
+    # Certstream worker — real-time CT log streaming
+    try:
+        from intel_feeds import start_certstream_worker, CERTSTREAM_ENABLED
+        if CERTSTREAM_ENABLED:
+            from pipeline import ingest_domains
+            start_certstream_worker(ingest_fn=ingest_domains)
+            print("✓ Certstream real-time CT worker started")
+        else:
+            print("↷ Certstream disabled (CERTSTREAM_ENABLED=false)")
+    except Exception as e:
+        print(f"Certstream worker init failed: {e}")
+
     # Global domain discovery pipeline
     # Skip if PIPELINE_WORKER_ENABLED=true — scheduling is handled by pipeline_worker.py
     if os.getenv("PIPELINE_WORKER_ENABLED", "").lower() not in ("1", "true", "yes"):
         try:
             from apscheduler.schedulers.background import BackgroundScheduler as _BGS3
-            from pipeline import run_discovery_job, run_pipeline_daily, run_enrichment_weekly, run_bulk_discovery_job
+            from pipeline import run_discovery_job, run_pipeline_daily, run_enrichment_weekly, run_bulk_discovery_job, run_kev_refresh_job
             _pipeline_scheduler = _BGS3(timezone="Europe/Prague")
             # Daily: Radar + CT logs + Majestic at 01:00
             _pipeline_scheduler.add_job(run_discovery_job,      "cron", hour=1,  minute=0,  id="pipeline_discovery")
@@ -299,8 +346,10 @@ async def lifespan(app):
             _pipeline_scheduler.add_job(run_enrichment_weekly,  "cron", day_of_week="sun",  hour=3,  minute=0,  id="pipeline_tier2")
             # Weekly Saturday: bulk discovery — Tranco + Umbrella (~2M domains)
             _pipeline_scheduler.add_job(run_bulk_discovery_job, "cron", day_of_week="sat",  hour=0,  minute=0,  id="pipeline_bulk_discovery")
+            # Daily: CISA KEV refresh + immediate re-scoring of affected domains
+            _pipeline_scheduler.add_job(run_kev_refresh_job,    "cron", hour=6,  minute=0,  id="kev_refresh")
             _pipeline_scheduler.start()
-            print("✓ Pipeline scheduler started (daily discovery 01:00, Tier1 every 4h, Tier2 Sun 03:00, bulk discovery Sat 00:00)")
+            print("✓ Pipeline scheduler started (daily discovery 01:00, Tier1 every 4h, Tier2 Sun 03:00, bulk Sat 00:00, KEV refresh 06:00)")
         except Exception as e:
             print(f"Pipeline scheduler init failed: {e}")
     else:
@@ -6223,6 +6272,58 @@ def taxii_objects(
     )
     bundle = STIXConnector.build_bundle(rows.data or [])
     return bundle
+
+
+# ── SSE real-time alert stream ────────────────────────────────────────────────
+
+@app.get("/stream/alerts")
+async def stream_alerts(
+    request: Request,
+    authorization: str = Header(None),
+    min_risk: int = Query(80, ge=0, le=100),
+):
+    """Server-Sent Events stream — push new high-risk domain alerts to the dashboard.
+
+    Clients receive events as: data: {JSON}\\n\\n
+    Heartbeat (data: {"type":"heartbeat"}) sent every 25 s to keep the connection alive.
+
+    Example JS client:
+        const es = new EventSource('/stream/alerts?min_risk=80', {headers: {Authorization: 'Bearer ...'}});
+        es.onmessage = e => console.log(JSON.parse(e.data));
+    """
+    user = get_user_from_header(authorization)
+
+    q: asyncio.Queue = asyncio.Queue()
+    _sse_listeners.append(q)
+
+    async def event_generator():
+        try:
+            # Send connected event
+            yield f"data: {json.dumps({'type': 'connected', 'min_risk': min_risk})}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=25.0)
+                    # Filter by risk threshold and user scope (pipeline events are global)
+                    if event.get("risk_score", 0) >= min_risk:
+                        yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield "data: {\"type\":\"heartbeat\"}\n\n"
+        finally:
+            try:
+                _sse_listeners.remove(q)
+            except ValueError:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

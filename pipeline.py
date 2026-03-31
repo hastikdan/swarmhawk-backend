@@ -33,13 +33,28 @@ Every domain ever discovered gets weekly vulnerability tracking.
 import os, re, json, time, logging, io, zipfile, socket
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Optional, Callable
 
 import requests as req
 
 from integrations import fire_integrations_sync
 
+# Intel feeds — KEV/EPSS boost, OSV CVEs, nuclei, BGP/ASN, SecurityTrails
+from intel_feeds import (
+    kev_boost_risk, osv_enrich_cves, nuclei_enrich_result,
+    asn_expand_domain, securitytrails_subdomains,
+    start_certstream_worker, refresh_intel_feeds,
+)
+
 log = logging.getLogger(__name__)
+
+# ── Alert callback (set by main.py to push SSE events to connected clients) ───
+_alert_callback: Optional[Callable[[dict], None]] = None
+
+def register_alert_callback(fn: Callable[[dict], None]) -> None:
+    """Register a function to call when a high-risk finding is upserted."""
+    global _alert_callback
+    _alert_callback = fn
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLOUDFLARE_TOKEN      = os.getenv("CLOUDFLARE_API_TOKEN", "")
@@ -252,6 +267,23 @@ def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
             user_id,
             db,
         )
+
+    # Push SSE event to connected dashboard clients for critical findings
+    if risk >= 80 and _alert_callback:
+        try:
+            _alert_callback({
+                "type":       "alert",
+                "domain":     domain,
+                "risk_score": risk,
+                "priority":   priority,
+                "max_cvss":   max_cvss,
+                "country":    country,
+                "kev_cves":   result.get("kev_cves") or [],
+                "epss_max":   result.get("epss_max") or 0,
+                "timestamp":  now,
+            })
+        except Exception:
+            pass
 
 
 def ingest_domains(domains: list[str], source: str, country: Optional[str] = None,
@@ -539,6 +571,25 @@ def _tier1_scan_one(domain: str, country: str, source: str) -> Optional[dict]:
         result["risk_score"] = compute_unified_risk(
             result.get("max_cvss", 0), [], result.get("software") or [], enrichment
         )
+
+        # OSV: find additional CVEs for detected software packages
+        try:
+            software = result.get("software") or []
+            cves     = result.get("cves") or []
+            result["cves"] = osv_enrich_cves(software, cves)
+            if result["cves"]:
+                new_max = max((c.get("cvss") or 0 for c in result["cves"]), default=0.0)
+                if new_max > result.get("max_cvss", 0):
+                    result["max_cvss"] = new_max
+        except Exception as e:
+            log.debug(f"[tier1] {domain} osv enrichment failed: {e}")
+
+        # KEV/EPSS: boost risk if any CVE is actively exploited
+        try:
+            result = kev_boost_risk(result)
+        except Exception as e:
+            log.debug(f"[tier1] {domain} kev boost failed: {e}")
+
         return result
     except Exception as e:
         log.debug(f"[tier1] {domain}: {e}")
@@ -577,6 +628,24 @@ def _tier2_scan_one(domain: str, country: str) -> Optional[dict]:
         elif max_cvss >= 4:     result["priority"] = "MEDIUM"
         elif max_cvss > 0:      result["priority"] = "LOW"
         else:                   result["priority"] = "INFO"
+
+        # OSV: additional CVEs for detected software
+        try:
+            result["cves"] = osv_enrich_cves(software, result["cves"])
+        except Exception as e:
+            log.debug(f"[tier2] {domain} osv enrichment: {e}")
+
+        # KEV/EPSS: boost risk for known-exploited CVEs
+        try:
+            result = kev_boost_risk(result)
+        except Exception as e:
+            log.debug(f"[tier2] {domain} kev boost: {e}")
+
+        # Nuclei: actively validate fingerprinted vulnerabilities (risk >= 60)
+        try:
+            result = nuclei_enrich_result(result)
+        except Exception as e:
+            log.debug(f"[tier2] {domain} nuclei: {e}")
 
         return result
     except Exception as e:
@@ -847,6 +916,105 @@ def run_enrichment_weekly():
     scanned = run_tier2_enrichment(db=db, batch_size=TIER2_BATCH_SIZE)
     log.info(f"[enrichment] Tier 2 complete — {scanned} domains enriched")
     return scanned
+
+
+# ── ASN / SecurityTrails discovery jobs ──────────────────────────────────────
+
+def run_asn_discovery_job(domains: list[str], db=None) -> int:
+    """Expand a list of user-enrolled domains to all FQDNs in their org IP space.
+
+    For each domain: resolve IP → BGPView ASN → IP prefixes → reverse DNS → ingest.
+    Used for MSP/Enterprise customers scanning their full attack surface.
+
+    Returns total count of newly queued domains.
+    """
+    db = db or _get_db()
+    total = 0
+    for domain in domains:
+        try:
+            discovered = asn_expand_domain(domain, max_domains=300)
+            if discovered:
+                total += ingest_domains(discovered, source="asn_expansion", db=db)
+                log.info(f"[asn_discovery] {domain}: queued {len(discovered)} org-space domains")
+        except Exception as e:
+            log.warning(f"[asn_discovery] {domain}: {e}")
+    return total
+
+
+def run_subdomain_discovery_job(domains: list[str], db=None) -> int:
+    """Enumerate subdomains via SecurityTrails for a list of apex domains.
+
+    Requires SECURITYTRAILS_API_KEY env var.
+    Returns total count of newly queued subdomains.
+    """
+    db = db or _get_db()
+    total = 0
+    for domain in domains:
+        try:
+            subs = securitytrails_subdomains(domain)
+            if subs:
+                total += ingest_domains(subs, source="securitytrails", db=db)
+                log.info(f"[securitytrails] {domain}: queued {len(subs)} subdomains")
+        except Exception as e:
+            log.warning(f"[securitytrails] {domain}: {e}")
+    return total
+
+
+def run_kev_refresh_job() -> int:
+    """Daily job: refresh CISA KEV cache and re-score any domains with newly-added CVEs.
+
+    Re-scans domains in scan_results whose CVEs were just added to CISA KEV,
+    boosting their risk_score to ≥ 95 immediately without waiting for next Tier scan.
+    Returns count of domains re-scored.
+    """
+    from intel_feeds import kev_cache, kev_boost_risk as _boost
+    kev_cache.preload()  # force refresh
+
+    db = _get_db()
+    rescored = 0
+    try:
+        # Fetch domains with known CVEs that may need re-scoring
+        rows = db.table("scan_results")\
+            .select("id,domain,cves,risk_score,priority,country")\
+            .gte("max_cvss", 4.0)\
+            .lt("risk_score", 95)\
+            .limit(5000)\
+            .execute()
+        candidates = rows.data or []
+    except Exception as e:
+        log.error(f"[kev_refresh] failed to fetch candidates: {e}")
+        return 0
+
+    for row in candidates:
+        cves_raw = row.get("cves") or "[]"
+        try:
+            cves = json.loads(cves_raw) if isinstance(cves_raw, str) else cves_raw
+        except Exception:
+            continue
+
+        if not any(kev_cache.is_exploited(c.get("id", "")) for c in cves):
+            continue
+
+        # This domain has a KEV CVE — boost it immediately
+        boosted = _boost({
+            "domain":     row["domain"],
+            "cves":       cves,
+            "risk_score": row.get("risk_score", 0),
+            "priority":   row.get("priority", "INFO"),
+        })
+        try:
+            db.table("scan_results").update({
+                "risk_score":    boosted["risk_score"],
+                "priority":      boosted["priority"],
+                "last_scanned_at": datetime.now(timezone.utc).isoformat(),
+            }).eq("id", row["id"]).execute()
+            rescored += 1
+            log.info(f"[kev_refresh] {row['domain']} re-scored to {boosted['risk_score']} (KEV CVE)")
+        except Exception as e:
+            log.warning(f"[kev_refresh] update failed for {row['domain']}: {e}")
+
+    log.info(f"[kev_refresh] done — {rescored} domains re-scored due to CISA KEV update")
+    return rescored
 
 
 # ── Status reporting ──────────────────────────────────────────────────────────
