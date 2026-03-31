@@ -37,6 +37,20 @@ log = logging.getLogger(__name__)
 VIRUSTOTAL_API_KEY     = os.getenv("VIRUSTOTAL_API_KEY", "")
 CENSYS_API_ID          = os.getenv("CENSYS_API_ID", "")
 CENSYS_API_SECRET      = os.getenv("CENSYS_API_SECRET", "")
+
+
+def _censys_auth() -> tuple[Optional[tuple], Optional[str]]:
+    """Return (auth_tuple, None) for Basic or (None, bearer_header) for PAT.
+
+    - Legacy Search v2: set CENSYS_API_ID + CENSYS_API_SECRET → Basic Auth
+    - New Platform API: set only CENSYS_API_ID (PAT) → Bearer token
+    Returns (None, None) if no credentials configured.
+    """
+    if CENSYS_API_ID and CENSYS_API_SECRET:
+        return (CENSYS_API_ID, CENSYS_API_SECRET), None
+    if CENSYS_API_ID:
+        return None, f"Bearer {CENSYS_API_ID}"
+    return None, None
 NUCLEI_ENABLED         = os.getenv("NUCLEI_ENABLED", "true").lower() not in ("0", "false", "no")
 CERTSTREAM_ENABLED     = os.getenv("CERTSTREAM_ENABLED", "true").lower() not in ("0", "false", "no")
 
@@ -531,15 +545,20 @@ def censys_search_org(org_name: str, limit: int = 100) -> list[dict]:
     Requires CENSYS_API_ID + CENSYS_API_SECRET.
     Returns [{ip, protocols, autonomous_system, services: [...]}]
     """
-    if not CENSYS_API_ID or not CENSYS_API_SECRET:
+    auth, bearer = _censys_auth()
+    if not auth and not bearer:
         return []
+
+    headers = {"Accept": "application/json"}
+    if bearer:
+        headers["Authorization"] = bearer
 
     try:
         r = req.post(
             "https://search.censys.io/api/v2/hosts/search",
-            auth=(CENSYS_API_ID, CENSYS_API_SECRET),
+            auth=auth,
             json={"q": f'autonomous_system.name: "{org_name}"', "per_page": min(limit, 100)},
-            headers={"Accept": "application/json"},
+            headers=headers,
             timeout=20,
         )
         if r.status_code != 200:
@@ -564,12 +583,17 @@ def censys_search_org(org_name: str, limit: int = 100) -> list[dict]:
 
 def censys_get_host(ip: str) -> Optional[dict]:
     """Fetch full host detail from Censys for a single IP."""
-    if not CENSYS_API_ID or not CENSYS_API_SECRET:
+    auth, bearer = _censys_auth()
+    if not auth and not bearer:
         return None
+    headers = {}
+    if bearer:
+        headers["Authorization"] = bearer
     try:
         r = req.get(
             f"https://search.censys.io/api/v2/hosts/{ip}",
-            auth=(CENSYS_API_ID, CENSYS_API_SECRET),
+            auth=auth,
+            headers=headers,
             timeout=15,
         )
         if r.status_code != 200:
