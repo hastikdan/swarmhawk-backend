@@ -1049,7 +1049,8 @@ def get_pipeline_status(db=None) -> dict:
 
     try:
         by_source = {}
-        for src in ("radar", "ct_logs", "majestic", "tranco", "umbrella", "outreach", "sonar"):
+        for src in ("radar", "ct_logs", "majestic", "tranco", "umbrella",
+                    "certstream", "asn_expansion", "securitytrails", "outreach", "sonar"):
             try:
                 n = db.table("scan_results").select("id", count="exact").eq("source", src).execute().count or 0
                 by_source[src] = n
@@ -1057,6 +1058,26 @@ def get_pipeline_status(db=None) -> dict:
                 pass
     except Exception:
         by_source = {}
+
+    # Intel feed metrics
+    try:
+        kev_boosted = db.table("scan_results").select("id", count="exact").gte("risk_score", 95).execute().count or 0
+    except Exception:
+        kev_boosted = -1
+
+    # KEV count from in-memory cache (no DB query needed)
+    try:
+        from intel_feeds import kev_cache
+        kev_count = kev_cache.count()
+    except Exception:
+        kev_count = 0
+
+    # Certstream worker status
+    try:
+        from intel_feeds import _certstream_running, CERTSTREAM_ENABLED
+        certstream_status = "running" if _certstream_running else ("disabled" if not CERTSTREAM_ENABLED else "stopped")
+    except Exception:
+        certstream_status = "unknown"
 
     return {
         "queue_pending":      queue_count,
@@ -1071,4 +1092,11 @@ def get_pipeline_status(db=None) -> dict:
         "radar_limit":        RADAR_LIMIT,
         "radar_countries":    len(RADAR_COUNTRIES),
         "bulk_limit":         BULK_LIMIT,
+        # Intel feed stats
+        "kev_loaded":         kev_count,
+        "kev_boosted_domains": kev_boosted,
+        "certstream_status":  certstream_status,
+        "certstream_domains": by_source.get("certstream", 0),
+        "asn_domains":        by_source.get("asn_expansion", 0),
+        "securitytrails_domains": by_source.get("securitytrails", 0),
     }
