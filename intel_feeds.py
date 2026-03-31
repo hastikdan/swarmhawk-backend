@@ -8,12 +8,12 @@ Modules:
   - OSV.dev    : Open-source vulnerability DB covering npm, PyPI, Go, Maven, etc.
   - Censys     : Internet-wide host scan data (CENSYS_API_ID + CENSYS_API_SECRET)
   - BGP/ASN    : Org-wide IP prefix → reverse DNS expansion (BGPView, no key)
-  - SecurityTrails: Historical DNS + subdomain discovery (SECURITYTRAILS_API_KEY)
+  - Subdomain enumeration: crt.sh (free, no key) + HackerTarget (free, no key) + VirusTotal (free 500/day, VIRUSTOTAL_API_KEY)
   - Certstream : Real-time CT log streaming worker (WebSocket)
   - Nuclei     : Active vulnerability validation via nuclei CLI binary
 
 Environment variables:
-  SECURITYTRAILS_API_KEY  — optional; enables subdomain discovery
+  VIRUSTOTAL_API_KEY      — optional; enables VirusTotal passive DNS subdomains (free 500/day)
   CENSYS_API_ID           — optional; enables Censys host search
   CENSYS_API_SECRET       — optional; enables Censys host search
   NUCLEI_ENABLED          — set "false" to disable nuclei even if installed
@@ -34,7 +34,7 @@ import requests as req
 
 log = logging.getLogger(__name__)
 
-SECURITYTRAILS_API_KEY = os.getenv("SECURITYTRAILS_API_KEY", "")
+VIRUSTOTAL_API_KEY     = os.getenv("VIRUSTOTAL_API_KEY", "")
 CENSYS_API_ID          = os.getenv("CENSYS_API_ID", "")
 CENSYS_API_SECRET      = os.getenv("CENSYS_API_SECRET", "")
 NUCLEI_ENABLED         = os.getenv("NUCLEI_ENABLED", "true").lower() not in ("0", "false", "no")
@@ -425,35 +425,102 @@ def asn_expand_domain(domain: str, max_domains: int = 500) -> list[str]:
     return list(found)[:max_domains]
 
 
-# ── SecurityTrails Subdomain Discovery ─────────────────────────────────────────
+# ── Subdomain Enumeration (free, multi-source) ────────────────────────────────
 
-def securitytrails_subdomains(domain: str) -> list[str]:
-    """Enumerate all known subdomains of a domain via SecurityTrails.
-
-    Requires SECURITYTRAILS_API_KEY.  Free tier: 50 queries/month.
-    Returns list of FQDNs.
-    """
-    if not SECURITYTRAILS_API_KEY:
-        return []
-
-    parts = domain.split(".")
-    apex  = ".".join(parts[-2:]) if len(parts) >= 2 else domain
-
+def _crtsh_subdomains(apex: str) -> set[str]:
+    """crt.sh Certificate Transparency — free, no key, covers ~80%+ of subdomains."""
+    found: set[str] = set()
     try:
         r = req.get(
-            f"https://api.securitytrails.com/v1/domain/{apex}/subdomains",
-            headers={"APIKEY": SECURITYTRAILS_API_KEY, "Accept": "application/json"},
-            params={"children_only": "false", "include_inactive": "false"},
+            "https://crt.sh/",
+            params={"q": f"%.{apex}", "output": "json", "deduplicate": "Y"},
+            headers=_UA, timeout=30,
+        )
+        if r.status_code != 200:
+            return found
+        for entry in r.json():
+            for name in (entry.get("name_value") or "").split("\n"):
+                name = name.strip().lstrip("*.")
+                if name.endswith(f".{apex}") or name == apex:
+                    found.add(name.lower())
+    except Exception as e:
+        log.debug(f"[crtsh] {apex}: {e}")
+    return found
+
+
+def _hackertarget_subdomains(apex: str) -> set[str]:
+    """HackerTarget hostsearch API — free, no key, fast."""
+    found: set[str] = set()
+    try:
+        r = req.get(
+            "https://api.hackertarget.com/hostsearch/",
+            params={"q": apex},
+            headers=_UA, timeout=15,
+        )
+        if r.status_code != 200 or "error" in r.text.lower():
+            return found
+        for line in r.text.splitlines():
+            parts = line.split(",")
+            if parts and parts[0].endswith(f".{apex}"):
+                found.add(parts[0].strip().lower())
+    except Exception as e:
+        log.debug(f"[hackertarget] {apex}: {e}")
+    return found
+
+
+def _virustotal_subdomains(apex: str) -> set[str]:
+    """VirusTotal passive DNS subdomains — free tier 500 req/day with API key."""
+    if not VIRUSTOTAL_API_KEY:
+        return set()
+    found: set[str] = set()
+    try:
+        r = req.get(
+            f"https://www.virustotal.com/api/v3/domains/{apex}/subdomains",
+            headers={"x-apikey": VIRUSTOTAL_API_KEY, "Accept": "application/json"},
+            params={"limit": 40},
             timeout=15,
         )
         if r.status_code != 200:
-            log.warning(f"[securitytrails] HTTP {r.status_code} for {apex}")
-            return []
-        subs = r.json().get("subdomains", [])
-        return [f"{s}.{apex}" for s in subs if s and s != "@"]
+            return found
+        for item in r.json().get("data", []):
+            sub = item.get("id", "").lower().strip()
+            if sub and sub.endswith(f".{apex}"):
+                found.add(sub)
     except Exception as e:
-        log.warning(f"[securitytrails] failed for {apex}: {e}")
-        return []
+        log.debug(f"[virustotal] {apex}: {e}")
+    return found
+
+
+def enumerate_subdomains(domain: str) -> list[str]:
+    """Enumerate subdomains using free sources: crt.sh + HackerTarget + VirusTotal.
+
+    All three sources are free with no or minimal API key requirements:
+      - crt.sh: completely free, no key, CT-log based
+      - HackerTarget: free, no key, up to 10 req/day per IP
+      - VirusTotal: free 500 req/day with VIRUSTOTAL_API_KEY
+
+    Returns deduplicated list of FQDNs (excluding the apex domain itself).
+    """
+    parts = domain.split(".")
+    apex  = ".".join(parts[-2:]) if len(parts) >= 2 else domain
+
+    found: set[str] = set()
+    found.update(_crtsh_subdomains(apex))
+    found.update(_hackertarget_subdomains(apex))
+    found.update(_virustotal_subdomains(apex))
+    found.discard(apex)
+
+    result = sorted(found)
+    if result:
+        log.info(f"[subdomain] {apex}: {len(result)} subdomains "
+                 f"(crt.sh + HackerTarget + VT)")
+    return result
+
+
+# Keep old name as alias for backward compat with pipeline.py callers
+def securitytrails_subdomains(domain: str) -> list[str]:
+    """Backward-compatible alias → now routes to free multi-source enumeration."""
+    return enumerate_subdomains(domain)
 
 
 # ── Censys Host Search ─────────────────────────────────────────────────────────
