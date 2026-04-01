@@ -54,6 +54,7 @@ RANK_OFFSETS        = [int(x.strip()) for x in _RANK_OFFSET_ENV.split(",") if x.
 
 TIMEOUT = 10
 UA = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Scout/1.0)"}
+HUNTER_API_KEY = os.getenv("HUNTER_API_KEY", "")
 
 
 # ── Portkey-aware Anthropic call helper ───────────────────────────────────────
@@ -345,6 +346,173 @@ def _extract_emails_from_html(html: str, own_domain: str) -> list[str]:
     own   = [e for e in found if e.endswith(f"@{own_domain}")]
     other = [e for e in found if not e.endswith(f"@{own_domain}")]
     return own + other
+
+
+def _hunter_lookup(domain: str) -> list[dict]:
+    """Fetch verified emails from Hunter.io domain search API.
+
+    Returns list of {email, source, verified} dicts.
+    Requires HUNTER_API_KEY env var; silently skips if not set.
+    Free tier: 25 requests/month.
+    """
+    if not HUNTER_API_KEY:
+        return []
+    try:
+        r = req.get(
+            "https://api.hunter.io/v2/domain-search",
+            params={"domain": domain, "api_key": HUNTER_API_KEY, "limit": 10},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json().get("data", {})
+        results = []
+        for entry in (data.get("emails") or []):
+            email = (entry.get("value") or "").lower().strip()
+            if not email or "@" not in email:
+                continue
+            confidence = entry.get("confidence", 0)
+            results.append({
+                "email":    email,
+                "source":   "hunter",
+                "verified": confidence >= 70,
+            })
+        return results
+    except Exception as e:
+        log.debug(f"[hunter] {domain}: {e}")
+        return []
+
+
+def _smtp_verify(email: str, timeout: int = 6) -> bool:
+    """SMTP RCPT TO probe — checks if mailbox likely exists without sending.
+
+    Returns True if the server accepts the recipient, False otherwise.
+    This is a best-effort check; many servers reject probes or use catch-all.
+    """
+    import smtplib
+    import socket
+    domain = email.split("@")[1]
+    try:
+        # Resolve MX record
+        import dns.resolver
+        mx_records = dns.resolver.resolve(domain, "MX")
+        mx_host = str(sorted(mx_records, key=lambda r: r.preference)[0].exchange).rstrip(".")
+    except Exception:
+        mx_host = domain  # fall back to A record
+
+    try:
+        with smtplib.SMTP(mx_host, port=25, timeout=timeout) as smtp:
+            smtp.ehlo_or_helo_if_needed()
+            smtp.mail("noreply@swarmhawk.com")
+            code, _ = smtp.rcpt(email)
+            return code == 250
+    except Exception:
+        return False
+
+
+def discover_contacts_rich(domain: str) -> list[dict]:
+    """
+    Multi-source contact discovery returning structured results.
+
+    Each result: {email, source, verified}
+      source:   "security_txt" | "whois" | "scrape" | "hunter" | "guess"
+      verified: True if SMTP probe accepted OR Hunter confidence >= 70
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    verified_emails: list[dict] = []   # real sources
+    guess_emails:    list[dict] = []   # pattern guesses
+
+    def _fetch_security_txt() -> list[dict]:
+        found = []
+        for path in ["/.well-known/security.txt", "/security.txt"]:
+            try:
+                r = req.get(f"https://{domain}{path}", timeout=5, headers=UA, verify=False)
+                if r.status_code == 200 and "Contact:" in r.text:
+                    for m in re.finditer(
+                        r"Contact:\s*(?:mailto:)?([^\s]+@[^\s]+)", r.text, re.IGNORECASE
+                    ):
+                        found.append({"email": m.group(1).lower(), "source": "security_txt", "verified": True})
+            except Exception:
+                pass
+        return found
+
+    def _fetch_whois() -> list[dict]:
+        try:
+            import whois
+            w = whois.whois(domain)
+            raw = w.emails if isinstance(w.emails, list) else ([w.emails] if w.emails else [])
+            return [{"email": str(e).lower(), "source": "whois", "verified": False} for e in raw if e]
+        except Exception:
+            return []
+
+    def _fetch_page(path: str) -> list[dict]:
+        try:
+            r = req.get(f"https://{domain}{path}", timeout=5, headers=UA, verify=False, allow_redirects=True)
+            if r.status_code == 200:
+                emails = _extract_emails_from_html(r.text[:80_000], domain)
+                return [{"email": e, "source": "scrape", "verified": False} for e in emails]
+        except Exception:
+            pass
+        return []
+
+    # Run all sources in parallel
+    futures = {}
+    with ThreadPoolExecutor(max_workers=14) as pool:
+        futures["security_txt"] = pool.submit(_fetch_security_txt)
+        futures["whois"]        = pool.submit(_fetch_whois)
+        futures["hunter"]       = pool.submit(_hunter_lookup, domain)
+        for path in _CONTACT_PAGES:
+            futures[f"page:{path}"] = pool.submit(_fetch_page, path)
+
+        for key, fut in futures.items():
+            try:
+                results = fut.result(timeout=12)
+                verified_emails.extend(results)
+            except Exception:
+                pass
+
+    # Pattern guesses as last resort
+    _GUESS_PREFIXES = ["security", "info", "contact", "webmaster", "admin"]
+    for prefix in _GUESS_PREFIXES:
+        guess_emails.append({"email": f"{prefix}@{domain}", "source": "guess", "verified": False})
+
+    # Deduplicate — real sources first, guesses appended only if no real email found
+    seen: set[str] = set()
+    result: list[dict] = []
+
+    def _add(item: dict):
+        e = item["email"].strip().lower().rstrip(".")
+        if not e or "@" not in e:
+            return
+        host = e.split("@")[1]
+        if "." not in host or host in _JUNK_EMAIL_DOMAINS:
+            return
+        if any(e.endswith(ext) for ext in (".png", ".jpg", ".gif", ".svg", ".css", ".js")):
+            return
+        if e not in seen:
+            seen.add(e)
+            result.append({**item, "email": e})
+
+    # Own-domain verified first, then other verified, then guesses
+    own_verified   = [i for i in verified_emails if f"@{domain}" in i["email"]]
+    other_verified = [i for i in verified_emails if f"@{domain}" not in i["email"]]
+    for item in own_verified + other_verified:
+        _add(item)
+
+    # SMTP-verify scrape/whois results that aren't already verified
+    for item in result:
+        if not item["verified"] and item["source"] in ("scrape", "whois"):
+            item["verified"] = _smtp_verify(item["email"])
+
+    # Only add guesses if we found no real emails; SMTP-verify the top guess
+    if not result:
+        for item in guess_emails:
+            _add(item)
+        if result:
+            result[0]["verified"] = _smtp_verify(result[0]["email"])
+
+    return result[:10]
 
 
 def discover_all_contacts(domain: str) -> list[str]:
@@ -1492,7 +1660,9 @@ async def discover_prospect_contact(prospect_id: str, authorization: str = Heade
     if not domain:
         raise HTTPException(404, f"Prospect {prospect_id} not found")
 
-    emails = discover_all_contacts(domain)
+    rich = discover_contacts_rich(domain)
+    # backward-compat plain list for legacy callers
+    emails  = [r["email"] for r in rich]
     primary = emails[0] if emails else None
 
     if primary:
@@ -1503,7 +1673,8 @@ async def discover_prospect_contact(prospect_id: str, authorization: str = Heade
 
     return {
         "domain":  domain,
-        "emails":  emails,
+        "emails":  emails,       # plain list (backward-compat)
+        "contacts": rich,        # structured: [{email, source, verified}]
         "primary": primary,
         "source":  source_table,
     }
