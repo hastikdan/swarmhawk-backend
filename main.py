@@ -356,7 +356,13 @@ async def lifespan(app):
         print("↷ Pipeline scheduler skipped — PIPELINE_WORKER_ENABLED is set (handled by worker process)")
     yield
 
-app = FastAPI(title="SwarmHawk API", version="2.1.0", lifespan=lifespan)
+app = FastAPI(
+    title="SwarmHawk API",
+    version="2.1.0",
+    lifespan=lifespan,
+    docs_url=None,   # disable built-in Swagger UI — served at swarmhawk.com/docs.html
+    redoc_url=None,  # disable ReDoc
+)
 
 # CORS must be added BEFORE any exception handlers or routers
 app.add_middleware(
@@ -366,6 +372,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/docs", include_in_schema=False)
+async def redirect_docs():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="https://www.swarmhawk.com/docs.html", status_code=301)
+
+@app.get("/redoc", include_in_schema=False)
+async def redirect_redoc():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="https://www.swarmhawk.com/docs.html", status_code=301)
 
 # Mount outreach router
 try:
