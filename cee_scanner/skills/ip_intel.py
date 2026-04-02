@@ -21,6 +21,15 @@ import socket
 import logging
 import requests
 
+# Known CDN / proxy ASN prefixes and org name fragments.
+# IPs belonging to these are shared infrastructure — a DNSBL hit on a CDN IP
+# reflects another tenant's abuse, not the scanned domain itself.
+CDN_ORG_FRAGMENTS = [
+    "cloudflare", "akamai", "fastly", "incapsula", "imperva",
+    "sucuri", "amazon", "google", "microsoft", "cdn77",
+    "stackpath", "bunnycdn", "keycdn",
+]
+
 logger = logging.getLogger("cee_scanner.skills.ip_intel")
 
 TIMEOUT = 7
@@ -94,16 +103,25 @@ def _shodan_ip(ip: str, api_key: str) -> dict | None:
 
 
 def _dnsbl_check(ip: str) -> list[str]:
-    """Check IP against DNS blocklists. Returns list of hit names."""
+    """Check IP against DNS blocklists. Returns list of hit names.
+
+    Spamhaus ZEN (and other DNSBLs) signal a listing by returning an address
+    in the 127.x.x.x loopback range.  We must verify the response is actually
+    in that range — any other address (wildcard DNS, resolver glitch) is NOT
+    a valid listing and must be ignored to avoid false positives.
+    NXDOMAIN (socket.gaierror) means the IP is clean / not listed.
+    """
     reversed_ip = ".".join(reversed(ip.split(".")))
     hits = []
     for bl_host, bl_name in DNSBL_LIST:
         query = f"{reversed_ip}.{bl_host}"
         try:
-            socket.getaddrinfo(query, None)
-            hits.append(bl_name)
+            answers = socket.getaddrinfo(query, None, socket.AF_INET)
+            # Only count as listed if the response IP is in the 127.x.x.x range
+            if any(r[4][0].startswith("127.") for r in answers):
+                hits.append(bl_name)
         except socket.gaierror:
-            pass  # NXDOMAIN = not listed
+            pass  # NXDOMAIN = not listed = clean
         except Exception:
             pass
     return hits
@@ -157,11 +175,19 @@ def check_ip_intel(domain: str) -> "CheckResult":
 
         # ── ASN / hosting info ───────────────────────────────────────────────
         asn_data = _asn_lookup(ip)
+        org = ""
+        is_cdn = False
         if asn_data:
             org     = asn_data.get("org", "")
             country = asn_data.get("country", "")
             city    = asn_data.get("city", "")
             detail_lines.append(f"  ASN/Org: {org}  [{city}, {country}]")
+
+            # Detect CDN / shared proxy — DNSBL hits on these IPs are unreliable
+            # because the IP is shared infrastructure, not the domain's own server.
+            is_cdn = any(cdn in org.lower() for cdn in CDN_ORG_FRAGMENTS)
+            if is_cdn:
+                detail_lines.append(f"  Note: CDN/proxy detected — DNSBL results for this IP may reflect other tenants")
 
             # Flag known bulletproof / high-risk hosting ASNs
             HIGH_RISK_ORGS = [
@@ -175,7 +201,10 @@ def check_ip_intel(domain: str) -> "CheckResult":
         bl_hits = _dnsbl_check(ip)
         if bl_hits:
             detail_lines.append(f"  Blocklists: {', '.join(bl_hits)}")
-            if len(bl_hits) >= 2:
+            if is_cdn:
+                # Hit on a CDN IP — informational only, not a finding against this domain
+                detail_lines.append(f"  (CDN IP — blocklist hit is unreliable, skipping finding)")
+            elif len(bl_hits) >= 2:
                 critical_findings.append(f"IP {ip} on {len(bl_hits)} blocklists: {', '.join(bl_hits)}")
             else:
                 warning_findings.append(f"IP {ip} on blocklist: {bl_hits[0]}")

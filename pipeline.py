@@ -48,6 +48,22 @@ from intel_feeds import (
 
 log = logging.getLogger(__name__)
 
+# ── Scanner public IP (cached at first call, refreshed every 24h) ─────────────
+_scanner_ip: str = ""
+_scanner_ip_fetched_at: float = 0.0
+
+def _get_scanner_ip() -> str:
+    global _scanner_ip, _scanner_ip_fetched_at
+    if _scanner_ip and (time.time() - _scanner_ip_fetched_at) < 86400:
+        return _scanner_ip
+    try:
+        r = req.get("https://api.ipify.org?format=json", timeout=5)
+        _scanner_ip = r.json().get("ip", "")
+        _scanner_ip_fetched_at = time.time()
+    except Exception:
+        pass
+    return _scanner_ip
+
 # ── Alert callback (set by main.py to push SSE events to connected clients) ───
 _alert_callback: Optional[Callable[[dict], None]] = None
 
@@ -1099,4 +1115,5 @@ def get_pipeline_status(db=None) -> dict:
         "certstream_domains": by_source.get("certstream", 0),
         "asn_domains":        by_source.get("asn_expansion", 0),
         "securitytrails_domains": by_source.get("securitytrails", 0),
+        "scanner_ip":         _get_scanner_ip(),
     }
