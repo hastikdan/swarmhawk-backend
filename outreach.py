@@ -695,8 +695,7 @@ def query_nvd(product: str, version: str) -> list[dict]:
     try:
         r = req.get(NVD, params={
             "keywordSearch": f"{kw} {version}",
-            "cvssV3SeverityMin": "HIGH",
-            "resultsPerPage": 5,
+            "resultsPerPage": 10,
         }, timeout=12)
         if r.status_code != 200:
             return []
@@ -709,7 +708,7 @@ def query_nvd(product: str, version: str) -> list[dict]:
                 score = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
             elif "cvssMetricV30" in metrics:
                 score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
-            if score:
+            if score and score >= 7.0:
                 cves.append({"id": cve["id"], "cvss": score, "product": product, "version": version})
         result = sorted(cves, key=lambda x: x["cvss"], reverse=True)
         _NVD_CACHE[cache_key] = {"data": result, "ts": time.time()}

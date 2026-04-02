@@ -644,6 +644,18 @@ def check_email_security(domain: str) -> CheckResult:
     try:
         import subprocess
 
+        # Pre-check: does the domain have any MX records?
+        # If not, email security checks are not applicable — skip them.
+        try:
+            mx_probe = subprocess.run(
+                ["dig", "+short", "MX", domain],
+                capture_output=True, text=True, timeout=5
+            )
+            if mx_probe.returncode == 0 and not mx_probe.stdout.strip():
+                return result.ok("No mail server configured", "no_mx")
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # dig unavailable or timed out — proceed with checks anyway
+
         try:
             spf = subprocess.run(
                 ["dig", "+short", "TXT", domain],
@@ -877,12 +889,16 @@ def check_ports(domain: str) -> CheckResult:
 def check_subdomains(domain: str) -> CheckResult:
     """Subdomain enumeration via Certificate Transparency logs (crt.sh) and DNS wordlist."""
     import socket as _sock
+    import os as _os
     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
     result = CheckResult("subdomains", domain)
 
-    # Normalise to root domain
-    parts = domain.lower().lstrip("www.").split(".")
-    base = ".".join(parts[-2:]) if len(parts) >= 2 else domain
+    # Normalise to root domain — use removeprefix, NOT lstrip (lstrip strips chars, not strings)
+    d = domain.lower()
+    if d.startswith("www."):
+        d = d[4:]
+    parts = d.split(".")
+    base = ".".join(parts[-2:]) if len(parts) >= 2 else d
 
     WORDLIST = [
         "www", "mail", "email", "webmail", "smtp", "pop", "imap", "mx", "mx1", "mx2",
@@ -936,6 +952,22 @@ def check_subdomains(domain: str) -> CheckResult:
 
     all_subs = list(set(WORDLIST) | ct_subs)
 
+    # ── Wildcard DNS detection ────────────────────────────────────────────────
+    # CDNs often use *.domain.com → catch-all IP, making every wordlist guess
+    # resolve. Detect this by probing a guaranteed-nonexistent subdomain.
+    # If it resolves → wildcard DNS active → wordlist is useless.
+    # In that case we trust ONLY crt.sh results (real issued certificates).
+    wildcard_dns = False
+    _sentinel = _os.urandom(10).hex()
+    try:
+        _sock.gethostbyname(f"{_sentinel}.{base}")
+        wildcard_dns = True
+    except Exception:
+        pass
+
+    # When wildcard DNS is active, restrict candidates to CT log entries only.
+    candidates = list(ct_subs) if wildcard_dns else all_subs
+
     # ── DNS resolution ────────────────────────────────────────────────────────
     found: list[str] = []
     sensitive_found: list[str] = []
@@ -948,7 +980,7 @@ def check_subdomains(domain: str) -> CheckResult:
             return None
 
     with ThreadPoolExecutor(max_workers=40) as ex:
-        for sub in [f.result() for f in _as_completed({ex.submit(_resolve, s) for s in all_subs})]:
+        for sub in [f.result() for f in _as_completed({ex.submit(_resolve, s) for s in candidates})]:
             if sub:
                 found.append(sub)
                 if sub in SENSITIVE:
@@ -958,6 +990,11 @@ def check_subdomains(domain: str) -> CheckResult:
     total = len(found)
 
     if total == 0:
+        if wildcard_dns:
+            return result.ok(
+                "No subdomains found in CT logs",
+                f"Wildcard DNS detected — wordlist skipped (false-positive risk). CT log scan returned no results.",
+            )
         return result.ok(
             "No exposed subdomains found",
             f"Checked CT logs + {len(WORDLIST)}-entry wordlist — nothing resolved",

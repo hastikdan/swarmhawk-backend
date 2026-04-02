@@ -59,6 +59,9 @@ def _run_probes(domain: str) -> tuple[list[str], list[str]]:
             if r.status_code not in (200, 206):
                 continue
             body = r.text[:3000]
+            # Empty body → catch-all route, not a real endpoint
+            if len(body.strip()) < 100:
+                continue
             if confirm_pat and not re.search(confirm_pat, body, re.IGNORECASE):
                 continue
             if path == "/robots.txt":

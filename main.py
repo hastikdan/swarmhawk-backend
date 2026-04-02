@@ -3385,8 +3385,7 @@ async def passive_scan(domain: str, authorization: str = Header(None)):
             time.sleep(0.4)
             nresp = req.get(NVD, params={
                 "keywordSearch": f"{kw} {sw['version']}",
-                "cvssV3SeverityMin": "HIGH",
-                "resultsPerPage": 5,
+                "resultsPerPage": 10,
             }, timeout=10)
             if nresp.status_code == 200:
                 vulns = nresp.json().get("vulnerabilities", [])
@@ -3399,7 +3398,7 @@ async def passive_scan(domain: str, authorization: str = Header(None)):
                         score = metrics["cvssMetricV31"][0]["cvssData"]["baseScore"]
                     elif "cvssMetricV30" in metrics:
                         score = metrics["cvssMetricV30"][0]["cvssData"]["baseScore"]
-                    if score and score > best_score:
+                    if score and score >= 7.0 and score > best_score:
                         best_score, best_id = score, cve["id"]
                 if best_id:
                     cve_hits.append({

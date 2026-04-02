@@ -31,9 +31,9 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"}
 # severity: "critical" | "warning"
 DAST_PROBES = [
     # ── Admin panels ─────────────────────────────────────────────────────────
-    ("/admin",               "Admin panel exposed",                "warning",  None),
-    ("/admin/login",         "Admin login page exposed",           "warning",  None),
-    ("/administrator",       "Administrator panel exposed",        "warning",  None),
+    ("/admin",               "Admin panel exposed",                "warning",  r'login|password|username|sign.?in|dashboard|panel|admin'),
+    ("/admin/login",         "Admin login page exposed",           "warning",  r'login|password|username|sign.?in'),
+    ("/administrator",       "Administrator panel exposed",        "warning",  r'login|password|username|sign.?in|dashboard|panel'),
     ("/wp-admin/",           "WordPress admin panel exposed",      "warning",  r"wp-admin|WordPress"),
     ("/phpmyadmin/",         "phpMyAdmin exposed",                 "critical", r"phpMyAdmin|pma_username"),
     ("/phpmyadmin",          "phpMyAdmin exposed",                 "critical", r"phpMyAdmin|pma_username"),
@@ -46,12 +46,12 @@ DAST_PROBES = [
     ("/swagger.yaml",        "Swagger API docs exposed",           "warning",  r'swagger:|openapi:'),
     ("/swagger-ui.html",     "Swagger UI exposed",                 "warning",  r'swagger|Swagger'),
     ("/swagger-ui/",         "Swagger UI exposed",                 "warning",  r'swagger|Swagger'),
-    ("/api-docs",            "API docs exposed",                   "warning",  None),
-    ("/api-docs/",           "API docs exposed",                   "warning",  None),
+    ("/api-docs",            "API docs exposed",                   "warning",  r'"swagger"|"openapi"|"paths"|"info"'),
+    ("/api-docs/",           "API docs exposed",                   "warning",  r'"swagger"|"openapi"|"paths"|"info"'),
     ("/openapi.json",        "OpenAPI spec exposed",               "warning",  r'"openapi"'),
     ("/openapi.yaml",        "OpenAPI spec exposed",               "warning",  r'openapi:'),
-    ("/v1/api-docs",         "API v1 docs exposed",                "warning",  None),
-    ("/v2/api-docs",         "API v2 docs exposed",                "warning",  None),
+    ("/v1/api-docs",         "API v1 docs exposed",                "warning",  r'"swagger"|"openapi"|"paths"'),
+    ("/v2/api-docs",         "API v2 docs exposed",                "warning",  r'"swagger"|"openapi"|"paths"'),
     ("/graphql",             "GraphQL endpoint exposed",           "warning",  r'GraphQL|__schema'),
     ("/graphiql",            "GraphiQL IDE exposed",               "warning",  r'graphiql|GraphiQL'),
 
@@ -110,9 +110,11 @@ def _check_open_redirect(domain: str) -> str | None:
                 allow_redirects=False, verify=False,
             )
             # 3xx redirect to external domain = open redirect
+            # Must redirect TO evil.com (as the destination host), not merely
+            # preserve evil.com in the query string of a canonical redirect.
             if r.status_code in (301, 302, 303, 307, 308):
                 loc = r.headers.get("Location", "")
-                if "evil.com" in loc:
+                if re.match(r'https?://evil\.com', loc) or loc.startswith("//evil.com"):
                     m = re.search(r'\?(\w+)=', path)
                     param = f"?{m.group(1)}" if m else "redirect parameter"
                     return f"Open Redirect — server follows attacker-controlled URLs (via '{param}' parameter)"
@@ -170,14 +172,12 @@ def check_dast(domain: str) -> "CheckResult":
 
             body = r.text[:3000]
 
-            # Skip HTML homepages (catch-all redirect false positive)
-            # unless the confirm pattern matches
-            if not confirm_pat:
-                # No confirm pattern: just trust the 200 status
-                pass
-            else:
-                if not re.search(confirm_pat, body, re.IGNORECASE):
-                    continue
+            # Empty body → catch-all route, not a real endpoint
+            if len(body.strip()) < 100:
+                continue
+
+            if confirm_pat and not re.search(confirm_pat, body, re.IGNORECASE):
+                continue
 
             # robots.txt: only flag if it disallows interesting paths
             if path == "/robots.txt":

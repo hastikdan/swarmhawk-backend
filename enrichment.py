@@ -88,7 +88,12 @@ def _parse_enrichment(raw: dict) -> dict:
     if isinstance(es, dict):
         status = es.get("status", "")
         detail = (es.get("detail") or "").lower()
-        if status == "ok":
+        if status == "ok" and detail == "no_mx":
+            # Domain has no MX record — email security checks are not applicable
+            result["spf_status"]   = "not_applicable"
+            result["dmarc_status"] = "not_applicable"
+            result["dkim_status"]  = "not_applicable"
+        elif status == "ok":
             result["spf_status"]   = "present"
             result["dmarc_status"] = "present"
             result["dkim_status"]  = "present"
