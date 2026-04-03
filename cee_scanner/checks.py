@@ -83,6 +83,8 @@ class CheckResult:
             d["cves"] = self.cves
         if hasattr(self, "software"):
             d["software"] = [{"product": p, "version": v} for p, v in self.software]
+        if hasattr(self, "nuclei_findings"):
+            d["nuclei_findings"] = self.nuclei_findings
         return d
 
 
@@ -1231,6 +1233,69 @@ def check_paranoidlab(domain: str) -> CheckResult:
         )
 
 
+def check_nuclei(domain: str) -> CheckResult:
+    """Active CVE + misconfiguration scan via nuclei templates.
+
+    Wraps intel_feeds.nuclei_scan(). Silently skips if nuclei binary is not installed.
+    Findings are serialised into check detail and as structured nuclei_findings list.
+    """
+    result = CheckResult("nuclei", domain)
+    try:
+        from intel_feeds import nuclei_scan as _nuclei_scan  # type: ignore
+    except ImportError:
+        return result.ok("Nuclei scanner not available", "intel_feeds not importable")
+
+    try:
+        findings = _nuclei_scan(domain)
+    except Exception as e:
+        return result.ok("Nuclei scan skipped", str(e)[:100])
+
+    if not findings:
+        return result.ok("No active vulnerabilities confirmed", "nuclei: 0 findings")
+
+    crits   = [f for f in findings if f.get("severity") == "critical"]
+    highs   = [f for f in findings if f.get("severity") == "high"]
+    mediums = [f for f in findings if f.get("severity") == "medium"]
+
+    max_cvss = max((f.get("cvss") or 0.0 for f in findings), default=0.0)
+
+    lines = []
+    for f in findings[:15]:
+        sev     = f.get("severity", "unknown").upper()
+        cve_str = f" [{f['cve_id']}]" if f.get("cve_id") else ""
+        cvss    = f.get("cvss") or 0.0
+        url     = f.get("matched_at", "")
+        lines.append(f"• {f.get('name','')}{cve_str} — {sev} CVSS {cvss:.1f} @ {url}")
+    if len(findings) > 15:
+        lines.append(f"  … and {len(findings) - 15} more")
+
+    detail = f"Max CVSS {max_cvss:.1f} — {len(findings)} confirmed finding(s)\n" + "\n".join(lines)
+
+    if crits:
+        r = result.critical(
+            f"Nuclei: {len(crits)} critical finding(s)" + (f" + {len(highs)} high" if highs else ""),
+            detail,
+            impact=min(25, len(crits) * 10 + len(highs) * 5),
+        )
+    elif highs:
+        r = result.warn(
+            f"Nuclei: {len(highs)} high-severity finding(s)",
+            detail,
+            impact=min(15, len(highs) * 5),
+        )
+    elif mediums:
+        r = result.warn(
+            f"Nuclei: {len(mediums)} medium-severity finding(s)",
+            detail,
+            impact=min(8, len(mediums) * 3),
+        )
+    else:
+        r = result.ok(f"Nuclei: {len(findings)} low/info finding(s)", detail)
+
+    r.nuclei_findings = findings
+    return r
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -1261,6 +1326,8 @@ ALL_CHECKS = [
     check_ports,                # TCP connect scan of 30 common ports
     check_subdomains,           # CT log + DNS wordlist subdomain enumeration
     check_cms,                  # CMS / technology fingerprinting and version disclosure
+    # ── Active CVE validation ──
+    check_nuclei,               # nuclei templates: 3,000+ active CVE + misconfiguration checks
 ]
 
 

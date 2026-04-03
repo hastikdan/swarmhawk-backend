@@ -797,7 +797,7 @@ def nuclei_enrich_result(result: dict) -> dict:
     Only runs for risk_score >= 60 to avoid wasting resources on low-risk domains.
     Marks matching CVEs as confirmed=True and boosts risk for high/critical findings.
     """
-    if result.get("risk_score", 0) < 60:
+    if result.get("risk_score", 0) < 30:
         return result
 
     findings = nuclei_scan(result.get("domain", ""))
