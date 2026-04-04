@@ -1249,6 +1249,37 @@ def admin_delete_user(user_id: str, authorization: str = Header(None)):
     return {"deleted": user_id}
 
 
+class AdminUpdateUserBody(BaseModel):
+    email: Optional[str] = None
+    name:  Optional[str] = None
+
+@app.patch("/admin/users/{user_id}")
+def admin_update_user(user_id: str, body: AdminUpdateUserBody, authorization: str = Header(None)):
+    """Update a user's email and/or name. Admin only."""
+    import re as _re
+    require_admin(authorization)
+    db = get_admin_db()
+
+    row = db.table("users").select("id,email").eq("id", user_id).execute()
+    if not row.data:
+        raise HTTPException(404, "User not found")
+
+    updates: dict = {}
+    if body.email is not None:
+        email = body.email.strip().lower()
+        if not _re.match(r'^[^@\s]+@[^@\s]+\.[^@\s]+$', email):
+            raise HTTPException(400, "Invalid email address")
+        updates["email"] = email
+    if body.name is not None:
+        name = body.name.strip()
+        if name:
+            updates["name"] = name
+
+    if updates:
+        db.table("users").update(updates).eq("id", user_id).execute()
+    return {"updated": user_id}
+
+
 @app.post("/admin/users/{user_id}/rescan-all")
 def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Force re-scan all domains for a user. Admin only."""
