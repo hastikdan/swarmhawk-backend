@@ -888,6 +888,8 @@ async def login_email(body: LoginRequest):
         raise HTTPException(401, "No account found with that email")
 
     user = result.data[0]
+    if user.get("deleted_at"):
+        raise HTTPException(403, "This account has been deleted. Use the link in your deletion confirmation email to create a new account.")
     if user.get("password_hash") != hash_password(body.password):
         raise HTTPException(401, "Incorrect password")
 
@@ -993,6 +995,8 @@ async def google_auth(body: GoogleAuthRequest, background_tasks: BackgroundTasks
     existing = db.table("users").select("*").eq("email", email).execute()
     if existing.data:
         user = existing.data[0]
+        if user.get("deleted_at"):
+            raise HTTPException(403, "This account has been deleted. Use the link in your deletion confirmation email to create a new account.")
         db.table("users").update({
             "last_login": datetime.now(timezone.utc).isoformat(),
             "avatar":     avatar,
@@ -1037,9 +1041,9 @@ def admin_users(
     require_admin(authorization)
     db = get_admin_db()
 
-    # 1. Fetch paginated users
+    # 1. Fetch paginated users (include deleted_at for soft-delete display)
     offset = (page - 1) * per_page
-    users_res = db.table("users").select("id,email,name,auth_type,created_at,last_login") \
+    users_res = db.table("users").select("id,email,name,auth_type,created_at,last_login,deleted_at") \
         .order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
     total_res = db.table("users").select("id", count="exact").execute()
 
@@ -1047,7 +1051,7 @@ def admin_users(
     if not user_ids:
         return {"users": [], "total": total_res.count or 0, "page": page, "per_page": per_page}
 
-    # 2. Fetch domain counts for these users in one query
+    # 2. Fetch domain counts for these users in one query (include deleted users' domains)
     domains_res = db.table("domains").select("user_id").in_("user_id", user_ids).execute()
     domain_counts: dict = {}
     for d in (domains_res.data or []):
@@ -1073,6 +1077,7 @@ def admin_users(
             "paid_domains": paid_counts.get(uid, 0),
             "created_at":   u.get("created_at", ""),
             "last_login":   u.get("last_login", ""),
+            "deleted_at":   u.get("deleted_at"),
         })
 
     return {"users": rows, "total": total_res.count or 0, "page": page, "per_page": per_page}
@@ -1317,21 +1322,41 @@ def admin_revoke_key(key_id: str, authorization: str = Header(None)):
 
 @app.delete("/admin/users/{user_id}")
 def admin_delete_user(user_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
-    """Delete a user and all their data. Admin only."""
+    """Soft-delete a user (marks deleted_at, wipes sessions). No data is removed. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
 
-    # Fetch email + name before deletion for the confirmation email
-    user_row = db.table("users").select("email,name").eq("id", user_id).execute()
-    user_email = (user_row.data[0]["email"] if user_row.data else None)
-    user_name  = (user_row.data[0].get("name", "") if user_row.data else "")
+    user_row = db.table("users").select("email,name,deleted_at").eq("id", user_id).execute()
+    if not user_row.data:
+        raise HTTPException(404, "User not found")
+    u = user_row.data[0]
+    if u.get("deleted_at"):
+        raise HTTPException(409, "User is already deleted")
 
-    db.table("users").delete().eq("id", user_id).execute()
+    user_email = u["email"]
+    user_name  = u.get("name", "")
 
-    if user_email:
-        background_tasks.add_task(send_account_deletion_email, user_email, user_name)
+    db.table("users").update({
+        "deleted_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", user_id).execute()
+    db.table("sessions").delete().eq("user_id", user_id).execute()
 
+    background_tasks.add_task(send_account_deletion_email, user_email, user_name)
     return {"deleted": user_id}
+
+
+@app.post("/admin/users/{user_id}/restore")
+def admin_restore_user(user_id: str, authorization: str = Header(None)):
+    """Restore a soft-deleted user (clear deleted_at). Admin only."""
+    require_admin(authorization)
+    db = get_admin_db()
+    user_row = db.table("users").select("id,deleted_at").eq("id", user_id).execute()
+    if not user_row.data:
+        raise HTTPException(404, "User not found")
+    if not user_row.data[0].get("deleted_at"):
+        raise HTTPException(409, "User is not deleted")
+    db.table("users").update({"deleted_at": None}).eq("id", user_id).execute()
+    return {"restored": user_id}
 
 
 class AdminUpdateUserBody(BaseModel):
@@ -1871,28 +1896,28 @@ def update_profile(body: UpdateProfileRequest, authorization: str = Header(None)
 
 @app.delete("/me")
 def delete_account(background_tasks: BackgroundTasks, authorization: str = Header(None)):
-    """Delete the current user's account and all associated data."""
+    """Soft-delete the current user's account. Marks deleted_at, wipes sessions; all data is retained."""
     user = get_user_from_header(authorization)
     db   = get_db()
     uid  = user["sub"]
 
-    # Fetch email + name before deletion so we can send the confirmation email
-    user_row = db.table("users").select("email,name").eq("id", uid).execute()
-    user_email = (user_row.data[0]["email"] if user_row.data else None)
-    user_name  = (user_row.data[0].get("name", "") if user_row.data else "")
+    user_row = db.table("users").select("email,name,deleted_at").eq("id", uid).execute()
+    if not user_row.data:
+        raise HTTPException(404, "User not found")
+    u = user_row.data[0]
+    if u.get("deleted_at"):
+        raise HTTPException(409, "Account is already deleted")
 
-    # Delete all user data in order (domains cascade to scans/purchases via FK)
-    domains = db.table("domains").select("id").eq("user_id", uid).execute()
-    for d in (domains.data or []):
-        db.table("scans").delete().eq("domain_id", d["id"]).execute()
-        db.table("purchases").delete().eq("domain_id", d["id"]).execute()
-    db.table("domains").delete().eq("user_id", uid).execute()
+    user_email = u["email"]
+    user_name  = u.get("name", "")
+
+    # Soft-delete: stamp deleted_at and invalidate all sessions
+    db.table("users").update({
+        "deleted_at": datetime.now(timezone.utc).isoformat()
+    }).eq("id", uid).execute()
     db.table("sessions").delete().eq("user_id", uid).execute()
-    db.table("users").delete().eq("id", uid).execute()
 
-    if user_email:
-        background_tasks.add_task(send_account_deletion_email, user_email, user_name)
-
+    background_tasks.add_task(send_account_deletion_email, user_email, user_name)
     return {"deleted": True}
 
 
