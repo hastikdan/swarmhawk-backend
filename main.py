@@ -1933,7 +1933,7 @@ def list_domains(authorization: str = Header(None)):
     # Omitting checks(*) here is the key optimisation — checks are large JSON and we
     # only need them for the single latest scan per domain, fetched separately below.
     domains_res = db.table("domains")\
-        .select("id,domain,country,created_at,primary_contact,contact_emails,scans(id,scanned_at,risk_score),purchases(paid_at)")\
+        .select("id,domain,country,industry,created_at,primary_contact,contact_emails,scans(id,scanned_at,risk_score),purchases(paid_at)")\
         .eq("user_id", user["sub"])\
         .order("created_at", desc=True)\
         .execute()
@@ -2001,6 +2001,7 @@ def list_domains(authorization: str = Header(None)):
             "risk_score":      latest_scan["risk_score"] if latest_scan else None,
             "scanned_at":      latest_scan["scanned_at"] if latest_scan else None,
             "checks":          latest_checks,
+            "industry":        d.get("industry"),
             "primary_contact": d.get("primary_contact"),
             "contact_emails":  cached_contact_emails or [],
             "scan_history": [
@@ -2087,6 +2088,19 @@ def delete_domain(domain_id: str, authorization: str = Header(None)):
         raise HTTPException(404, "Domain not found")
     db.table("domains").delete().eq("id", domain_id).execute()
     return {"deleted": domain_id}
+
+
+@app.patch("/domains/{domain_id}/industry")
+def update_domain_industry(domain_id: str, body: dict, authorization: str = Header(None)):
+    """Set the industry tag for a domain."""
+    user = get_user_from_header(authorization)
+    db = get_admin_db()
+    domain = db.table("domains").select("id").eq("id", domain_id).eq("user_id", user["sub"]).execute()
+    if not domain.data:
+        raise HTTPException(404, "Domain not found")
+    industry = body.get("industry") or None  # allow clearing with null/empty
+    db.table("domains").update({"industry": industry}).eq("id", domain_id).execute()
+    return {"industry": industry}
 
 
 @app.get("/domains/{domain_id}/scan-status")
