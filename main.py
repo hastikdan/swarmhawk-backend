@@ -4855,7 +4855,7 @@ def _build_map_data() -> dict:
             if not cc or cc in ("EU", "??", ""):
                 cc = tld_to_country(r.get("domain", "unknown.com"))
             if not cc:
-                continue
+                cc = "US"  # default undetectable TLDs (.com/.net/.org etc.) to US
             if cc not in scan_counts:
                 scan_counts[cc] = {"domains": 0, "scanned": 0, "risk_scores": []}
             scan_counts[cc]["domains"] += 1
@@ -4895,6 +4895,29 @@ def _build_map_data() -> dict:
         _merge_scan_rows(filtered, scan_counts)
     except Exception as e:
         print(f"[map] outreach_prospects query failed: {e}")
+
+    # User-added domains: domains table joined with latest scan score
+    try:
+        user_doms = db.table("domains")\
+            .select("domain,country,scans(risk_score,scanned_at)")\
+            .execute()
+        all_seen = {r.get("domain") for r in sr_rows_data}
+        user_rows = []
+        for d in (user_doms.data or []):
+            dom = d.get("domain", "")
+            if dom in all_seen:
+                continue  # already counted from scan_results
+            scans = d.get("scans") or []
+            latest = max(scans, key=lambda s: s.get("scanned_at") or "", default=None) if scans else None
+            user_rows.append({
+                "domain":          dom,
+                "country":         d.get("country"),
+                "risk_score":      latest["risk_score"] if latest else None,
+                "last_scanned_at": latest["scanned_at"] if latest else None,
+            })
+        _merge_scan_rows(user_rows, scan_counts)
+    except Exception as e:
+        print(f"[map] user domains query failed: {e}")
 
     for cc, sc in scan_counts.items():
         if cc not in country_data:
@@ -5016,7 +5039,7 @@ def map_country_top_domains(code: str):
             dom = r.get("domain", "")
             cc = (r.get("country") or "").upper().strip()
             if not cc or cc in ("EU", "??", ""):
-                cc = tld_to_country(dom)
+                cc = tld_to_country(dom) or "US"
             if cc != code:
                 continue
             if dom in seen:
