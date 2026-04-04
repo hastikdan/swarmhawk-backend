@@ -1296,6 +1296,30 @@ def check_nuclei(domain: str) -> CheckResult:
     return r
 
 
+def check_injection(domain: str) -> CheckResult:
+    """OWASP A03:2021 — SQL/debug error disclosure and injectable surface detection."""
+    from cee_scanner.skills.injection import check_injection as _check
+    return _check(domain)
+
+
+def check_auth_security(domain: str) -> CheckResult:
+    """OWASP A07:2021 — Cookie flags, login brute-force exposure, unauthenticated admin panels."""
+    from cee_scanner.skills.auth_security import check_auth_security as _check
+    return _check(domain)
+
+
+def check_integrity(domain: str) -> CheckResult:
+    """OWASP A08:2021 — SRI on external CDN resources, exposed dependency manifests."""
+    from cee_scanner.skills.integrity import check_integrity as _check
+    return _check(domain)
+
+
+def check_ssrf(domain: str) -> CheckResult:
+    """OWASP A10:2021 — SSRF-prone endpoints, open redirects, unsafe URL parameters."""
+    from cee_scanner.skills.ssrf import check_ssrf as _check
+    return _check(domain)
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -1328,6 +1352,11 @@ ALL_CHECKS = [
     check_cms,                  # CMS / technology fingerprinting and version disclosure
     # ── Active CVE validation ──
     check_nuclei,               # nuclei templates: 3,000+ active CVE + misconfiguration checks
+    # ── OWASP Top 10 ──
+    check_injection,            # A03: SQL/debug error disclosure, injectable surfaces
+    check_auth_security,        # A07: cookie flags, login hardening, admin panel exposure
+    check_integrity,            # A08: SRI on CDN resources, exposed dependency manifests
+    check_ssrf,                 # A10: SSRF-prone endpoints, open redirects
 ]
 
 
