@@ -5269,6 +5269,45 @@ def pipeline_run_bulk_discovery(authorization: str = Header(None)):
         raise HTTPException(500, str(e))
 
 
+@app.post("/pipeline/backfill-outreach")
+def pipeline_backfill_outreach(authorization: str = Header(None)):
+    """Admin: mark already-scanned domains as pending outreach if they qualify
+    (risk_score >= 40 or max_cvss >= 7) but currently have no outreach_status.
+    Safe to run multiple times — only touches rows where outreach_status IS NULL.
+    Returns count of newly queued prospects."""
+    require_admin(authorization)
+    db = get_admin_db()
+    try:
+        # Fetch unqualified rows in chunks to avoid timeout
+        updated = 0
+        offset  = 0
+        chunk   = 500
+        while True:
+            rows = db.table("scan_results")\
+                .select("id,max_cvss,risk_score")\
+                .is_("outreach_status", "null")\
+                .range(offset, offset + chunk - 1)\
+                .execute()
+            if not rows.data:
+                break
+            qualifying = [
+                r["id"] for r in rows.data
+                if (r.get("max_cvss") or 0) >= 7.0 or (r.get("risk_score") or 0) >= 40
+            ]
+            if qualifying:
+                db.table("scan_results")\
+                    .update({"outreach_status": "pending"})\
+                    .in_("id", qualifying)\
+                    .execute()
+                updated += len(qualifying)
+            offset += chunk
+            if len(rows.data) < chunk:
+                break
+        return {"backfilled": updated, "message": f"{updated} domains marked as pending outreach"}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/pipeline/run-sonar-import")
 def pipeline_run_sonar_import(
     authorization: str = Header(None),

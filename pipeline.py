@@ -81,6 +81,7 @@ RADAR_LIMIT           = int(os.getenv("PIPELINE_RADAR_LIMIT", "200"))    # 2× f
 CT_LIMIT              = int(os.getenv("PIPELINE_CT_LIMIT", "1000"))
 BULK_LIMIT            = int(os.getenv("PIPELINE_BULK_LIMIT", "250000"))  # domains per bulk source
 CVSS_THRESHOLD        = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
+RISK_THRESHOLD        = float(os.getenv("OUTREACH_RISK_MIN", "40"))
 TIMEOUT               = 15
 UA                    = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Pipeline/1.0)"}
 
@@ -258,14 +259,16 @@ def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
                 # Only refresh scan data — never touch outreach workflow state
                 db.table("scan_results").update(scan_data).eq("id", row["id"]).execute()
                 return
-            new_status = "pending" if max_cvss >= CVSS_THRESHOLD else row.get("outreach_status")
+            qualifies  = max_cvss >= CVSS_THRESHOLD or risk >= RISK_THRESHOLD
+            new_status = "pending" if qualifies else row.get("outreach_status")
             db.table("scan_results").update({
                 **scan_data,
                 "outreach_status": new_status,
                 "email_body": result.get("email_body") or None,
             }).eq("id", row["id"]).execute()
         else:
-            new_status = "pending" if max_cvss >= CVSS_THRESHOLD else None
+            qualifies  = max_cvss >= CVSS_THRESHOLD or risk >= RISK_THRESHOLD
+            new_status = "pending" if qualifies else None
             db.table("scan_results").insert({
                 "domain":          domain,
                 "outreach_status": new_status,
@@ -762,7 +765,7 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
                 if result:
                     upsert_scan_result(result, db)
                     # Dual-write to outreach_prospects for backward compat (Phase 1)
-                    if result.get("max_cvss", 0) >= CVSS_THRESHOLD:
+                    if result.get("max_cvss", 0) >= CVSS_THRESHOLD or result.get("risk_score", 0) >= RISK_THRESHOLD:
                         _dual_write_outreach(result, db)
                     scanned += 1
             except Exception as e:
