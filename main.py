@@ -4857,25 +4857,31 @@ def _build_map_data() -> dict:
             if not cc:
                 continue
             if cc not in scan_counts:
-                scan_counts[cc] = {"domains": 0, "scanned": 0, "cvss": []}
+                scan_counts[cc] = {"domains": 0, "scanned": 0, "risk_scores": []}
             scan_counts[cc]["domains"] += 1
             if r.get("last_scanned_at") or r.get("scanned_at"):
                 scan_counts[cc]["scanned"] += 1
-            cvss_val = r.get("max_cvss")
-            if cvss_val is not None:
+            # Prefer risk_score (enrichment-aware); fall back to max_cvss × 10
+            risk = r.get("risk_score")
+            if risk is None:
+                cvss = r.get("max_cvss")
+                risk = float(cvss) * 10 if cvss is not None else None
+            if risk is not None:
                 try:
-                    scan_counts[cc]["cvss"].append(float(cvss_val))
+                    scan_counts[cc]["risk_scores"].append(float(risk))
                 except (ValueError, TypeError):
                     pass
 
     scan_counts: dict = {}
 
     # Primary source: unified scan_results table (all tiers)
+    sr_rows_data = []
     try:
         sr_rows = db.table("scan_results")\
-            .select("domain,country,max_cvss,last_scanned_at")\
+            .select("domain,country,risk_score,max_cvss,last_scanned_at")\
             .execute()
-        _merge_scan_rows(sr_rows.data, scan_counts)
+        sr_rows_data = sr_rows.data or []
+        _merge_scan_rows(sr_rows_data, scan_counts)
     except Exception as e:
         print(f"[map] scan_results query failed: {e}")
 
@@ -4884,8 +4890,7 @@ def _build_map_data() -> dict:
         op_rows = db.table("outreach_prospects")\
             .select("domain,country,max_cvss,scanned_at")\
             .execute()
-        # Only add domains not already counted from scan_results
-        sr_domains = {r.get("domain") for r in (sr_rows.data if 'sr_rows' in dir() else [])}
+        sr_domains = {r.get("domain") for r in sr_rows_data}
         filtered = [r for r in (op_rows.data or []) if r.get("domain") not in sr_domains]
         _merge_scan_rows(filtered, scan_counts)
     except Exception as e:
@@ -4900,11 +4905,11 @@ def _build_map_data() -> dict:
             }
         country_data[cc]["domains"]  = max(country_data[cc]["domains"], sc["domains"])
         country_data[cc]["scanned"]  = sc["scanned"]
-        if sc["cvss"]:
-            avg_cvss = sum(sc["cvss"]) / len(sc["cvss"])
-            country_data[cc]["avg_risk"]          = round(avg_cvss * 10, 1)
-            country_data[cc]["high_risk_domains"] = sum(1 for s in sc["cvss"] if s >= 7.0)
-            country_data[cc]["critical_findings"] = sum(1 for s in sc["cvss"] if s >= 9.0)
+        scores = sc["risk_scores"]
+        if scores:
+            country_data[cc]["avg_risk"]          = round(sum(scores) / len(scores), 1)
+            country_data[cc]["high_risk_domains"] = sum(1 for s in scores if s >= 60)
+            country_data[cc]["critical_findings"] = sum(1 for s in scores if s >= 80)
 
     # Strip internal keys, drop countries with 0 domains
     result = []
