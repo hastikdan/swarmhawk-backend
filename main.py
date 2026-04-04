@@ -340,8 +340,9 @@ async def lifespan(app):
             _pipeline_scheduler = _BGS3(timezone="Europe/Prague")
             # Daily: Radar + CT logs + Majestic at 01:00
             _pipeline_scheduler.add_job(run_discovery_job,      "cron", hour=1,  minute=0,  id="pipeline_discovery")
-            # Every 4 hours: Tier 1 batch scan (00:30, 04:30, 08:30, 12:30, 16:30, 20:30)
-            _pipeline_scheduler.add_job(run_pipeline_daily,     "cron", hour="0,4,8,12,16,20", minute=30, id="pipeline_tier1")
+            # Every 30 minutes: Tier 1 batch scan (configurable via PIPELINE_TIER1_INTERVAL_MINUTES, default 30)
+            _tier1_interval = int(os.getenv("PIPELINE_TIER1_INTERVAL_MINUTES", "30"))
+            _pipeline_scheduler.add_job(run_pipeline_daily, "interval", minutes=_tier1_interval, id="pipeline_tier1")
             # Weekly Sunday: full 22-check Tier 2 enrichment
             _pipeline_scheduler.add_job(run_enrichment_weekly,  "cron", day_of_week="sun",  hour=3,  minute=0,  id="pipeline_tier2")
             # Weekly Saturday: bulk discovery — Tranco + Umbrella (~2M domains)
@@ -349,7 +350,7 @@ async def lifespan(app):
             # Daily: CISA KEV refresh + immediate re-scoring of affected domains
             _pipeline_scheduler.add_job(run_kev_refresh_job,    "cron", hour=6,  minute=0,  id="kev_refresh")
             _pipeline_scheduler.start()
-            print("✓ Pipeline scheduler started (daily discovery 01:00, Tier1 every 4h, Tier2 Sun 03:00, bulk Sat 00:00, KEV refresh 06:00)")
+            print(f"✓ Pipeline scheduler started (Tier1 every {_tier1_interval}min, daily discovery 01:00, Tier2 Sun 03:00, bulk Sat 00:00, KEV refresh 06:00)")
         except Exception as e:
             print(f"Pipeline scheduler init failed: {e}")
     else:
