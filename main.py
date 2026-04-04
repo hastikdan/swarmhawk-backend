@@ -5145,6 +5145,45 @@ def pipeline_status():
         return {"error": str(e)}
 
 
+@app.get("/outreach/funnel")
+def outreach_funnel(authorization: str = Header(None)):
+    """Admin: outreach pipeline funnel — shows where prospects drop off."""
+    require_admin(authorization)
+    db = get_admin_db()
+    try:
+        sr = db.table("scan_results")
+        total_scanned   = sr.select("id", count="exact").not_.is_("last_scanned_at", "null").execute().count or 0
+        qualified       = sr.select("id", count="exact").not_.is_("outreach_status", "null").execute().count or 0
+        pending         = sr.select("id", count="exact").eq("outreach_status", "pending").execute().count or 0
+        has_email       = sr.select("id", count="exact").eq("outreach_status", "pending").not_.eq("contact_email", "").execute().count or 0
+        approved        = sr.select("id", count="exact").eq("outreach_status", "approved").execute().count or 0
+        sent            = sr.select("id", count="exact").eq("outreach_status", "sent").execute().count or 0
+        skipped         = sr.select("id", count="exact").eq("outreach_status", "skipped").execute().count or 0
+        # Qualification breakdown
+        missing_dmarc   = sr.select("id", count="exact").eq("dmarc_status", "missing").is_("outreach_status", "null").execute().count or 0
+        missing_spf     = sr.select("id", count="exact").eq("spf_status", "missing").is_("outreach_status", "null").execute().count or 0
+        blacklisted     = sr.select("id", count="exact").eq("blacklisted", True).is_("outreach_status", "null").execute().count or 0
+        return {
+            "funnel": {
+                "total_scanned":  total_scanned,
+                "qualified":      qualified,
+                "pending":        pending,
+                "has_email":      has_email,
+                "approved":       approved,
+                "sent":           sent,
+                "skipped":        skipped,
+            },
+            "unqualified_gaps": {
+                "missing_dmarc_not_yet_qualified": missing_dmarc,
+                "missing_spf_not_yet_qualified":   missing_spf,
+                "blacklisted_not_yet_qualified":   blacklisted,
+            },
+            "tip": "Run POST /pipeline/backfill-outreach to qualify all existing domains",
+        }
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 @app.post("/pipeline/run-discovery")
 def pipeline_run_discovery(authorization: str = Header(None)):
     """Admin: manually trigger global domain discovery (Cloudflare Radar + CT logs)."""
@@ -5300,20 +5339,19 @@ def pipeline_run_bulk_discovery(authorization: str = Header(None)):
 
 @app.post("/pipeline/backfill-outreach")
 def pipeline_backfill_outreach(authorization: str = Header(None)):
-    """Admin: mark already-scanned domains as pending outreach if they qualify
-    (risk_score >= 40 or max_cvss >= 7) but currently have no outreach_status.
-    Safe to run multiple times — only touches rows where outreach_status IS NULL.
-    Returns count of newly queued prospects."""
+    """Admin: mark already-scanned domains as pending outreach if they qualify.
+    Qualification: max_cvss >= 7 OR risk_score >= 40 OR missing DMARC/SPF OR blacklisted.
+    Safe to run multiple times — only touches rows where outreach_status IS NULL."""
     require_admin(authorization)
     db = get_admin_db()
+    from pipeline import _domain_qualifies
     try:
-        # Fetch unqualified rows in chunks to avoid timeout
         updated = 0
         offset  = 0
         chunk   = 500
         while True:
             rows = db.table("scan_results")\
-                .select("id,max_cvss,risk_score")\
+                .select("id,max_cvss,risk_score,dmarc_status,spf_status,blacklisted")\
                 .is_("outreach_status", "null")\
                 .range(offset, offset + chunk - 1)\
                 .execute()
@@ -5321,7 +5359,11 @@ def pipeline_backfill_outreach(authorization: str = Header(None)):
                 break
             qualifying = [
                 r["id"] for r in rows.data
-                if (r.get("max_cvss") or 0) >= 7.0 or (r.get("risk_score") or 0) >= 40
+                if _domain_qualifies(
+                    float(r.get("max_cvss") or 0),
+                    int(r.get("risk_score") or 0),
+                    r,
+                )
             ]
             if qualifying:
                 db.table("scan_results")\

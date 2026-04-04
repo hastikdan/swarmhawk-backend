@@ -187,6 +187,28 @@ def _get_db():
     return get_db()
 
 
+def _domain_qualifies(max_cvss: float, risk: int, scan_data: dict) -> bool:
+    """Return True if a domain should enter the outreach pipeline.
+
+    Qualification tiers (any one is enough):
+      1. CVE risk:        known CVE with CVSS >= 7.0
+      2. Overall risk:    computed risk_score >= 40
+      3. Email gap:       missing DMARC or missing SPF   ← most common, best sales angle
+      4. Blacklisted:     domain on Spamhaus/URLhaus/IP blocklist
+    """
+    if max_cvss >= CVSS_THRESHOLD:
+        return True
+    if risk >= RISK_THRESHOLD:
+        return True
+    if scan_data.get("dmarc_status") == "missing":
+        return True
+    if scan_data.get("spf_status") == "missing":
+        return True
+    if scan_data.get("blacklisted"):
+        return True
+    return False
+
+
 def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
     """Write unified scan result to scan_results table.
 
@@ -259,7 +281,7 @@ def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
                 # Only refresh scan data — never touch outreach workflow state
                 db.table("scan_results").update(scan_data).eq("id", row["id"]).execute()
                 return
-            qualifies  = max_cvss >= CVSS_THRESHOLD or risk >= RISK_THRESHOLD
+            qualifies  = _domain_qualifies(max_cvss, risk, scan_data)
             new_status = "pending" if qualifies else row.get("outreach_status")
             db.table("scan_results").update({
                 **scan_data,
@@ -267,7 +289,7 @@ def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
                 "email_body": result.get("email_body") or None,
             }).eq("id", row["id"]).execute()
         else:
-            qualifies  = max_cvss >= CVSS_THRESHOLD or risk >= RISK_THRESHOLD
+            qualifies  = _domain_qualifies(max_cvss, risk, scan_data)
             new_status = "pending" if qualifies else None
             db.table("scan_results").insert({
                 "domain":          domain,
@@ -765,7 +787,7 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
                 if result:
                     upsert_scan_result(result, db)
                     # Dual-write to outreach_prospects for backward compat (Phase 1)
-                    if result.get("max_cvss", 0) >= CVSS_THRESHOLD or result.get("risk_score", 0) >= RISK_THRESHOLD:
+                    if _domain_qualifies(result.get("max_cvss", 0), result.get("risk_score", 0), result):
                         _dual_write_outreach(result, db)
                     scanned += 1
             except Exception as e:
