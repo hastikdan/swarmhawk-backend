@@ -596,6 +596,81 @@ def send_welcome_and_confirm_email(to_email: str, name: str, token: str):
         print(f"[auth] Failed to send welcome email to {to_email}: {e}")
 
 
+def send_account_deletion_email(to_email: str, name: str):
+    """Send an account-deleted confirmation + re-registration link to the user."""
+    if not RESEND_API_KEY:
+        print(f"[auth] RESEND_API_KEY not set — skipping deletion email to {to_email}")
+        return
+    signup_url = f"{SITE_URL}/new/"
+    display_name = name or to_email.split("@")[0]
+    html = f"""<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#0e0d12;font-family:Arial,sans-serif">
+<div style="max-width:580px;margin:0 auto;padding:48px 24px">
+
+  <!-- Logo -->
+  <div style="margin-bottom:32px">
+    <span style="font-family:monospace;font-size:20px;font-weight:700;color:#cbff00;letter-spacing:1px">&#9679;SWARMHAWK</span>
+  </div>
+
+  <!-- Headline -->
+  <h1 style="color:#f0eef8;font-size:22px;font-weight:700;margin:0 0 8px">Your account has been deleted</h1>
+  <p style="color:#6b6880;font-size:14px;line-height:1.6;margin:0 0 24px">
+    Hi {display_name}, this email confirms that your SwarmHawk account and all associated data
+    (domains, scan reports, contacts) have been permanently removed.
+  </p>
+
+  <!-- Info box -->
+  <div style="background:#16151e;border-radius:8px;padding:20px;margin-bottom:32px;border-left:3px solid #cbff00">
+    <p style="color:#a0a0b8;font-size:13px;line-height:1.7;margin:0">
+      <strong style="color:#f0eef8">What was deleted:</strong><br>
+      Your login credentials &amp; profile &nbsp;·&nbsp; All monitored domains &nbsp;·&nbsp;
+      All scan reports &amp; risk scores &nbsp;·&nbsp; All contacts &amp; outreach data
+    </p>
+  </div>
+
+  <!-- Re-register CTA -->
+  <p style="color:#6b6880;font-size:14px;line-height:1.6;margin:0 0 20px">
+    Changed your mind? You can create a new SwarmHawk account at any time using the same email address.
+  </p>
+  <div style="margin-bottom:40px">
+    <a href="{signup_url}"
+       style="display:inline-block;background:#cbff00;color:#0e0d12;font-family:monospace;font-weight:700;font-size:13px;letter-spacing:1px;padding:14px 32px;border-radius:6px;text-decoration:none">
+      CREATE NEW ACCOUNT →
+    </a>
+  </div>
+
+  <!-- Divider -->
+  <div style="border-top:1px solid rgba(255,255,255,.08);margin-bottom:24px"></div>
+
+  <!-- Footer -->
+  <p style="color:#3a3840;font-size:11px;margin:0;font-family:monospace;line-height:1.8">
+    SwarmHawk · European Cybersecurity Intelligence<br>
+    hello@swarmhawk.com · swarmhawk.com<br>
+    You received this because your account was deleted.
+  </p>
+
+</div>
+</body>
+</html>"""
+    try:
+        import httpx as _httpx
+        r = _httpx.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from":    f"SwarmHawk <{FROM_EMAIL}>",
+                "to":      [to_email],
+                "subject": "Your SwarmHawk account has been deleted",
+                "html":    html,
+            },
+            timeout=10,
+        )
+        print(f"[auth] Deletion email sent to {to_email} (status {r.status_code})")
+    except Exception as e:
+        print(f"[auth] Failed to send deletion email to {to_email}: {e}")
+
+
 def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
                      new_threats: list[str]):
     """Send risk-change or new-threat alert email."""
@@ -1241,11 +1316,21 @@ def admin_revoke_key(key_id: str, authorization: str = Header(None)):
 
 
 @app.delete("/admin/users/{user_id}")
-def admin_delete_user(user_id: str, authorization: str = Header(None)):
+def admin_delete_user(user_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Delete a user and all their data. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
+
+    # Fetch email + name before deletion for the confirmation email
+    user_row = db.table("users").select("email,name").eq("id", user_id).execute()
+    user_email = (user_row.data[0]["email"] if user_row.data else None)
+    user_name  = (user_row.data[0].get("name", "") if user_row.data else "")
+
     db.table("users").delete().eq("id", user_id).execute()
+
+    if user_email:
+        background_tasks.add_task(send_account_deletion_email, user_email, user_name)
+
     return {"deleted": user_id}
 
 
@@ -1785,11 +1870,17 @@ def update_profile(body: UpdateProfileRequest, authorization: str = Header(None)
 
 
 @app.delete("/me")
-def delete_account(authorization: str = Header(None)):
+def delete_account(background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Delete the current user's account and all associated data."""
     user = get_user_from_header(authorization)
     db   = get_db()
     uid  = user["sub"]
+
+    # Fetch email + name before deletion so we can send the confirmation email
+    user_row = db.table("users").select("email,name").eq("id", uid).execute()
+    user_email = (user_row.data[0]["email"] if user_row.data else None)
+    user_name  = (user_row.data[0].get("name", "") if user_row.data else "")
+
     # Delete all user data in order (domains cascade to scans/purchases via FK)
     domains = db.table("domains").select("id").eq("user_id", uid).execute()
     for d in (domains.data or []):
@@ -1798,6 +1889,10 @@ def delete_account(authorization: str = Header(None)):
     db.table("domains").delete().eq("user_id", uid).execute()
     db.table("sessions").delete().eq("user_id", uid).execute()
     db.table("users").delete().eq("id", uid).execute()
+
+    if user_email:
+        background_tasks.add_task(send_account_deletion_email, user_email, user_name)
+
     return {"deleted": True}
 
 
