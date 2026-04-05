@@ -88,6 +88,10 @@ UA                    = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Pipel
 # Scan tier-to-reschedule interval mapping
 TIER_RESCAN_DAYS = {1: 7, 2: 7}
 
+# ── Runtime diagnostics ───────────────────────────────────────────────────────
+_last_tier1_run:  Optional[str] = None   # ISO timestamp of last successful tier1 batch
+_last_tier1_scanned: int = 0             # how many domains scanned in last batch
+
 # ── TLD → ISO-2 country map (global, 80+ countries) ──────────────────────────
 # Note: COUNTRY_TLDS in outreach.py maps ISO-2 → TLD. This is the reverse.
 TLD_COUNTRY: dict[str, str] = {
@@ -951,9 +955,12 @@ def run_pipeline_daily():
     Runs after run_discovery_job has populated the queue.
     Processes domain_queue with Tier 1 scans.
     """
+    global _last_tier1_run, _last_tier1_scanned
     log.info("[pipeline_daily] starting Tier 1 batch processing")
     db = _get_db()
     scanned = run_tier1_batch(db=db, batch_size=TIER1_BATCH_SIZE)
+    _last_tier1_run = datetime.now(timezone.utc).isoformat()
+    _last_tier1_scanned = scanned
     log.info(f"[pipeline_daily] Tier 1 complete — {scanned} domains scanned")
     return scanned
 
@@ -1133,6 +1140,9 @@ def get_pipeline_status(db=None) -> dict:
     except Exception:
         certstream_status = "unknown"
 
+    import os as _os
+    worker_mode = _os.getenv("PIPELINE_WORKER_ENABLED", "").lower() in ("1", "true", "yes")
+
     return {
         "queue_pending":      queue_count,
         "total_domains":      total,
@@ -1154,4 +1164,8 @@ def get_pipeline_status(db=None) -> dict:
         "asn_domains":        by_source.get("asn_expansion", 0),
         "securitytrails_domains": by_source.get("securitytrails", 0),
         "scanner_ip":         _get_scanner_ip(),
+        # Scheduler diagnostics
+        "scheduler_mode":     "worker" if worker_mode else "inline",
+        "last_tier1_run":     _last_tier1_run,
+        "last_tier1_scanned": _last_tier1_scanned,
     }
