@@ -341,8 +341,11 @@ async def lifespan(app):
             # Daily: Radar + CT logs + Majestic at 01:00
             _pipeline_scheduler.add_job(run_discovery_job,      "cron", hour=1,  minute=0,  id="pipeline_discovery")
             # Every 30 minutes: Tier 1 batch scan (configurable via PIPELINE_TIER1_INTERVAL_MINUTES, default 30)
+            # next_run_time=datetime.now(timezone.utc) fires the first run immediately on startup
+            # instead of waiting a full interval — critical after Render cold starts.
             _tier1_interval = int(os.getenv("PIPELINE_TIER1_INTERVAL_MINUTES", "30"))
-            _pipeline_scheduler.add_job(run_pipeline_daily, "interval", minutes=_tier1_interval, id="pipeline_tier1")
+            _pipeline_scheduler.add_job(run_pipeline_daily, "interval", minutes=_tier1_interval,
+                                        id="pipeline_tier1", next_run_time=datetime.now(timezone.utc))
             # Weekly Sunday: full 22-check Tier 2 enrichment
             _pipeline_scheduler.add_job(run_enrichment_weekly,  "cron", day_of_week="sun",  hour=3,  minute=0,  id="pipeline_tier2")
             # Weekly Saturday: bulk discovery — Tranco + Umbrella (~2M domains)

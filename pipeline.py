@@ -166,10 +166,12 @@ def compute_unified_risk(max_cvss: float, checks: list, software: list,
 
 
 def _is_domain_reachable(domain: str, timeout: float = 3.0) -> bool:
-    """Quick TCP reachability check on port 443 (fallback 80).
+    """Reachability check: TCP port 443/80, then DNS fallback.
 
-    Eliminates dead/parked domains before wasting a full scan slot.
-    A 10s HTTP timeout × 600 dead domains = 100 minutes saved per batch.
+    Datacenter IPs (Render) are blocked by many CDNs on TCP, but those
+    domains still have valid DNS/SPF/DMARC data worth scanning.
+    A domain is "alive" if it responds on TCP *or* resolves in DNS.
+    Only truly non-existent domains (NXDOMAIN) return False.
     """
     for port in (443, 80):
         try:
@@ -177,7 +179,12 @@ def _is_domain_reachable(domain: str, timeout: float = 3.0) -> bool:
                 return True
         except (socket.timeout, socket.error, OSError):
             continue
-    return False
+    # TCP failed — Render's datacenter IP may be blocked; fall back to DNS
+    try:
+        socket.getaddrinfo(domain, None, socket.AF_INET)
+        return True
+    except (socket.gaierror, OSError):
+        return False
 
 
 # ── Database I/O ─────────────────────────────────────────────────────────────
@@ -759,11 +766,17 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
                 reachable_queue.append(row)  # on error assume reachable
 
     if dead_ids:
+        # Park dead domains 30 days out instead of deleting.
+        # Deleting causes daily discovery to immediately re-add them (skip_scan_check=True
+        # for bulk sources), creating an infinite dead-domain recycling loop.
+        # With queued_at far in future, ON CONFLICT DO NOTHING keeps them parked,
+        # and the priority/queued_at ordering won't surface them for 30 days.
+        snooze_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
         try:
-            db.table("domain_queue").delete().in_("id", dead_ids).execute()
+            db.table("domain_queue").update({"queued_at": snooze_until}).in_("id", dead_ids).execute()
         except Exception:
             pass
-        log.info(f"[tier1_batch] pre-filter: {len(dead_ids)} dead domains removed, "
+        log.info(f"[tier1_batch] pre-filter: {len(dead_ids)} dead domains parked 30d, "
                  f"{len(reachable_queue)} reachable queued")
     queue = reachable_queue
     if not queue:
