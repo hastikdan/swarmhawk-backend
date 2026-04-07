@@ -2435,11 +2435,12 @@ def get_report(domain_id: str, authorization: str = Header(None)):
     non_ai = [c for c in visible_checks if c.get("check") != "ai_summary"]
 
     # ── IP / datacenter geo (best-effort, non-blocking) ──────────────────────
+    import re as _re
     ip_address = None; ip_city = None; ip_org = None
+    domain_name = d["domain"]
+
+    # 1. Try pipeline scan_results cache (fast, no external call)
     try:
-        import socket as _sock, requests as _req
-        domain_name = d["domain"]
-        # 1. Try scan_results (pipeline already geo-enriched this domain)
         from outreach import get_db as _odb
         _sr = _odb().table("scan_results")\
             .select("ip_address,ip_city,ip_org")\
@@ -2447,22 +2448,28 @@ def get_report(domain_id: str, authorization: str = Header(None)):
             .limit(1).execute()
         if _sr.data and _sr.data[0].get("ip_address"):
             r0 = _sr.data[0]
-            ip_address = r0.get("ip_address")
+            ip_address = r0.get("ip_address") or None
             ip_city    = r0.get("ip_city") or ""
             ip_org     = r0.get("ip_org") or ""
-        else:
-            # 2. Resolve live and call ip-api.com
+    except Exception:
+        pass  # migration not run or domain not in pipeline — fall through to live lookup
+
+    # 2. Live fallback: resolve IP and call ip-api.com
+    if not ip_address:
+        try:
+            import socket as _sock, requests as _req
             _ip = _sock.gethostbyname(domain_name)
             _geo = _req.get(
                 f"http://ip-api.com/json/{_ip}?fields=status,lat,lon,city,as,org",
-                timeout=4
+                timeout=5
             ).json()
             if _geo.get("status") == "success":
                 ip_address = _ip
                 ip_city    = _geo.get("city") or ""
-                ip_org     = (_geo.get("org") or _geo.get("as") or "").replace(r"^AS\d+\s*", "")
-    except Exception:
-        pass
+                _raw_org   = _geo.get("org") or _geo.get("as") or ""
+                ip_org     = _re.sub(r"^AS\d+\s+", "", _raw_org)
+        except Exception:
+            pass
 
     return {
         "domain":      d["domain"],
