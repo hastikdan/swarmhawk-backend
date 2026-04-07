@@ -1202,7 +1202,7 @@ def admin_stats(authorization: str = Header(None)):
     from datetime import timedelta
 
     users     = db.table("users").select("id,created_at,auth_type").execute()
-    domains   = db.table("domains").select("id,domain,created_at").execute()
+    domains   = db.table("domains").select("id,domain,created_at,industry").execute()
     purchases = db.table("purchases").select("amount_usd,paid_at").execute()
     # Fetch scans with risk data and checks for deeper metrics
     scans     = db.table("scans").select("id,domain_id,risk_score,critical,warnings,checks,scanned_at").order("scanned_at", desc=True).limit(500).execute()
@@ -1243,6 +1243,39 @@ def admin_stats(authorization: str = Header(None)):
             if name not in check_counts:
                 check_counts[name] = {"critical": 0, "warning": 0, "ok": 0, "error": 0}
             check_counts[name][st] = check_counts[name].get(st, 0) + 1
+
+    # Industry × risk breakdown
+    # domain_id → industry (only domains that have an industry tag)
+    domain_industry = {d["id"]: d["industry"] for d in domains.data if d.get("industry")}
+    industry_stats: dict[str, dict] = {}
+    for s in scanned_domains:
+        ind = domain_industry.get(s.get("domain_id", ""))
+        if not ind:
+            continue
+        if ind not in industry_stats:
+            industry_stats[ind] = {"industry": ind, "domains": 0, "critical": 0, "warning": 0, "clean": 0, "total_score": 0}
+        score = s.get("risk_score") or 0
+        industry_stats[ind]["domains"]     += 1
+        industry_stats[ind]["total_score"] += score
+        if score >= 70:
+            industry_stats[ind]["critical"] += 1
+        elif score >= 30:
+            industry_stats[ind]["warning"]  += 1
+        else:
+            industry_stats[ind]["clean"]    += 1
+    # Compute avg and sort by critical desc, then total domains desc
+    industry_risk = []
+    for ind, s in industry_stats.items():
+        n = s["domains"]
+        industry_risk.append({
+            "industry": ind,
+            "domains":  n,
+            "critical": s["critical"],
+            "warning":  s["warning"],
+            "clean":    s["clean"],
+            "avg_risk": round(s["total_score"] / n, 1) if n else 0,
+        })
+    industry_risk.sort(key=lambda x: (x["critical"], x["domains"]), reverse=True)
 
     # Top 10 riskiest domains
     domain_map = {d["id"]: d["domain"] for d in domains.data}
@@ -1324,6 +1357,7 @@ def admin_stats(authorization: str = Header(None)):
         "check_breakdown": check_counts,
         "top_risky":       top_risky,
         "recent_scans":    recent_scans,
+        "industry_risk":   industry_risk,
     }
 
 
