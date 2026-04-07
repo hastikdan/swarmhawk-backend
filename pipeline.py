@@ -64,6 +64,83 @@ def _get_scanner_ip() -> str:
         pass
     return _scanner_ip
 
+# ── IP Geo enrichment (datacenter-level precision for map) ────────────────────
+
+_GEO_API = "http://ip-api.com/batch"
+_GEO_FIELDS = "status,lat,lon,city,as,org,countryCode"
+
+def _geo_enrich_domains(domains: list[str], db) -> int:
+    """Resolve IPs for up to 500 domains and store city/datacenter-level coords.
+
+    Uses ip-api.com/batch (free, 100 IPs/req, 45 req/min).
+    Only processes domains that don't yet have ip_lat populated.
+    Returns count of successfully geo-tagged domains.
+    """
+    if not domains:
+        return 0
+
+    # Resolve IPs for each domain (skip ones that fail)
+    ip_map: dict[str, str] = {}  # domain → IP
+    for domain in domains:
+        try:
+            ip = socket.gethostbyname(domain)
+            if ip and not ip.startswith("0."):
+                ip_map[domain] = ip
+        except Exception:
+            pass
+
+    if not ip_map:
+        return 0
+
+    # Build reverse map: IP → [domains] (multiple domains can share an IP)
+    ip_to_domains: dict[str, list[str]] = {}
+    for domain, ip in ip_map.items():
+        ip_to_domains.setdefault(ip, []).append(domain)
+
+    unique_ips = list(ip_to_domains.keys())
+    tagged = 0
+
+    # Call ip-api.com/batch in chunks of 100
+    for i in range(0, len(unique_ips), 100):
+        chunk = unique_ips[i:i + 100]
+        try:
+            resp = req.post(
+                f"{_GEO_API}?fields={_GEO_FIELDS}",
+                json=chunk, timeout=10,
+            )
+            if resp.status_code != 200:
+                continue
+            geo_results = resp.json()
+            for j, geo in enumerate(geo_results):
+                if geo.get("status") != "success":
+                    continue
+                ip = chunk[j]
+                lat  = geo.get("lat")
+                lon  = geo.get("lon")
+                city = geo.get("city") or ""
+                asn  = geo.get("as") or ""
+                org  = geo.get("org") or ""
+                for domain in ip_to_domains.get(ip, []):
+                    try:
+                        db.table("scan_results").update({
+                            "ip_address": ip,
+                            "ip_lat":     lat,
+                            "ip_lon":     lon,
+                            "ip_city":    city,
+                            "ip_asn":     asn,
+                            "ip_org":     org,
+                        }).eq("domain", domain).execute()
+                        tagged += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.debug(f"[geo_enrich] batch {i//100} failed: {e}")
+        time.sleep(0.5)  # stay well under 45 req/min
+
+    log.info(f"[geo_enrich] tagged {tagged}/{len(ip_map)} domains with datacenter coords")
+    return tagged
+
+
 # ── Alert callback (set by main.py to push SSE events to connected clients) ───
 _alert_callback: Optional[Callable[[dict], None]] = None
 
@@ -818,6 +895,14 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
             log.warning(f"[tier1_batch] cleanup failed: {e}")
 
     log.info(f"[tier1_batch] done — {scanned}/{len(queue)} scanned successfully")
+
+    # Geo-enrich newly scanned domains with datacenter-level coordinates
+    scanned_domains = [row["domain"] for row in queue if row["domain"] not in already_scanned]
+    try:
+        _geo_enrich_domains(scanned_domains, db)
+    except Exception as e:
+        log.debug(f"[tier1_batch] geo enrich skipped: {e}")
+
     return scanned
 
 

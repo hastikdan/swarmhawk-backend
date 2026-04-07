@@ -4839,6 +4839,7 @@ def domain_death_predictor(domain_id: str, authorization: str = Header(None)):
 
 _map_cache: dict = {"data": None, "built_at": None}
 _MAP_CACHE_TTL = 900  # 15 minutes — refresh faster as worker scans more
+_dc_cache:  dict = {"data": None, "built_at": None}  # datacenter-level geo cache
 
 
 def _build_map_data() -> dict:
@@ -5013,6 +5014,52 @@ def check_domains_available(domains: str):
         for domain, status in ex.map(check_one, domain_list):
             results[domain] = status
     return results
+
+
+@app.get("/map/datacenters")
+def map_datacenters():
+    """
+    Public: domain points with city/datacenter-level geo coordinates.
+    Returns only domains that have been geo-enriched (ip_lat != null).
+    Cached 30 minutes. Used by map.html at zoom >= 5.
+    """
+    global _dc_cache
+    now = datetime.now(timezone.utc)
+    if _dc_cache["data"] is not None and _dc_cache.get("built_at"):
+        age = (now - _dc_cache["built_at"]).total_seconds()
+        if age < 1800:
+            return _dc_cache["data"]
+
+    try:
+        from outreach import get_db as outreach_get_db
+        db = outreach_get_db()
+        rows = db.table("scan_results")\
+            .select("domain,ip_lat,ip_lon,ip_city,ip_asn,ip_org,risk_score,country")\
+            .not_.is_("ip_lat", "null")\
+            .not_.is_("ip_lon", "null")\
+            .execute()
+        points = []
+        for r in (rows.data or []):
+            lat = r.get("ip_lat")
+            lon = r.get("ip_lon")
+            if lat is None or lon is None:
+                continue
+            points.append({
+                "domain":    r.get("domain", ""),
+                "lat":       round(float(lat), 4),
+                "lon":       round(float(lon), 4),
+                "city":      r.get("ip_city") or "",
+                "asn":       r.get("ip_asn") or "",
+                "org":       r.get("ip_org") or "",
+                "risk":      r.get("risk_score") or 0,
+                "country":   r.get("country") or "",
+            })
+        result = {"points": points, "total": len(points)}
+        _dc_cache["data"]     = result
+        _dc_cache["built_at"] = now
+        return result
+    except Exception as e:
+        return {"points": [], "total": 0, "error": str(e)}
 
 
 @app.get("/map/data")
