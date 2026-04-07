@@ -1062,12 +1062,19 @@ def admin_users(
         uid = d["user_id"]
         domain_counts[uid] = domain_counts.get(uid, 0) + 1
 
-    # 3. Fetch purchase counts in one query
-    paid_res = db.table("purchases").select("user_id").in_("user_id", user_ids).execute()
+    # 3. Fetch purchase info in one query (for paid_domains count + plan detection)
+    paid_res = db.table("purchases").select("user_id,plan").in_("user_id", user_ids).execute()
     paid_counts: dict = {}
+    user_plans: dict = {}
     for p in (paid_res.data or []):
-        uid = p["user_id"]
+        uid  = p["user_id"]
+        plan = p.get("plan") or ""
         paid_counts[uid] = paid_counts.get(uid, 0) + 1
+        # Highest plan wins: platform > professional > annual > one_time
+        existing = user_plans.get(uid, "free")
+        priority = {"platform": 4, "professional": 3, "annual": 2, "one_time": 1, "free": 0}
+        if priority.get(plan, 1) > priority.get(existing, 0):
+            user_plans[uid] = plan if plan else "paid"
 
     rows = []
     for u in (users_res.data or []):
@@ -1077,6 +1084,7 @@ def admin_users(
             "email":        u.get("email", ""),
             "name":         u.get("name", ""),
             "auth_type":    u.get("auth_type", "google"),
+            "plan":         user_plans.get(uid, "free"),
             "domain_count": domain_counts.get(uid, 0),
             "paid_domains": paid_counts.get(uid, 0),
             "created_at":   u.get("created_at", ""),
@@ -1101,20 +1109,37 @@ def admin_domains(
     domains = db.table("domains").select("*, users(email,name)").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
     total   = db.table("domains").select("id", count="exact").execute()
 
+    domain_ids = [d["id"] for d in (domains.data or [])]
+
+    # Batch-fetch latest scan per domain (no N+1)
+    scan_map: dict = {}
+    if domain_ids:
+        scans_res = db.table("scans").select("domain_id,risk_score,scanned_at") \
+            .in_("domain_id", domain_ids).order("scanned_at", desc=True).execute()
+        for s in (scans_res.data or []):
+            did = s["domain_id"]
+            if did not in scan_map:
+                scan_map[did] = s
+
+    # Batch-fetch paid domains
+    paid_set: set = set()
+    if domain_ids:
+        paid_res = db.table("purchases").select("domain_id").in_("domain_id", domain_ids).execute()
+        paid_set = {p["domain_id"] for p in (paid_res.data or []) if p.get("domain_id")}
+
     rows = []
     for d in (domains.data or []):
-        # Get latest scan
-        scan = db.table("scans").select("risk_score,scanned_at").eq("domain_id", d["id"]).order("scanned_at", desc=True).limit(1).execute()
-        paid = db.table("purchases").select("id").eq("domain_id", d["id"]).execute()
+        did  = d["id"]
+        scan = scan_map.get(did, {})
         rows.append({
-            "id":          d["id"],
+            "id":          did,
             "domain":      d["domain"],
             "country":     d.get("country", ""),
             "user_email":  d.get("users", {}).get("email", "") if d.get("users") else "",
             "user_name":   d.get("users", {}).get("name", "") if d.get("users") else "",
-            "risk_score":  scan.data[0]["risk_score"] if scan.data else None,
-            "scanned_at":  scan.data[0]["scanned_at"] if scan.data else None,
-            "paid":        bool(paid.data),
+            "risk_score":  scan.get("risk_score"),
+            "scanned_at":  scan.get("scanned_at"),
+            "paid":        did in paid_set,
             "created_at":  d.get("created_at", ""),
         })
 
