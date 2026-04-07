@@ -881,8 +881,12 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
                 if result:
                     upsert_scan_result(result, db)
                     # Dual-write to outreach_prospects for backward compat (Phase 1)
-                    if _domain_qualifies(result.get("max_cvss", 0), result.get("risk_score", 0), result):
-                        _dual_write_outreach(result, db)
+                    # Flatten enrichment fields to top level so _domain_qualifies can
+                    # read spf_status, dmarc_status, blacklisted directly.
+                    enrichment = result.get("enrichment") or {}
+                    flat = {**result, **enrichment}
+                    if _domain_qualifies(flat.get("max_cvss", 0), flat.get("risk_score", 0), flat):
+                        _dual_write_outreach(flat, db)
                     scanned += 1
             except Exception as e:
                 log.warning(f"[tier1_batch] {row['domain']}: {e}")
@@ -954,6 +958,78 @@ def run_tier2_enrichment(db=None, batch_size: int = TIER2_BATCH_SIZE) -> int:
 
     log.info(f"[tier2_enrichment] done — {scanned}/{len(targets)} domains enriched")
     return scanned
+
+
+def backfill_outreach_prospects(db=None, limit: int = 2000) -> int:
+    """Sync qualifying scan_results into outreach_prospects.
+
+    Picks rows with outreach_status='pending' that don't yet have a matching
+    outreach_prospects row and dual-writes them. Run once after the enrichment
+    flatten bug was fixed to rescue already-scanned qualifying domains.
+    Returns count of newly written prospects.
+    """
+    db = db or _get_db()
+    try:
+        rows = db.table("scan_results")\
+            .select("domain,country,risk_score,max_cvss,software,cves,priority,"
+                    "spf_status,dmarc_status,blacklisted,contact_email,email_body")\
+            .eq("outreach_status", "pending")\
+            .limit(limit)\
+            .execute()
+    except Exception as e:
+        log.warning(f"[backfill] query failed: {e}")
+        return 0
+
+    if not rows.data:
+        log.info("[backfill] no pending scan_results to backfill")
+        return 0
+
+    # Fetch domains already in outreach_prospects to skip them
+    domains_in_op: set = set()
+    try:
+        op_rows = db.table("outreach_prospects").select("domain").execute()
+        domains_in_op = {r["domain"] for r in (op_rows.data or [])}
+    except Exception:
+        pass
+
+    written = 0
+    for r in rows.data:
+        domain = r.get("domain")
+        if not domain or domain in domains_in_op:
+            continue
+        try:
+            # Build a result-like dict that upsert_prospect accepts
+            soft = r.get("software") or []
+            if isinstance(soft, str):
+                import json as _j
+                try: soft = _j.loads(soft)
+                except: soft = []
+            cvs = r.get("cves") or []
+            if isinstance(cvs, str):
+                import json as _j
+                try: cvs = _j.loads(cvs)
+                except: cvs = []
+            flat = {
+                "domain":        domain,
+                "country":       r.get("country") or "",
+                "risk_score":    r.get("risk_score") or 0,
+                "max_cvss":      r.get("max_cvss") or 0.0,
+                "software":      soft,
+                "cves":          cvs,
+                "priority":      r.get("priority") or 50,
+                "contact_email": r.get("contact_email") or f"security@{domain}",
+                "email_body":    r.get("email_body") or "",
+                "spf_status":    r.get("spf_status"),
+                "dmarc_status":  r.get("dmarc_status"),
+                "blacklisted":   r.get("blacklisted") or False,
+            }
+            _dual_write_outreach(flat, db)
+            written += 1
+        except Exception as e:
+            log.debug(f"[backfill] {domain}: {e}")
+
+    log.info(f"[backfill] wrote {written} prospects from scan_results → outreach_prospects")
+    return written
 
 
 # ── Dual-write helper (Phase 1 backward compat) ───────────────────────────────

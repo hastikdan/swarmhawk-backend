@@ -5493,7 +5493,14 @@ def pipeline_backfill_outreach(authorization: str = Header(None)):
             offset += chunk
             if len(rows.data) < chunk:
                 break
-        return {"backfilled": updated, "message": f"{updated} domains marked as pending outreach"}
+        # Also dual-write the newly-marked + existing pending rows to outreach_prospects
+        from pipeline import backfill_outreach_prospects
+        written = backfill_outreach_prospects(db=db)
+        return {
+            "backfilled":           updated,
+            "prospects_written":    written,
+            "message": f"{updated} domains marked pending in scan_results, {written} written to outreach_prospects",
+        }
     except Exception as e:
         raise HTTPException(500, str(e))
 
