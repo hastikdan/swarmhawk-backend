@@ -5106,11 +5106,64 @@ def _build_map_data() -> dict:
                 row["domains"] = len(PROSPECT_DOMAINS.get(cc, [])) or 1
             result.append(row)
 
+    # ── Industry risk breakdown from user-added domains ──────────────────────
+    industry_risk: list = []
+    try:
+        # Use get_admin_db so we can read the domains table with service-role key
+        admin_db = get_admin_db()
+        ind_doms = admin_db.table("domains").select("id,industry").execute()
+        domain_industry_map = {d["id"]: d["industry"] for d in (ind_doms.data or []) if d.get("industry")}
+
+        if domain_industry_map:
+            # Latest scan per domain from the scans table
+            ind_scans = admin_db.table("scans")\
+                .select("domain_id,risk_score")\
+                .in_("domain_id", list(domain_industry_map.keys()))\
+                .order("scanned_at", desc=True)\
+                .execute()
+            # Keep only the latest scan per domain
+            latest_per_domain: dict = {}
+            for s in (ind_scans.data or []):
+                did = s["domain_id"]
+                if did not in latest_per_domain:
+                    latest_per_domain[did] = s.get("risk_score") or 0
+
+            ind_stats: dict = {}
+            for did, score in latest_per_domain.items():
+                ind = domain_industry_map.get(did)
+                if not ind:
+                    continue
+                if ind not in ind_stats:
+                    ind_stats[ind] = {"domains": 0, "critical": 0, "warning": 0, "clean": 0, "total_score": 0}
+                ind_stats[ind]["domains"]     += 1
+                ind_stats[ind]["total_score"] += score
+                if score >= 70:
+                    ind_stats[ind]["critical"] += 1
+                elif score >= 30:
+                    ind_stats[ind]["warning"]  += 1
+                else:
+                    ind_stats[ind]["clean"]    += 1
+
+            for ind, s in ind_stats.items():
+                n = s["domains"]
+                industry_risk.append({
+                    "industry": ind,
+                    "domains":  n,
+                    "critical": s["critical"],
+                    "warning":  s["warning"],
+                    "clean":    s["clean"],
+                    "avg_risk": round(s["total_score"] / n, 1) if n else 0,
+                })
+            industry_risk.sort(key=lambda x: (x["critical"], x["domains"]), reverse=True)
+    except Exception as e:
+        print(f"[map] industry_risk build failed: {e}")
+
     now = datetime.now(timezone.utc).isoformat()
     return {
         "countries":     sorted(result, key=lambda x: (x["avg_risk"], x["scanned"]), reverse=True),
         "total_domains": sum(r["domains"] for r in result),
         "total_scanned": sum(r["scanned"] for r in result),
+        "industry_risk": industry_risk,
         "generated_at":  now,
         "last_updated":  now,
     }
