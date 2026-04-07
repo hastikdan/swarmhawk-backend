@@ -1106,16 +1106,27 @@ def admin_domains(
     db = get_admin_db()
 
     offset = (page - 1) * per_page
-    domains = db.table("domains").select("*, users(email,name)").order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
+    # Avoid embedded join (select *, users(...)) — PostgREST range header can interact
+    # unexpectedly with embedded resources. Batch-fetch users separately instead.
+    domains = db.table("domains").select("id,domain,country,user_id,created_at") \
+        .order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
     total   = db.table("domains").select("id", count="exact").execute()
 
     domain_ids = [d["id"] for d in (domains.data or [])]
+    user_ids   = list({d["user_id"] for d in (domains.data or []) if d.get("user_id")})
+
+    # Batch-fetch user info
+    user_map: dict = {}
+    if user_ids:
+        users_res = db.table("users").select("id,email,name").in_("id", user_ids).execute()
+        for u in (users_res.data or []):
+            user_map[u["id"]] = u
 
     # Batch-fetch latest scan per domain (no N+1)
     scan_map: dict = {}
     if domain_ids:
         scans_res = db.table("scans").select("domain_id,risk_score,scanned_at") \
-            .in_("domain_id", domain_ids).order("scanned_at", desc=True).execute()
+            .in_("domain_id", domain_ids).order("scanned_at", desc=True).limit(per_page * 5).execute()
         for s in (scans_res.data or []):
             did = s["domain_id"]
             if did not in scan_map:
@@ -1131,12 +1142,13 @@ def admin_domains(
     for d in (domains.data or []):
         did  = d["id"]
         scan = scan_map.get(did, {})
+        usr  = user_map.get(d.get("user_id", ""), {})
         rows.append({
             "id":          did,
             "domain":      d["domain"],
             "country":     d.get("country", ""),
-            "user_email":  d.get("users", {}).get("email", "") if d.get("users") else "",
-            "user_name":   d.get("users", {}).get("name", "") if d.get("users") else "",
+            "user_email":  usr.get("email", ""),
+            "user_name":   usr.get("name", ""),
             "risk_score":  scan.get("risk_score"),
             "scanned_at":  scan.get("scanned_at"),
             "paid":        did in paid_set,
