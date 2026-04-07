@@ -1320,6 +1320,36 @@ def check_ssrf(domain: str) -> CheckResult:
     return _check(domain)
 
 
+def check_jwt_security(domain: str) -> CheckResult:
+    """OWASP A08/A04:2021 — JWT alg:none, weak HMAC secrets, missing expiry, sensitive claims."""
+    from cee_scanner.skills.jwt_security import check_jwt_security as _check
+    return _check(domain)
+
+
+def check_deserialization(domain: str) -> CheckResult:
+    """OWASP A08:2021 — Java/PHP serialized objects in cookies, .NET ViewState, Shiro rememberMe."""
+    from cee_scanner.skills.deserialization import check_deserialization as _check
+    return _check(domain)
+
+
+def check_default_creds(domain: str) -> CheckResult:
+    """OWASP A02/A07:2021 — Default credential pairs on login forms and HTTP Basic auth endpoints."""
+    from cee_scanner.skills.default_creds import check_default_creds as _check
+    return _check(domain)
+
+
+def check_rate_limiting(domain: str) -> CheckResult:
+    """OWASP A06:2021 — Missing rate limiting on login, password reset, and registration endpoints."""
+    from cee_scanner.skills.rate_limiting import check_rate_limiting as _check
+    return _check(domain)
+
+
+def check_llm_security(domain: str) -> CheckResult:
+    """OWASP LLM01-LLM10:2025 — AI chatbot detection, exposed LLM API keys, prompt injection surface."""
+    from cee_scanner.skills.llm_security import check_llm_security as _check
+    return _check(domain)
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -1352,11 +1382,16 @@ ALL_CHECKS = [
     check_cms,                  # CMS / technology fingerprinting and version disclosure
     # ── Active CVE validation ──
     check_nuclei,               # nuclei templates: 3,000+ active CVE + misconfiguration checks
-    # ── OWASP Top 10 ──
-    check_injection,            # A03: SQL/debug error disclosure, injectable surfaces
+    # ── OWASP Top 10 + LLM ──
+    check_injection,            # A03/A05: SQL+NoSQL error disclosure, injectable surfaces
     check_auth_security,        # A07: cookie flags, login hardening, admin panel exposure
     check_integrity,            # A08: SRI on CDN resources, exposed dependency manifests
-    check_ssrf,                 # A10: SSRF-prone endpoints, open redirects
+    check_ssrf,                 # A10/A01: SSRF-prone endpoints, open redirects
+    check_jwt_security,         # A08/A04: JWT alg:none, weak secrets, missing expiry
+    check_deserialization,      # A08: Java/PHP/Shiro deserialization vectors
+    check_default_creds,        # A02/A07: default credential testing on login forms
+    check_rate_limiting,        # A06: missing rate limits on login/reset/register
+    check_llm_security,         # LLM01-LLM10: AI chatbot risks, exposed API keys
 ]
 
 

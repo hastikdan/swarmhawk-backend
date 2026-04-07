@@ -2691,8 +2691,11 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
         "nuclei": "Active CVE Scan (Nuclei)",
         "sast": "SAST — Source Exposure", "sca": "SCA — Dependency CVEs",
         "dast": "DAST — App Testing", "iac": "IaC — Config Exposure",
-        "injection": "A03: Injection", "auth_security": "A07: Auth Failures",
-        "integrity": "A08: Data Integrity", "ssrf": "A10: SSRF",
+        "injection": "A03/A05: Injection", "auth_security": "A07: Auth Failures",
+        "integrity": "A08: Data Integrity", "ssrf": "A10/A01: SSRF",
+        "jwt_security": "A08/A04: JWT Security", "deserialization": "A08: Deserialization",
+        "default_creds": "A02/A07: Default Creds", "rate_limiting": "A06: Rate Limiting",
+        "llm_security": "LLM01-10: AI Security",
     }
 
     # ── Date formatting ──────────────────────────────────────────────────────

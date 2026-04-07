@@ -21,6 +21,19 @@ logger = logging.getLogger("cee_scanner.skills.injection")
 TIMEOUT = 8
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"}
 
+# NoSQL / MongoDB error patterns
+NOSQL_ERROR_PATTERNS = [
+    (r"mongodberror|mongoservererror|mongobulkwriteerror", "MongoDB error disclosed"),
+    (r"mongoosecastingerror|mongoose.*validationerror",    "Mongoose ORM error disclosed"),
+    (r'"keyPattern"\s*:|"keyValue"\s*:',                   "MongoDB duplicate key error"),
+    (r'CouchDB|{"error":.*"reason":',                      "CouchDB error disclosed"),
+    (r'Redis.*error|WRONGTYPE.*Operation',                 "Redis error disclosed"),
+    (r'DynamoDB.*ValidationException|ResourceNotFoundException', "DynamoDB error disclosed"),
+    (r'neo4j.*exception|cypher.*error',                    "Neo4j/Cypher error disclosed"),
+    (r'cassandra.*exception|com\.datastax',                "Cassandra error disclosed"),
+    (r'\$where.*mapreduce|bson\.objectid',                 "MongoDB BSON/injection indicator"),
+]
+
 # Patterns indicating SQL/ORM errors are leaking to the client
 SQL_ERROR_PATTERNS = [
     (r"you have an error in your sql syntax",          "MySQL syntax error disclosed"),
@@ -66,6 +79,9 @@ def check_injection(domain: str) -> "CheckResult":
     def _scan_body(body: str, context: str):
         lower = body.lower()
         for pattern, label in SQL_ERROR_PATTERNS:
+            if re.search(pattern, lower):
+                critical_findings.append(f"{label} ({context})")
+        for pattern, label in NOSQL_ERROR_PATTERNS:
             if re.search(pattern, lower):
                 critical_findings.append(f"{label} ({context})")
         for pattern, label in DEBUG_PATTERNS:
@@ -143,5 +159,5 @@ def check_injection(domain: str) -> "CheckResult":
 
     return result.ok(
         "No injection surfaces detected",
-        f"No SQL errors, debug traces, or excessive input exposure found"
+        "No SQL/NoSQL errors, debug traces, or excessive input exposure found"
     )
