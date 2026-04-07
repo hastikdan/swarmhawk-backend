@@ -19,7 +19,7 @@ import logging
 
 logger = logging.getLogger("cee_scanner.skills.default_creds")
 
-TIMEOUT = 8
+TIMEOUT = 4
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"}
 
 # Default credential pairs to test — ordered by likelihood
@@ -31,24 +31,19 @@ DEFAULT_CREDS = [
     ("admin",     "123456"),
 ]
 
-# Login endpoints to probe — look for password field in response
+# Login endpoints to probe — ordered by prevalence, stop at first match
 LOGIN_PATHS = [
-    "/login", "/signin", "/wp-login.php", "/wp-admin",
-    "/admin/login", "/administrator", "/user/login",
-    "/auth/login", "/account/login",
+    "/login", "/signin", "/admin/login", "/wp-login.php",
 ]
 
 # App-specific admin paths with known defaults
 APP_ADMIN_PATHS = [
-    ("/phpmyadmin/",        "phpMyAdmin",  "root / (empty)"),
-    ("/adminer/",           "Adminer",     "root / (empty)"),
-    ("/manager/html",       "Tomcat Manager", "tomcat / tomcat or admin / admin"),
-    ("/jenkins/",           "Jenkins",     "admin / (setup secret)"),
-    ("/grafana/",           "Grafana",     "admin / admin"),
-    ("/kibana/",            "Kibana",      "elastic / changeme"),
-    ("/console/",           "WebLogic/JBoss console", "weblogic / weblogic1"),
-    ("/solr/",              "Apache Solr", "(no auth by default)"),
-    ("/api/v1/",            "Generic API", "check for unauthenticated access"),
+    ("/phpmyadmin/",  "phpMyAdmin",     "root / (empty)"),
+    ("/adminer/",     "Adminer",        "root / (empty)"),
+    ("/manager/html", "Tomcat Manager", "tomcat / tomcat or admin / admin"),
+    ("/jenkins/",     "Jenkins",        "admin / (setup secret)"),
+    ("/grafana/",     "Grafana",        "admin / admin"),
+    ("/kibana/",      "Kibana",         "elastic / changeme"),
 ]
 
 # Patterns that indicate a successful login (vs. staying on login page)

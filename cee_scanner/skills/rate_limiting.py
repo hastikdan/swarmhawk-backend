@@ -21,7 +21,7 @@ import logging
 
 logger = logging.getLogger("cee_scanner.skills.rate_limiting")
 
-TIMEOUT = 8
+TIMEOUT = 4
 HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; SecurityResearch/1.0)"}
 
 # Headers that indicate rate limiting is in place
@@ -47,12 +47,10 @@ RATE_LIMIT_TARGETS = [
     ("/login",            "POST", {"username": "probe@test.com", "password": "probe123"}, "Login"),
     ("/signin",           "POST", {"email":    "probe@test.com", "password": "probe123"}, "Sign-in"),
     ("/forgot-password",  "POST", {"email":    "probe@test.com"},                          "Password reset"),
-    ("/password/reset",   "POST", {"email":    "probe@test.com"},                          "Password reset"),
     ("/api/auth/login",   "POST", {"username": "probe@test.com", "password": "probe123"}, "API login"),
-    ("/register",         "POST", {"email":    "probe@test.com", "password": "probe123",
-                                   "username": "probe_user"},                              "Registration"),
     ("/api/v1/auth",      "POST", {"username": "probe@test.com", "password": "probe123"}, "API v1 auth"),
 ]
+RAPID_REQUEST_COUNT = 3  # 5 was too slow; 3 is sufficient to detect missing rate limits
 
 
 def _has_rate_limit_signal(response) -> bool:
@@ -117,7 +115,7 @@ def check_rate_limiting(domain: str) -> "CheckResult":
                 continue
 
             # Endpoint exists — test rapid fire
-            results = _send_rapid_requests(url, method, post_data, count=5)
+            results = _send_rapid_requests(url, method, post_data, count=RAPID_REQUEST_COUNT)
             if not results:
                 continue
 

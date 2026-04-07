@@ -1408,11 +1408,22 @@ def scan_domain(domain: str) -> dict:
                 "Check crashed", str(e)[:80]
             ).to_dict()
 
+    CHECK_TIMEOUT = 30  # max seconds any single check may run
+
     results = []
     with ThreadPoolExecutor(max_workers=len(ALL_CHECKS)) as executor:
         futures = {executor.submit(_run, fn): fn for fn in ALL_CHECKS}
-        for future in as_completed(futures):
-            results.append(future.result())
+        for future in as_completed(futures, timeout=CHECK_TIMEOUT * 2):
+            fn = futures[future]
+            try:
+                results.append(future.result(timeout=CHECK_TIMEOUT))
+            except TimeoutError:
+                logger.warning(f"Check {fn.__name__} timed out for {domain}")
+                results.append(CheckResult(fn.__name__, domain).error(
+                    "Check timed out", f"exceeded {CHECK_TIMEOUT}s limit"
+                ).to_dict())
+            except Exception:
+                results.append(future.result())
 
     # Calculate risk score (0=best, 100=worst)
     penalty = sum(r["score_impact"] for r in results)
