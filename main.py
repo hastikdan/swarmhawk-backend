@@ -2433,6 +2433,37 @@ def get_report(domain_id: str, authorization: str = Header(None)):
         visible_checks = [c for c in checks if c.get("check") in FREE_CHECKS]
 
     non_ai = [c for c in visible_checks if c.get("check") != "ai_summary"]
+
+    # ── IP / datacenter geo (best-effort, non-blocking) ──────────────────────
+    ip_address = None; ip_city = None; ip_org = None
+    try:
+        import socket as _sock, requests as _req
+        domain_name = d["domain"]
+        # 1. Try scan_results (pipeline already geo-enriched this domain)
+        from outreach import get_db as _odb
+        _sr = _odb().table("scan_results")\
+            .select("ip_address,ip_city,ip_org")\
+            .eq("domain", domain_name)\
+            .limit(1).execute()
+        if _sr.data and _sr.data[0].get("ip_address"):
+            r0 = _sr.data[0]
+            ip_address = r0.get("ip_address")
+            ip_city    = r0.get("ip_city") or ""
+            ip_org     = r0.get("ip_org") or ""
+        else:
+            # 2. Resolve live and call ip-api.com
+            _ip = _sock.gethostbyname(domain_name)
+            _geo = _req.get(
+                f"http://ip-api.com/json/{_ip}?fields=status,lat,lon,city,as,org",
+                timeout=4
+            ).json()
+            if _geo.get("status") == "success":
+                ip_address = _ip
+                ip_city    = _geo.get("city") or ""
+                ip_org     = (_geo.get("org") or _geo.get("as") or "").replace(r"^AS\d+\s*", "")
+    except Exception:
+        pass
+
     return {
         "domain":      d["domain"],
         "risk_score":  latest["risk_score"],
@@ -2442,6 +2473,9 @@ def get_report(domain_id: str, authorization: str = Header(None)):
         "critical":    sum(1 for c in non_ai if c.get("status") == "critical"),
         "warnings":    sum(1 for c in non_ai if c.get("status") == "warning"),
         "locked_count": len(checks) - len(visible_checks) if not is_paid else 0,
+        "ip_address":  ip_address,
+        "ip_city":     ip_city,
+        "ip_org":      ip_org,
     }
 
 
