@@ -2166,16 +2166,23 @@ def delete_domain(domain_id: str, authorization: str = Header(None)):
     return {"deleted": domain_id}
 
 
+class IndustryBody(BaseModel):
+    industry: str | None = None
+
 @app.patch("/domains/{domain_id}/industry")
-def update_domain_industry(domain_id: str, body: dict, authorization: str = Header(None)):
+def update_domain_industry(domain_id: str, body: IndustryBody, authorization: str = Header(None)):
     """Set the industry tag for a domain."""
     user = get_user_from_header(authorization)
     db = get_admin_db()
     domain = db.table("domains").select("id").eq("id", domain_id).eq("user_id", user["sub"]).execute()
     if not domain.data:
         raise HTTPException(404, "Domain not found")
-    industry = body.get("industry") or None  # allow clearing with null/empty
-    db.table("domains").update({"industry": industry}).eq("id", domain_id).execute()
+    industry = body.industry or None  # allow clearing with null/empty
+    try:
+        db.table("domains").update({"industry": industry}).eq("id", domain_id).execute()
+    except Exception as e:
+        _reset_db_on_ssl_error(e)
+        raise HTTPException(500, f"Could not save industry: {str(e)[:200]}")
     return {"industry": industry}
 
 
