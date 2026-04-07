@@ -88,17 +88,42 @@ def get_db() -> Client:
     return get_admin_db()
 
 def get_admin_db() -> Client:
-    """Return a Supabase client using the service_role key to bypass RLS."""
+    """Return a Supabase client using the service_role key to bypass RLS.
+
+    The client is cached as a singleton for performance, but is discarded
+    and recreated whenever an SSL/connection error is detected so that a
+    dropped Supabase connection (idle timeout, server restart, free-tier
+    pause) is transparently healed on the next request.
+    """
     global admin_db
+    key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
+    if not SUPABASE_URL or not key:
+        raise HTTPException(503, "Database not configured — set SUPABASE_URL and SUPABASE_KEY on Render")
     if admin_db is None:
-        key = SUPABASE_SERVICE_KEY or SUPABASE_KEY
-        if not SUPABASE_URL or not key:
-            raise HTTPException(503, "Database not configured — set SUPABASE_URL and SUPABASE_KEY on Render")
         try:
             admin_db = create_client(SUPABASE_URL, key)
         except Exception as e:
             raise HTTPException(503, f"Database connection failed: {str(e)[:200]}")
     return admin_db
+
+
+_SSL_KEYWORDS = ("eof", "ssl", "broken pipe", "connection reset", "connection refused", "timed out")
+
+def _reset_db_on_ssl_error(e: Exception) -> None:
+    """If the exception looks like a dropped SSL/socket connection, discard
+    the cached client so the next call to get_admin_db() reconnects."""
+    global admin_db
+    msg = str(e).lower()
+    if any(kw in msg for kw in _SSL_KEYWORDS):
+        admin_db = None
+
+def _reset_db_on_ssl_error_msg(detail: str) -> None:
+    """Same as above but takes a plain string (used in the global HTTP exception handler
+    where we only have the HTTPException detail, not the original exception object)."""
+    global admin_db
+    msg = detail.lower()
+    if any(kw in msg for kw in _SSL_KEYWORDS):
+        admin_db = None
 
 # ── App ───────────────────────────────────────────────────────────────────────
 
@@ -376,6 +401,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Global 503 handler: if the detail contains an SSL/EOF error string, reset
+    the cached Supabase client so the *next* request reconnects cleanly."""
+    from fastapi.responses import JSONResponse
+    if exc.status_code == 503 and exc.detail:
+        _reset_db_on_ssl_error_msg(str(exc.detail))
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
 
 @app.get("/docs", include_in_schema=False)
 async def redirect_docs():
