@@ -1107,36 +1107,45 @@ def admin_users(
     db = get_admin_db()
     offset = (page - 1) * per_page
 
-    # Round 1 (parallel): paginated user rows + total count
-    from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_users = ex.submit(
-            lambda: db.table("users")
-                      .select("id,email,name,role,auth_type,created_at,last_login,deleted_at")
-                      .order("created_at", desc=True)
-                      .range(offset, offset + per_page - 1)
-                      .execute()
-        )
-        f_total = ex.submit(
-            lambda: db.table("users").select("id", count="exact").execute()
-        )
-        users_res = f_users.result()
-        total_res = f_total.result()
+    # Fetch paginated user rows (sequential — postgrest-py singleton is not safe for concurrent use)
+    try:
+        users_res = db.table("users")\
+            .select("id,email,name,role,auth_type,created_at,last_login,deleted_at")\
+            .order("created_at", desc=True)\
+            .range(offset, offset + per_page - 1)\
+            .execute()
+    except Exception as e:
+        # Fallback: role column may not exist yet (migration 010 pending)
+        logger.warning(f"admin_users full select failed ({e}), retrying without role column")
+        users_res = db.table("users")\
+            .select("id,email,name,auth_type,created_at,last_login,deleted_at")\
+            .order("created_at", desc=True)\
+            .range(offset, offset + per_page - 1)\
+            .execute()
+
+    # Total count (separate query, safe to fail)
+    total = 0
+    try:
+        count_res = db.table("users").select("id", count="exact").execute()
+        total = count_res.count or len(users_res.data or [])
+    except Exception:
+        total = len(users_res.data or [])
 
     user_ids = [u["id"] for u in (users_res.data or [])]
     if not user_ids:
-        return {"users": [], "total": total_res.count or 0, "page": page, "per_page": per_page}
+        return {"users": [], "total": total, "page": page, "per_page": per_page}
 
-    # Round 2 (parallel): domain counts + purchase info
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_domains   = ex.submit(
-            lambda: db.table("domains").select("user_id").in_("user_id", user_ids).execute()
-        )
-        f_purchases = ex.submit(
-            lambda: db.table("purchases").select("user_id,plan").in_("user_id", user_ids).execute()
-        )
-        domains_res = f_domains.result()
-        paid_res    = f_purchases.result()
+    # Domain counts
+    try:
+        domains_res = db.table("domains").select("user_id").in_("user_id", user_ids).execute()
+    except Exception:
+        domains_res = type("R", (), {"data": []})()
+
+    # Purchase info
+    try:
+        paid_res = db.table("purchases").select("user_id,plan").in_("user_id", user_ids).execute()
+    except Exception:
+        paid_res = type("R", (), {"data": []})()
 
     domain_counts: dict = {}
     for d in (domains_res.data or []):
@@ -1171,7 +1180,7 @@ def admin_users(
             "deleted_at":   u.get("deleted_at"),
         })
 
-    return {"users": rows, "total": total_res.count or 0, "page": page, "per_page": per_page}
+    return {"users": rows, "total": total, "page": page, "per_page": per_page}
 
 
 @app.get("/admin/domains")
