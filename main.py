@@ -5221,10 +5221,12 @@ def _build_map_data() -> dict:
     except Exception as e:
         print(f"[map] industry_risk build failed: {e}")
 
-    # Accurate totals via count="exact" — not limited by Supabase row cap
+    # Accurate totals: use get_admin_db() (service_role, bypasses RLS) so the
+    # counts match what the /outreach/funnel endpoint sees.
     try:
-        _total_domains = db.table("scan_results").select("id", count="exact").execute().count or 0
-        _total_scanned = db.table("scan_results").select("id", count="exact")\
+        adb = get_admin_db()
+        _total_domains = adb.table("scan_results").select("id", count="exact").execute().count or 0
+        _total_scanned = adb.table("scan_results").select("id", count="exact")\
             .not_.is_("last_scanned_at", "null").execute().count or 0
     except Exception:
         _total_domains = sum(r["domains"] for r in result)
