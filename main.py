@@ -2432,6 +2432,136 @@ def rescan_domain(domain_id: str, background_tasks: BackgroundTasks, authorizati
     return {"status": "scanning", "message": f"Rescan started for {d['domain']}"}
 
 
+class AuthScanBody(BaseModel):
+    cookie:     str
+    user_agent: str = ""
+
+
+@app.post("/domains/{domain_id}/scan/authenticated")
+def scan_authenticated(domain_id: str, body: AuthScanBody, background_tasks: BackgroundTasks,
+                       authorization: str = Header(None)):
+    """
+    Run an authenticated scan using the provided session cookie.
+    Checks cookie security flags, authenticated page headers, and IDOR surface.
+    Results are stored alongside the regular scan report.
+    """
+    if not body.cookie or len(body.cookie) < 4:
+        raise HTTPException(400, "cookie is required")
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("id,domain").eq("id", domain_id).eq("user_id", user["sub"]).execute()
+    if not row.data:
+        raise HTTPException(404, "Domain not found")
+    d = row.data[0]
+
+    def _run_auth_scan(did: str, domain: str, cookie: str, user_agent: str):
+        try:
+            from cee_scanner.checks import scan_domain_authenticated
+            result = scan_domain_authenticated(domain, cookie, user_agent)
+            adm = get_admin_db()
+            # Store auth result in the latest scan row
+            existing = adm.table("scans").select("id").eq("domain_id", did).order("scanned_at", desc=True).limit(1).execute()
+            if existing.data:
+                adm.table("scans").update({
+                    "auth_scan": result,
+                    "auth_scanned_at": result["scanned_at"],
+                }).eq("id", existing.data[0]["id"]).execute()
+            logger.info(f"Authenticated scan complete for {domain}: {result['warnings']} warnings")
+        except Exception as e:
+            logger.error(f"Auth scan failed for {domain}: {e}")
+
+    background_tasks.add_task(_run_auth_scan, d["id"], d["domain"], body.cookie, body.user_agent)
+    return {"status": "scanning", "message": f"Authenticated scan started for {d['domain']}"}
+
+
+def _ownership_token(domain: str) -> str:
+    """Deterministic 32-char verify token derived from domain + server secret."""
+    secret = (SUPABASE_SERVICE_KEY or SUPABASE_KEY or "swarmhawk-verify").encode()
+    return hmac.new(secret, domain.encode(), hashlib.sha256).hexdigest()[:32]
+
+
+@app.get("/domains/{domain_id}/verify-token")
+def get_verify_token(domain_id: str, authorization: str = Header(None)):
+    """Return the ownership verification token for a domain (owner only)."""
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("domain,verified_at").eq("id", domain_id).eq("user_id", user["sub"]).execute()
+    if not row.data:
+        raise HTTPException(404, "Domain not found")
+    d = row.data[0]
+    token = _ownership_token(d["domain"])
+    return {
+        "domain":      d["domain"],
+        "token":       token,
+        "verified_at": d.get("verified_at"),
+        "methods": {
+            "dns_txt": {
+                "name":  "DNS TXT record",
+                "value": f"swarmhawk-verify={token}",
+                "hint":  f"Add a TXT record on {d['domain']} with the value above",
+            },
+            "well_known": {
+                "name":  "File upload",
+                "url":   f"https://{d['domain']}/.well-known/swarmhawk-verify.txt",
+                "hint":  f"Create /.well-known/swarmhawk-verify.txt containing only: {token}",
+            },
+            "meta_tag": {
+                "name":  "HTML meta tag",
+                "tag":   f'<meta name="swarmhawk-verify" content="{token}">',
+                "hint":  "Add the meta tag inside the <head> of your homepage",
+            },
+        },
+    }
+
+
+@app.post("/domains/{domain_id}/verify")
+def verify_domain_ownership(domain_id: str, authorization: str = Header(None)):
+    """Attempt to verify domain ownership via DNS TXT, .well-known file, or HTML meta tag."""
+    import subprocess
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    row  = db.table("domains").select("domain,verified_at").eq("id", domain_id).eq("user_id", user["sub"]).execute()
+    if not row.data:
+        raise HTTPException(404, "Domain not found")
+    domain = row.data[0]["domain"]
+    token  = _ownership_token(domain)
+
+    # ── Method 1: DNS TXT record ─────────────────────────────────────────────
+    try:
+        proc = subprocess.run(
+            ["dig", "+short", "TXT", domain],
+            capture_output=True, text=True, timeout=8
+        )
+        if proc.returncode == 0 and f"swarmhawk-verify={token}" in proc.stdout:
+            get_admin_db().table("domains").update({"verified_at": datetime.now(timezone.utc).isoformat()}).eq("id", domain_id).execute()
+            return {"verified": True, "method": "dns_txt"}
+    except Exception:
+        pass
+
+    # ── Method 2: .well-known file ───────────────────────────────────────────
+    try:
+        import requests as _req
+        r = _req.get(f"https://{domain}/.well-known/swarmhawk-verify.txt", timeout=8, verify=False,
+                     headers={"User-Agent": "SwarmHawk-Verify/1.0"})
+        if r.status_code == 200 and token in r.text.strip():
+            get_admin_db().table("domains").update({"verified_at": datetime.now(timezone.utc).isoformat()}).eq("id", domain_id).execute()
+            return {"verified": True, "method": "well_known"}
+    except Exception:
+        pass
+
+    # ── Method 3: HTML meta tag ──────────────────────────────────────────────
+    try:
+        r = _req.get(f"https://{domain}", timeout=8, verify=False,
+                     headers={"User-Agent": "SwarmHawk-Verify/1.0"}, allow_redirects=True)
+        if r.status_code == 200 and f'swarmhawk-verify" content="{token}"' in r.text:
+            get_admin_db().table("domains").update({"verified_at": datetime.now(timezone.utc).isoformat()}).eq("id", domain_id).execute()
+            return {"verified": True, "method": "meta_tag"}
+    except Exception:
+        pass
+
+    return {"verified": False, "message": "Verification token not found via DNS TXT, .well-known file, or HTML meta tag"}
+
+
 @app.get("/domains/{domain_id}/contacts")
 def get_domain_contacts(domain_id: str, authorization: str = Header(None)):
     """Discover contact emails for a domain (security.txt, WHOIS, website scrape)."""
@@ -2710,18 +2840,31 @@ def get_report(domain_id: str, authorization: str = Header(None)):
         except Exception:
             pass
 
+    # ── Auth scan result ──────────────────────────────────────────────────────
+    auth_scan = None
+    try:
+        raw_auth = latest.get("auth_scan")
+        if raw_auth:
+            auth_scan = json.loads(raw_auth) if isinstance(raw_auth, str) else raw_auth
+    except Exception:
+        pass
+
     return {
-        "domain":      d["domain"],
-        "risk_score":  latest["risk_score"],
-        "scanned_at":  latest["scanned_at"],
-        "paid":        is_paid,
-        "checks":      visible_checks,
-        "critical":    sum(1 for c in non_ai if c.get("status") == "critical"),
-        "warnings":    sum(1 for c in non_ai if c.get("status") == "warning"),
-        "locked_count": len(checks) - len(visible_checks) if not is_paid else 0,
-        "ip_address":  ip_address,
-        "ip_city":     ip_city,
-        "ip_org":      ip_org,
+        "domain":        d["domain"],
+        "risk_score":    latest["risk_score"],
+        "scanned_at":    latest["scanned_at"],
+        "paid":          is_paid,
+        "checks":        visible_checks,
+        "critical":      sum(1 for c in non_ai if c.get("status") == "critical"),
+        "warnings":      sum(1 for c in non_ai if c.get("status") == "warning"),
+        "informational": sum(1 for c in non_ai if c.get("status") == "info"),
+        "locked_count":  len(checks) - len(visible_checks) if not is_paid else 0,
+        "ip_address":    ip_address,
+        "ip_city":       ip_city,
+        "ip_org":        ip_org,
+        "verified_at":   d.get("verified_at"),
+        "auth_scan":     auth_scan,
+        "auth_scanned_at": latest.get("auth_scanned_at"),
     }
 
 

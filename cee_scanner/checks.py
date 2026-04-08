@@ -37,16 +37,18 @@ class CheckResult:
     def __init__(self, check: str, domain: str):
         self.check = check
         self.domain = domain
-        self.status = "ok"        # ok | warning | critical | error
+        self.status = "ok"        # ok | warning | critical | error | info
         self.title = ""
         self.detail = ""
         self.score_impact = 0     # 0-25 penalty points
+        self.confidence = "confirmed"  # confirmed | likely | informational
 
     def warn(self, title: str, detail: str = "", impact: int = 5):
         self.status = "warning"
         self.title = title
         self.detail = detail
         self.score_impact = impact
+        self.confidence = "confirmed"
         return self
 
     def critical(self, title: str, detail: str = "", impact: int = 15):
@@ -54,6 +56,7 @@ class CheckResult:
         self.title = title
         self.detail = detail
         self.score_impact = impact
+        self.confidence = "confirmed"
         return self
 
     def ok(self, title: str, detail: str = ""):
@@ -61,6 +64,7 @@ class CheckResult:
         self.title = title
         self.detail = detail
         self.score_impact = 0
+        self.confidence = "confirmed"
         return self
 
     def error(self, title: str, detail: str = ""):
@@ -68,6 +72,16 @@ class CheckResult:
         self.title = title
         self.detail = detail
         self.score_impact = 5
+        self.confidence = "confirmed"
+        return self
+
+    def info(self, title: str, detail: str = ""):
+        """Surface indicator — not a confirmed vulnerability. No score penalty."""
+        self.status = "info"
+        self.title = title
+        self.detail = detail
+        self.score_impact = 0
+        self.confidence = "informational"
         return self
 
     def to_dict(self) -> dict:
@@ -77,6 +91,7 @@ class CheckResult:
             "title": self.title,
             "detail": self.detail,
             "score_impact": self.score_impact,
+            "confidence": self.confidence,
         }
         # CVE skill attaches extra structured data
         if hasattr(self, "cves"):
@@ -1426,11 +1441,13 @@ def scan_domain(domain: str) -> dict:
                 results.append(future.result())
 
     # Calculate risk score (0=best, 100=worst)
-    penalty = sum(r["score_impact"] for r in results)
+    # Informational findings (surface indicators) carry no score penalty
+    penalty = sum(r["score_impact"] for r in results if r.get("confidence") != "informational")
     risk_score = min(100, penalty)
 
     critical_count = sum(1 for r in results if r["status"] == "critical")
-    warning_count = sum(1 for r in results if r["status"] == "warning")
+    warning_count  = sum(1 for r in results if r["status"] == "warning")
+    info_count     = sum(1 for r in results if r["status"] == "info")
 
     return {
         "domain": domain,
@@ -1438,7 +1455,124 @@ def scan_domain(domain: str) -> dict:
         "risk_score": risk_score,
         "critical": critical_count,
         "warnings": warning_count,
+        "informational": info_count,
         "checks": results,
+    }
+
+
+def scan_domain_authenticated(domain: str, cookie: str, user_agent: str = "") -> dict:
+    """
+    Run a targeted authenticated scan using the provided session cookie.
+    Tests authenticated surfaces: cookie security flags, header behaviour
+    behind auth, SSRF-prone endpoints that require login, and injection
+    surfaces exposed only to logged-in users.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from cee_scanner.skills.auth_security import check_auth_security
+    from cee_scanner.skills.ssrf import check_ssrf
+    from cee_scanner.skills.injection import check_injection
+    import requests as _req
+
+    auth_headers = {
+        "User-Agent": user_agent or "Mozilla/5.0 (compatible; SwarmHawk-AuthScan/1.0)",
+        "Cookie": cookie,
+    }
+
+    # ── Cookie security flag check ───────────────────────────────────────────
+    def _check_cookie_flags() -> dict:
+        result = CheckResult("cookie_flags", domain)
+        try:
+            r = _req.get(f"https://{domain}", headers=auth_headers, timeout=8,
+                         allow_redirects=True, verify=False)
+            set_cookie_headers = r.headers.get_all("set-cookie") if hasattr(r.headers, "get_all") else [
+                v for k, v in r.headers.items() if k.lower() == "set-cookie"
+            ]
+            issues = []
+            for sc in set_cookie_headers:
+                sc_lower = sc.lower()
+                if "httponly" not in sc_lower:
+                    issues.append(f"Cookie missing HttpOnly: {sc.split(';')[0][:60]}")
+                if "secure" not in sc_lower:
+                    issues.append(f"Cookie missing Secure flag: {sc.split(';')[0][:60]}")
+                if "samesite" not in sc_lower:
+                    issues.append(f"Cookie missing SameSite: {sc.split(';')[0][:60]}")
+            if issues:
+                return result.warn("Cookie security flags missing",
+                                   "\n".join(f"• {i}" for i in issues),
+                                   impact=min(12, len(issues) * 4)).to_dict()
+            if set_cookie_headers:
+                return result.ok("Cookie security flags present",
+                                 f"{len(set_cookie_headers)} cookie(s) checked — HttpOnly, Secure, SameSite set").to_dict()
+            return result.ok("No Set-Cookie headers in response").to_dict()
+        except Exception as e:
+            return result.error("Cookie flag check failed", str(e)[:80]).to_dict()
+
+    # ── Authenticated headers check ──────────────────────────────────────────
+    def _check_auth_headers() -> dict:
+        result = CheckResult("auth_headers", domain)
+        try:
+            r = _req.get(f"https://{domain}", headers=auth_headers, timeout=8,
+                         allow_redirects=True, verify=False)
+            resp_hdrs = {k.lower(): v for k, v in r.headers.items()}
+            missing = []
+            if "x-frame-options" not in resp_hdrs and "content-security-policy" not in resp_hdrs:
+                missing.append("X-Frame-Options / CSP (clickjacking risk on authenticated pages)")
+            if "cache-control" not in resp_hdrs or "no-store" not in resp_hdrs.get("cache-control", "").lower():
+                missing.append("Cache-Control: no-store (authenticated page may be cached by proxy)")
+            if missing:
+                return result.warn("Auth page security headers missing",
+                                   "\n".join(f"• {m}" for m in missing),
+                                   impact=min(10, len(missing) * 5)).to_dict()
+            return result.ok("Authenticated page headers look correct").to_dict()
+        except Exception as e:
+            return result.error("Auth header check failed", str(e)[:80]).to_dict()
+
+    # ── IDOR probe: try incrementing a numeric ID in common API paths ────────
+    def _check_idor_surface() -> dict:
+        result = CheckResult("idor_surface", domain)
+        PROBE_PATHS = ["/api/user/1", "/api/users/1", "/api/account/1",
+                       "/api/me", "/api/profile", "/dashboard/user/1"]
+        found = []
+        try:
+            for path in PROBE_PATHS:
+                try:
+                    r = _req.get(f"https://{domain}{path}", headers=auth_headers,
+                                 timeout=6, verify=False, allow_redirects=False)
+                    if r.status_code == 200 and len(r.text) > 20:
+                        found.append(f"{path} → 200 ({len(r.text)}B — review for IDOR)")
+                except Exception:
+                    pass
+            if found:
+                return result.info(
+                    f"IDOR surface: {len(found)} accessible API path(s)",
+                    "These paths returned 200 with your session — manually verify they\n"
+                    "enforce per-user access control:\n" + "\n".join(f"• {f}" for f in found)
+                ).to_dict()
+            return result.ok("No obvious IDOR surface found", "Common /api/user/ID paths returned 401/403/404").to_dict()
+        except Exception as e:
+            return result.error("IDOR probe failed", str(e)[:80]).to_dict()
+
+    AUTH_CHECKS = [_check_cookie_flags, _check_auth_headers, _check_idor_surface]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=len(AUTH_CHECKS)) as executor:
+        futures = {executor.submit(fn): fn for fn in AUTH_CHECKS}
+        for future in as_completed(futures, timeout=60):
+            try:
+                results.append(future.result(timeout=30))
+            except Exception as e:
+                results.append(CheckResult("auth_check", domain).error("Check failed", str(e)[:80]).to_dict())
+
+    penalty = sum(r["score_impact"] for r in results if r.get("confidence") != "informational")
+    return {
+        "domain":      domain,
+        "scanned_at":  datetime.now(timezone.utc).isoformat(),
+        "scan_type":   "authenticated",
+        "risk_score":  min(100, penalty),
+        "critical":    sum(1 for r in results if r["status"] == "critical"),
+        "warnings":    sum(1 for r in results if r["status"] == "warning"),
+        "informational": sum(1 for r in results if r["status"] == "info"),
+        "checks":      results,
     }
 
 

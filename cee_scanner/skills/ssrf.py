@@ -151,21 +151,22 @@ def check_ssrf(domain: str) -> "CheckResult":
         return result.ok("SSRF check skipped", str(e)[:80])
 
     if critical_findings:
-        detail = "Critical:\n" + "\n".join(f"• {f}" for f in critical_findings)
+        detail = "Confirmed:\n" + "\n".join(f"• {f}" for f in critical_findings)
         if findings:
-            detail += "\nAdditional risk surface:\n" + "\n".join(f"• {f}" for f in findings)
+            detail += "\nAdditional surface (unconfirmed):\n" + "\n".join(f"• {f}" for f in findings)
         return result.critical(
-            f"A10: {len(critical_findings)} SSRF/redirect issue(s)",
+            f"A10: {len(critical_findings)} SSRF/redirect confirmed",
             detail,
             impact=min(20, len(critical_findings) * 12 + len(findings) * 3)
         )
 
     if findings:
-        detail = "\n".join(f"• {f}" for f in findings)
-        return result.warn(
+        # Path existence and URL params are surface indicators only — not confirmed vulns.
+        # No score penalty; admin should investigate but these are not FP vulnerabilities.
+        detail = "Surface area detected (not confirmed vulnerabilities):\n" + "\n".join(f"• {f}" for f in findings)
+        return result.info(
             f"A10: {len(findings)} SSRF surface indicator(s)",
-            detail,
-            impact=min(10, len(findings) * 4)
+            detail
         )
 
     return result.ok(
