@@ -525,17 +525,37 @@ def make_session(user_id: str) -> str:
 
 
 def is_admin(user_id: str) -> bool:
+    """True if user is super admin (ADMIN_EMAIL) OR has role='admin' in DB."""
+    db = get_db()
+    r = db.table("users").select("email,role").eq("id", user_id).execute()
+    if not r.data:
+        return False
+    u = r.data[0]
+    if ADMIN_EMAIL and u.get("email") == ADMIN_EMAIL:
+        return True
+    return (u.get("role") or "user") == "admin"
+
+
+def is_super_admin(user_id: str) -> bool:
+    """True only for the owner identified by ADMIN_EMAIL env var."""
     if not ADMIN_EMAIL:
         return False
     db = get_db()
     r = db.table("users").select("email").eq("id", user_id).execute()
-    return bool(r.data and r.data[0]["email"] == ADMIN_EMAIL)
+    return bool(r.data and r.data[0].get("email") == ADMIN_EMAIL)
 
 
 def require_admin(authorization: str) -> str:
     user = get_user_from_header(authorization)
     if not is_admin(user["sub"]):
         raise HTTPException(status_code=403, detail="Admin access required")
+    return user["sub"]
+
+
+def require_super_admin(authorization: str) -> str:
+    user = get_user_from_header(authorization)
+    if not is_super_admin(user["sub"]):
+        raise HTTPException(status_code=403, detail="Super admin access required")
     return user["sub"]
 
 # ── Email confirmation helper ─────────────────────────────────────────────────
@@ -899,13 +919,15 @@ async def register(body: RegisterRequest, background_tasks: BackgroundTasks):
             first_domain = dom_result.data[0]
             background_tasks.add_task(run_scan_background, first_domain["id"], domain)
 
+    _uid = user["id"]
     return {
         "user": {
-            "id":       user["id"],
-            "email":    body.email.lower(),
-            "name":     body.username.strip(),
-            "avatar":   "",
-            "is_admin": is_admin(user["id"]),
+            "id":            _uid,
+            "email":         body.email.lower(),
+            "name":          body.username.strip(),
+            "avatar":        "",
+            "is_admin":      is_admin(_uid),
+            "is_super_admin": is_super_admin(_uid),
         },
         "session_token": session_token,
         "first_domain":  first_domain,
@@ -938,13 +960,15 @@ async def login_email(body: LoginRequest):
     }).eq("id", user["id"]).execute()
 
     session_token = make_session(user["id"])
+    _uid = user["id"]
     return {
         "user": {
-            "id":       user["id"],
-            "email":    user["email"],
-            "name":     user["name"] or user["email"],
-            "avatar":   user.get("avatar", ""),
-            "is_admin": is_admin(user["id"]),
+            "id":            _uid,
+            "email":         user["email"],
+            "name":          user["name"] or user["email"],
+            "avatar":        user.get("avatar", ""),
+            "is_admin":      is_admin(_uid),
+            "is_super_admin": is_super_admin(_uid),
         },
         "session_token": session_token,
     }
@@ -1058,14 +1082,16 @@ async def google_auth(body: GoogleAuthRequest, background_tasks: BackgroundTasks
         background_tasks.add_task(send_welcome_email, email, name)
 
     token = make_session(user["id"])
+    _uid = user["id"]
     return {
         "session_token": token,
         "user": {
-            "id":       user["id"],
-            "email":    email,
-            "name":     name,
-            "avatar":   avatar,
-            "is_admin": is_admin(user["id"]),
+            "id":            _uid,
+            "email":         email,
+            "name":          name,
+            "avatar":        avatar,
+            "is_admin":      is_admin(_uid),
+            "is_super_admin": is_super_admin(_uid),
         },
     }
 
@@ -1079,35 +1105,52 @@ def admin_users(
     """Full user list with domain counts and last login. Admin only."""
     require_admin(authorization)
     db = get_admin_db()
-
-    # 1. Fetch paginated users (include deleted_at for soft-delete display)
     offset = (page - 1) * per_page
-    users_res = db.table("users").select("id,email,name,auth_type,created_at,last_login,deleted_at") \
-        .order("created_at", desc=True).range(offset, offset + per_page - 1).execute()
-    total_res = db.table("users").select("id", count="exact").execute()
+
+    # Round 1 (parallel): paginated user rows + total count
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_users = ex.submit(
+            lambda: db.table("users")
+                      .select("id,email,name,role,auth_type,created_at,last_login,deleted_at")
+                      .order("created_at", desc=True)
+                      .range(offset, offset + per_page - 1)
+                      .execute()
+        )
+        f_total = ex.submit(
+            lambda: db.table("users").select("id", count="exact").execute()
+        )
+        users_res = f_users.result()
+        total_res = f_total.result()
 
     user_ids = [u["id"] for u in (users_res.data or [])]
     if not user_ids:
         return {"users": [], "total": total_res.count or 0, "page": page, "per_page": per_page}
 
-    # 2. Fetch domain counts for these users in one query (include deleted users' domains)
-    domains_res = db.table("domains").select("user_id").in_("user_id", user_ids).execute()
+    # Round 2 (parallel): domain counts + purchase info
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_domains   = ex.submit(
+            lambda: db.table("domains").select("user_id").in_("user_id", user_ids).execute()
+        )
+        f_purchases = ex.submit(
+            lambda: db.table("purchases").select("user_id,plan").in_("user_id", user_ids).execute()
+        )
+        domains_res = f_domains.result()
+        paid_res    = f_purchases.result()
+
     domain_counts: dict = {}
     for d in (domains_res.data or []):
         uid = d["user_id"]
         domain_counts[uid] = domain_counts.get(uid, 0) + 1
 
-    # 3. Fetch purchase info in one query (for paid_domains count + plan detection)
-    paid_res = db.table("purchases").select("user_id,plan").in_("user_id", user_ids).execute()
     paid_counts: dict = {}
-    user_plans: dict = {}
+    user_plans:  dict = {}
+    priority = {"platform": 4, "professional": 3, "annual": 2, "one_time": 1, "free": 0}
     for p in (paid_res.data or []):
         uid  = p["user_id"]
         plan = p.get("plan") or ""
         paid_counts[uid] = paid_counts.get(uid, 0) + 1
-        # Highest plan wins: platform > professional > annual > one_time
         existing = user_plans.get(uid, "free")
-        priority = {"platform": 4, "professional": 3, "annual": 2, "one_time": 1, "free": 0}
         if priority.get(plan, 1) > priority.get(existing, 0):
             user_plans[uid] = plan if plan else "paid"
 
@@ -1118,6 +1161,7 @@ def admin_users(
             "id":           uid,
             "email":        u.get("email", ""),
             "name":         u.get("name", ""),
+            "role":         u.get("role") or "user",
             "auth_type":    u.get("auth_type", "google"),
             "plan":         user_plans.get(uid, "free"),
             "domain_count": domain_counts.get(uid, 0),
@@ -1498,6 +1542,25 @@ def admin_update_user(user_id: str, body: AdminUpdateUserBody, authorization: st
     if updates:
         db.table("users").update(updates).eq("id", user_id).execute()
     return {"updated": user_id}
+
+
+class AdminRoleBody(BaseModel):
+    role: str  # 'user' or 'admin'
+
+@app.patch("/admin/users/{user_id}/role")
+def admin_set_user_role(user_id: str, body: AdminRoleBody, authorization: str = Header(None)):
+    """Set a user's role to 'admin' or 'user'. Super admin only."""
+    caller_id = require_super_admin(authorization)
+    if body.role not in ("user", "admin"):
+        raise HTTPException(400, "Role must be 'user' or 'admin'")
+    db = get_admin_db()
+    target = db.table("users").select("id,email").eq("id", user_id).execute()
+    if not target.data:
+        raise HTTPException(404, "User not found")
+    if ADMIN_EMAIL and target.data[0].get("email") == ADMIN_EMAIL:
+        raise HTTPException(400, "Cannot change super admin role")
+    db.table("users").update({"role": body.role}).eq("id", user_id).execute()
+    return {"user_id": user_id, "role": body.role}
 
 
 @app.post("/admin/users/{user_id}/rescan-all")
@@ -1922,15 +1985,15 @@ def get_me(authorization: str = Header(None)):
     if not result.data:
         raise HTTPException(404, "User not found")
     u = result.data[0]
-    admin = is_admin(u["id"])
+    _uid = u["id"]
     from pipeline import _get_scanner_ip
     return {
-        "id":            u["id"],
+        "id":            _uid,
         "email":         u["email"],
         "name":          u.get("name", ""),
         "avatar":        u.get("avatar", ""),
-        "is_admin":      admin,
-        "is_super_admin": admin,   # currently same as is_admin (owner only); extend later for multi-admin tiers
+        "is_admin":      is_admin(_uid),
+        "is_super_admin": is_super_admin(_uid),
         "auth_type":     u.get("auth_type", "google"),
         "scanner_ip":    _get_scanner_ip(),
     }

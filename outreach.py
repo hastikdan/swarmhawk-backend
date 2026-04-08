@@ -1453,6 +1453,7 @@ async def prospects_stats(authorization: str = Header(None)):
         "countries":     sorted(stats.values(), key=lambda x: x["total"], reverse=True),
         "last_scan":     last_scan,
         "scanned_today": scanned_today,
+        "next_scan_at":  get_next_scan_time(),
         "total":         sum(s["total"] for s in stats.values()),
         "source":        "cloudflare_radar" if CLOUDFLARE_TOKEN else "tranco+fallback",
         "scan_limit":    SCAN_LIMIT,
@@ -2083,16 +2084,33 @@ async def test_template(body: dict, authorization: str = Header(None)):
 
 # ── APScheduler daily cron ────────────────────────────────────────────────────
 
+_scheduler = None  # module-level ref so endpoints can query next_run_time
+
+
 def start_scheduler():
     """Call from main.py startup to enable automatic daily scans."""
+    global _scheduler
     try:
         from apscheduler.schedulers.background import BackgroundScheduler
         scheduler = BackgroundScheduler(timezone="Europe/Prague")
         scheduler.add_job(_run_scan_job, "cron", hour=2, minute=0, id="daily_prospect_scan")
         scheduler.start()
+        _scheduler = scheduler
         source = "Cloudflare Radar" if CLOUDFLARE_TOKEN else "Tranco+fallback"
         print(f"[outreach] Daily scan scheduler started — 02:00 Prague (data ready by 08:00 CET), {len(COUNTRY_TLDS)} countries × {SCAN_LIMIT} domains ({source})")
         return scheduler
     except ImportError:
         print("[outreach] APScheduler not installed — add apscheduler to requirements.txt")
         return None
+
+
+def get_next_scan_time() -> str | None:
+    """Return ISO-8601 UTC string of next daily_prospect_scan run, or None."""
+    try:
+        if _scheduler:
+            job = _scheduler.get_job("daily_prospect_scan")
+            if job and job.next_run_time:
+                return job.next_run_time.astimezone(timezone.utc).isoformat()
+    except Exception:
+        pass
+    return None
