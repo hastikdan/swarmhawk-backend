@@ -1609,6 +1609,75 @@ def admin_scan_history(authorization: str = Header(None)):
         logs_data = logs.data or []
     return {"domain_scans": scans_data, "marketing_scans": logs_data}
 
+@app.get("/admin/domains/{domain_id}/scan-debug")
+def admin_scan_debug(domain_id: str, authorization: str = Header(None)):
+    """Admin: full scan history + error details for a domain. Useful for diagnosing failed scans."""
+    require_admin(authorization)
+    db = get_admin_db()
+
+    # Domain metadata
+    dom = db.table("domains").select("id,domain,user_id,country,created_at") \
+        .eq("id", domain_id).execute()
+    if not dom.data:
+        raise HTTPException(404, "Domain not found")
+    domain_row = dom.data[0]
+
+    # Owner email
+    owner_email = None
+    try:
+        ur = db.table("users").select("email").eq("id", domain_row.get("user_id","")).execute()
+        if ur.data:
+            owner_email = ur.data[0]["email"]
+    except Exception:
+        pass
+
+    # All scans for this domain, newest first
+    scans_res = db.table("scans") \
+        .select("id,risk_score,critical,warnings,checks,scanned_at") \
+        .eq("domain_id", domain_id) \
+        .order("scanned_at", desc=True) \
+        .limit(20) \
+        .execute()
+
+    scans = []
+    for s in (scans_res.data or []):
+        checks = s.get("checks") or []
+        if isinstance(checks, str):
+            try:
+                checks = __import__("json").loads(checks)
+            except Exception:
+                checks = []
+        # Pull out any error checks
+        errors = [c for c in checks if (c.get("status") or "") in ("error", "fail")
+                  and c.get("check") == "error"]
+        failed_checks = [c for c in checks if (c.get("status") or "") in ("critical", "error")
+                         and c.get("check") != "error"]
+        scans.append({
+            "scan_id":       s["id"],
+            "scanned_at":    s["scanned_at"],
+            "risk_score":    s.get("risk_score"),
+            "critical":      s.get("critical"),
+            "warnings":      s.get("warnings"),
+            "total_checks":  len(checks),
+            "scan_errors":   errors,            # whole-scan failure records
+            "critical_findings": failed_checks, # individual check failures
+        })
+
+    # Is the domain currently being scanned?
+    active = _active_scans.get(domain_id)
+
+    return {
+        "domain":       domain_row["domain"],
+        "domain_id":    domain_id,
+        "owner_email":  owner_email,
+        "country":      domain_row.get("country"),
+        "created_at":   domain_row.get("created_at"),
+        "active_scan":  active,
+        "scan_count":   len(scans),
+        "scans":        scans,
+    }
+
+
 @app.get("/admin/portkey/usage")
 def admin_portkey_usage(authorization: str = Header(None)):
     """Fetch AI cost/usage summary from Portkey analytics API (last 30 days)."""
