@@ -5740,15 +5740,15 @@ def pipeline_run_bulk_discovery(authorization: str = Header(None)):
         raise HTTPException(500, str(e))
 
 
-@app.post("/pipeline/backfill-outreach")
-def pipeline_backfill_outreach(authorization: str = Header(None)):
-    """Admin: mark already-scanned domains as pending outreach if they qualify.
-    Qualification: max_cvss >= 7 OR risk_score >= 40 OR missing DMARC/SPF OR blacklisted.
-    Safe to run multiple times — only touches rows where outreach_status IS NULL."""
-    require_admin(authorization)
-    db = get_admin_db()
-    from pipeline import _domain_qualifies
+_backfill_status: dict = {"running": False, "backfilled": 0, "prospects_written": 0, "error": None, "finished_at": None}
+
+def _run_backfill_job():
+    """Background worker for /pipeline/backfill-outreach."""
+    global _backfill_status
+    _backfill_status = {"running": True, "backfilled": 0, "prospects_written": 0, "error": None, "finished_at": None}
     try:
+        db = get_admin_db()
+        from pipeline import _domain_qualifies, backfill_outreach_prospects
         updated = 0
         offset  = 0
         chunk   = 500
@@ -5774,19 +5774,36 @@ def pipeline_backfill_outreach(authorization: str = Header(None)):
                     .in_("id", qualifying)\
                     .execute()
                 updated += len(qualifying)
+            _backfill_status["backfilled"] = updated
             offset += chunk
             if len(rows.data) < chunk:
                 break
-        # Also dual-write the newly-marked + existing pending rows to outreach_prospects
-        from pipeline import backfill_outreach_prospects
         written = backfill_outreach_prospects(db=db)
-        return {
-            "backfilled":           updated,
-            "prospects_written":    written,
-            "message": f"{updated} domains marked pending in scan_results, {written} written to outreach_prospects",
-        }
+        _backfill_status.update({"running": False, "prospects_written": written,
+                                  "finished_at": datetime.now(timezone.utc).isoformat()})
+        print(f"[backfill] done: {updated} qualified, {written} prospects written")
     except Exception as e:
-        raise HTTPException(500, str(e))
+        _backfill_status.update({"running": False, "error": str(e)[:300],
+                                  "finished_at": datetime.now(timezone.utc).isoformat()})
+        print(f"[backfill] failed: {e}")
+
+
+@app.post("/pipeline/backfill-outreach")
+def pipeline_backfill_outreach(background_tasks: BackgroundTasks, authorization: str = Header(None)):
+    """Admin: qualify already-scanned domains for outreach in background.
+    Returns immediately — poll GET /pipeline/backfill-outreach/status for progress."""
+    require_admin(authorization)
+    if _backfill_status.get("running"):
+        return {"status": "already_running", "backfilled": _backfill_status["backfilled"]}
+    background_tasks.add_task(_run_backfill_job)
+    return {"status": "started", "message": "Qualification running in background — check /pipeline/backfill-outreach/status"}
+
+
+@app.get("/pipeline/backfill-outreach/status")
+def pipeline_backfill_status(authorization: str = Header(None)):
+    """Admin: poll qualification job progress."""
+    require_admin(authorization)
+    return _backfill_status
 
 
 @app.post("/pipeline/run-sonar-import")
