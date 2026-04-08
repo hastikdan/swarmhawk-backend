@@ -5221,11 +5221,20 @@ def _build_map_data() -> dict:
     except Exception as e:
         print(f"[map] industry_risk build failed: {e}")
 
+    # Accurate totals via count="exact" — not limited by Supabase row cap
+    try:
+        _total_domains = db.table("scan_results").select("id", count="exact").execute().count or 0
+        _total_scanned = db.table("scan_results").select("id", count="exact")\
+            .not_.is_("last_scanned_at", "null").execute().count or 0
+    except Exception:
+        _total_domains = sum(r["domains"] for r in result)
+        _total_scanned = sum(r["scanned"] for r in result)
+
     now = datetime.now(timezone.utc).isoformat()
     return {
         "countries":     sorted(result, key=lambda x: (x["avg_risk"], x["scanned"]), reverse=True),
-        "total_domains": sum(r["domains"] for r in result),
-        "total_scanned": sum(r["scanned"] for r in result),
+        "total_domains": _total_domains,
+        "total_scanned": _total_scanned,
         "industry_risk": industry_risk,
         "generated_at":  now,
         "last_updated":  now,
