@@ -1563,6 +1563,25 @@ def admin_set_user_role(user_id: str, body: AdminRoleBody, authorization: str = 
     return {"user_id": user_id, "role": body.role}
 
 
+class AdminSetPasswordBody(BaseModel):
+    password: str
+
+@app.post("/admin/users/{user_id}/set-password")
+def admin_set_password(user_id: str, body: AdminSetPasswordBody, authorization: str = Header(None)):
+    """Set a user's password directly. Super admin only."""
+    require_super_admin(authorization)
+    if len(body.password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters")
+    db = get_admin_db()
+    target = db.table("users").select("id,email,auth_type").eq("id", user_id).execute()
+    if not target.data:
+        raise HTTPException(404, "User not found")
+    if target.data[0].get("auth_type") == "google":
+        raise HTTPException(400, "Cannot set password for Google OAuth accounts")
+    db.table("users").update({"password_hash": hash_password(body.password)}).eq("id", user_id).execute()
+    return {"updated": user_id}
+
+
 @app.post("/admin/users/{user_id}/rescan-all")
 def admin_rescan_user(user_id: str, background_tasks: BackgroundTasks, authorization: str = Header(None)):
     """Force re-scan all domains for a user. Admin only."""
