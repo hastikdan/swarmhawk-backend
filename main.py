@@ -1572,6 +1572,43 @@ def admin_set_user_role(user_id: str, body: AdminRoleBody, authorization: str = 
     return {"user_id": user_id, "role": body.role}
 
 
+class AdminSetPlanBody(BaseModel):
+    plan: str  # "free" | "pro" | "business" | "enterprise"
+
+@app.patch("/admin/users/{user_id}/plan")
+def admin_set_user_plan(user_id: str, body: AdminSetPlanBody, authorization: str = Header(None)):
+    """Override a user's active plan. Super admin only.
+    Non-free plans insert an admin-override purchase record (amount=0).
+    Free cancels all existing active purchases."""
+    require_super_admin(authorization)
+    VALID_PLANS = {"free", "pro", "business", "enterprise"}
+    if body.plan not in VALID_PLANS:
+        raise HTTPException(400, f"plan must be one of {sorted(VALID_PLANS)}")
+    db = get_admin_db()
+    if not db.table("users").select("id").eq("id", user_id).execute().data:
+        raise HTTPException(404, "User not found")
+    now = datetime.now(timezone.utc).isoformat()
+    override_session_id = f"admin_override_{user_id}"
+    # Always cancel any existing admin override first
+    db.table("purchases").update({"cancelled_at": now})\
+        .eq("user_id", user_id).eq("stripe_session_id", override_session_id)\
+        .is_("cancelled_at", "null").execute()
+    if body.plan == "free":
+        # Also cancel all other active purchases
+        db.table("purchases").update({"cancelled_at": now})\
+            .eq("user_id", user_id).is_("cancelled_at", "null").execute()
+    else:
+        db.table("purchases").insert({
+            "user_id":           user_id,
+            "domain":            "admin_override",
+            "plan":              body.plan,
+            "amount_usd":        0,
+            "paid_at":           now,
+            "stripe_session_id": override_session_id,
+        }).execute()
+    return {"user_id": user_id, "plan": body.plan}
+
+
 class AdminSetPasswordBody(BaseModel):
     password: str
 
