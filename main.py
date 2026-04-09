@@ -3158,33 +3158,31 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     import os as _os
     from fpdf import FPDF
 
-    # ── Design system constants ──────────────────────────────────────────────
-    C_DARK    = (8,   8,  16)
-    C_SURFACE = (15,  15, 26)
-    C_CARD    = (19,  19, 31)
-    C_BORDER  = (38,  38, 55)
-    C_TEXT    = (232, 232, 240)
-    C_MUTED   = (136, 136, 160)
-    C_LIME    = (163, 230, 53)
-    C_RED     = (248, 113, 113)
-    C_AMBER   = (251, 191, 36)
-    C_ORANGE  = (251, 146, 60)
-    C_GREEN   = (163, 230, 53)
-    C_PURPLE  = (167, 139, 250)
-    C_GREY    = (100, 100, 120)
+    # ── Design system constants (from DESIGN.md) ────────────────────────────
+    C_DARK    = (8,   8,  16)    # --dark    page background
+    C_SURFACE = (15,  15, 26)    # --surface header / footer band
+    C_CARD    = (19,  19, 31)    # --card    check card background
+    C_CARD2   = (24,  24, 40)    # raised within card
+    C_BORDER  = (38,  38, 55)    # --border approximated (rgba 255,255,255,.07 on --dark)
+    C_TEXT    = (232, 232, 240)  # --text    primary text
+    C_MUTED   = (136, 136, 160)  # --muted   secondary text
+    C_LIME    = (163, 230, 53)   # --lime    accent
+    C_RED     = (248, 113, 113)  # --red     critical
+    C_AMBER   = (251, 191, 36)   # --amber   warning
+    C_ORANGE  = (251, 146, 60)   # high
+    C_GREEN   = (163, 230, 53)   # clean / ok  (same lime)
+    C_GREY    = (100, 100, 120)  # error / unknown
 
     STATUS_COLOR = {
         "critical": C_RED,
         "warning":  C_AMBER,
         "ok":       C_GREEN,
-        "info":     C_PURPLE,
         "error":    C_GREY,
     }
     STATUS_LABEL = {
         "critical": "CRITICAL",
         "warning":  "WARNING",
-        "ok":       "PASSED",
-        "info":     "INFO",
+        "ok":       "OK",
         "error":    "ERROR",
     }
     CHECK_LABELS = {
@@ -3210,8 +3208,8 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
         "ports": "Critical Ports", "admin_panel": "Admin Panel",
         "directory_listing": "Directory Listing", "subdomains": "Subdomains",
         "nuclei": "Active CVE Scan (Nuclei)",
-        "sast": "SAST - Source Exposure", "sca": "SCA - Dependency CVEs",
-        "dast": "DAST - App Testing", "iac": "IaC - Config Exposure",
+        "sast": "SAST — Source Exposure", "sca": "SCA — Dependency CVEs",
+        "dast": "DAST — App Testing", "iac": "IaC — Config Exposure",
         "injection": "A03/A05: Injection", "auth_security": "A07: Auth Failures",
         "integrity": "A08: Data Integrity", "ssrf": "A10/A01: SSRF",
         "jwt_security": "A08/A04: JWT Security", "deserialization": "A08: Deserialization",
@@ -3226,40 +3224,31 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     except Exception:
         scan_date = scanned_at[:10] if scanned_at else "—"
 
-    # ── Separate and sort checks matching dashboard display order ────────────
-    # confidence field: "confirmed" (default) or "informational" (zero score impact)
-    all_checks = [c for c in checks if c.get("check") != "ai_summary"]
-    confirmed  = [c for c in all_checks if c.get("confidence") != "informational" and c.get("status") != "info"]
-    info_checks = [c for c in all_checks if c.get("confidence") == "informational" or c.get("status") == "info"]
+    non_ai   = [c for c in checks if c.get("check") != "ai_summary"]
+    criticals = sum(1 for c in non_ai if c.get("status") == "critical")
+    warnings  = sum(1 for c in non_ai if c.get("status") == "warning")
+    cleans    = sum(1 for c in non_ai if c.get("status") == "ok")
 
-    # Sort confirmed: critical → warning → ok → error
-    _order = {"critical": 0, "warning": 1, "ok": 2, "error": 3}
-    confirmed.sort(key=lambda c: _order.get(c.get("status", "ok"), 9))
+    # Score color
+    if   risk_score >= 60: score_col = C_RED
+    elif risk_score >= 30: score_col = C_AMBER
+    elif risk_score >= 10: score_col = C_ORANGE
+    else:                  score_col = C_GREEN
 
-    criticals     = sum(1 for c in confirmed if c.get("status") == "critical")
-    warnings      = sum(1 for c in confirmed if c.get("status") == "warning")
-    cleans        = sum(1 for c in confirmed if c.get("status") == "ok")
-    info_count    = len(info_checks)
-
-    # ── Score colour + label matching dashboard ──────────────────────────────
-    if   risk_score >= 70: score_col = C_RED;    score_label = "CRITICAL RISK"
-    elif risk_score >= 50: score_col = C_ORANGE; score_label = "HIGH RISK"
-    elif risk_score >= 30: score_col = C_AMBER;  score_label = "MEDIUM RISK"
-    else:                  score_col = C_GREEN;  score_label = "LOW RISK"
-
-    # ── Font setup ───────────────────────────────────────────────────────────
+    # ── Font helpers ─────────────────────────────────────────────────────────
     _FONTS_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "fonts")
 
     class DarkPDF(FPDF):
-        def header(self): pass
+        def header(self):
+            pass   # custom header drawn manually on first page only
         def footer(self):
+            # ── Per-page footer bar ─────────────────────────────────────────
             self.set_y(-14)
             self.set_fill_color(*C_SURFACE)
             self.rect(0, self.get_y() - 1, 210, 16, style="F")
             self.set_font("Inter", "", 7)
             self.set_text_color(*C_MUTED)
-            self.cell(0, 6, "SwarmHawk - European Cybersecurity Intelligence - www.swarmhawk.com",
-                      align="C", new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 6, "SwarmHawk - European Cybersecurity Intelligence - www.swarmhawk.com", align="C", new_x="LMARGIN", new_y="NEXT")
             self.cell(0, 5, f"Page {self.page_no()} - Confidential - Scan date: {scan_date}", align="C")
 
     pdf = DarkPDF(format="A4")
@@ -3278,140 +3267,38 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
         FONT_XBOLD = "InterEB"
         _fonts_ok  = True
     except Exception:
+        # Fallback if fonts dir not found
         FONT_BODY  = "Helvetica"
         FONT_MONO  = "Courier"
         FONT_XBOLD = "Helvetica"
 
-    def _new_page():
-        pdf.add_page()
-        pdf.set_fill_color(*C_DARK)
-        pdf.rect(0, 0, 210, 297, style="F")
-        pdf.ln(4)
-
-    def _section_rule(title: str, col=None):
-        col = col or C_LIME
-        if pdf.get_y() > 265:
-            _new_page()
-        pdf.ln(4)
-        pdf.set_draw_color(*col)
-        pdf.set_line_width(0.3)
-        pdf.line(18, pdf.get_y(), 192, pdf.get_y())
-        pdf.set_line_width(0.2)
-        pdf.ln(4)
-        pdf.set_x(18)
-        pdf.set_font(FONT_BODY, "", 8)
-        pdf.set_text_color(*col)
-        pdf.cell(0, 5, title, new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(2)
-
-    def _check_card(c: dict):
-        status  = c.get("status", "ok")
-        chk_key = c.get("check", "")
-        label   = _pdf_safe(CHECK_LABELS.get(chk_key, chk_key.replace("_", " ").upper()))
-        title   = _pdf_safe(c.get("title", ""))
-        detail  = _pdf_safe(c.get("detail", ""))
-        impact  = c.get("score_impact", 0) or 0
-        s_color = STATUS_COLOR.get(status, C_GREY)
-        s_label = STATUS_LABEL.get(status, status.upper())
-
-        card_x = 18
-        card_w = 174
-        # Show detail for critical and warning; show brief (1 line) for ok/info if present
-        show_detail = bool(detail) and status in ("critical", "warning")
-        show_brief  = bool(detail) and status in ("ok", "info") and len(detail) <= 120
-        row_h = 8
-        detail_lines = 0
-        if show_detail:
-            detail_lines = min(4, len(detail) // 55 + 1)
-        elif show_brief:
-            detail_lines = 1
-        card_h = row_h + (detail_lines * 4 + 2 if detail_lines else 0)
-
-        if pdf.get_y() + card_h + 6 > 275:
-            _new_page()
-
-        card_y = pdf.get_y()
-        pdf.set_fill_color(*C_CARD)
-        pdf.rect(card_x, card_y, card_w, card_h + 4, style="F")
-        pdf.set_fill_color(*s_color)
-        pdf.rect(card_x, card_y, 3, card_h + 4, style="F")
-
-        # Impact badge (right side, for non-zero impacts on critical/warning)
-        impact_text = f"-{impact}pts" if impact > 0 else ""
-
-        # Status badge
-        pdf.set_xy(card_x + 5, card_y + 1.5)
-        pdf.set_fill_color(*s_color)
-        bw = 20
-        pdf.set_font(FONT_MONO, "B", 6)
-        pdf.set_text_color(*C_DARK)
-        pdf.cell(bw, 5, s_label, fill=True, align="C", new_x="RIGHT", new_y="TOP")
-
-        # Check key
-        pdf.set_x(pdf.get_x() + 2)
-        pdf.set_font(FONT_MONO, "", 7)
-        pdf.set_text_color(*C_MUTED)
-        pdf.cell(36, 5, _pdf_safe(chk_key[:18]), new_x="RIGHT", new_y="TOP")
-
-        # Title
-        pdf.set_x(pdf.get_x() + 2)
-        remaining = card_w - bw - 36 - 11 - (len(impact_text) * 2 + 2)
-        pdf.set_font(FONT_BODY, "B", 8)
-        pdf.set_text_color(*C_TEXT)
-        pdf.cell(remaining, 5, title[:80], new_x="RIGHT", new_y="TOP")
-
-        # Score impact (right-aligned, red for deductions)
-        if impact_text:
-            pdf.set_font(FONT_MONO, "B", 7)
-            pdf.set_text_color(*C_RED)
-            pdf.cell(len(impact_text) * 2 + 2, 5, impact_text, align="R", new_x="LMARGIN", new_y="NEXT")
-        else:
-            pdf.set_xy(card_x, pdf.get_y() + 5)
-
-        # Full check label
-        pdf.set_x(card_x + 5 + bw + 2)
-        pdf.set_font(FONT_BODY, "", 7)
-        pdf.set_text_color(*C_MUTED)
-        pdf.cell(80, 4, label[:50], new_x="LMARGIN", new_y="NEXT")
-
-        # Detail text
-        if show_detail or show_brief:
-            pdf.set_x(card_x + 5)
-            pdf.set_font(FONT_BODY, "", 7)
-            pdf.set_text_color(*C_MUTED)
-            short = detail.replace("\n", "  ").replace("\u2022", "-")[:300]
-            if show_brief:
-                pdf.cell(card_w - 10, 4, short[:100], new_x="LMARGIN", new_y="NEXT")
-            else:
-                pdf.multi_cell(card_w - 10, 4, short)
-
-        pdf.set_y(card_y + card_h + 6)
-
-    # ════════════════════════════════════════════════════════════════
-    # PAGE 1
-    # ════════════════════════════════════════════════════════════════
     pdf.add_page()
+
+    # ── Fill entire first page background ───────────────────────────────────
     pdf.set_fill_color(*C_DARK)
     pdf.rect(0, 0, 210, 297, style="F")
 
-    # Header band
+    # ── Header band ─────────────────────────────────────────────────────────
     pdf.set_fill_color(*C_SURFACE)
     pdf.rect(0, 0, 210, 42, style="F")
+
+    # Lime left accent strip
     pdf.set_fill_color(*C_LIME)
     pdf.rect(0, 0, 3, 42, style="F")
 
+    # Wordmark
     pdf.set_xy(10, 10)
     pdf.set_font(FONT_MONO, "B", 13)
     pdf.set_text_color(*C_LIME)
     bullet = "\u25cf" if _fonts_ok else "*"
-    pdf.cell(6, 6, bullet)
+    pdf.cell(6, 6, bullet)   # ● or * dot
     pdf.set_x(pdf.get_x() + 1)
     pdf.cell(0, 6, "SWARMHAWK", new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_x(10)
     pdf.set_font(FONT_BODY, "", 8)
     pdf.set_text_color(*C_MUTED)
-    pdf.cell(0, 5, "Security Intelligence Report  -  European Cybersecurity", new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, _pdf_safe("Security Intelligence Report  -  European Cybersecurity"), new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_x(10)
     pdf.set_font(FONT_MONO, "", 7)
@@ -3420,137 +3307,177 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
 
     pdf.set_y(50)
 
-    # Domain name
+    # ── Hero: domain + score ─────────────────────────────────────────────────
     pdf.set_x(18)
-    pdf.set_font(FONT_BODY, "B", 8)
+    pdf.set_font(FONT_BODY, "B", 11)
     pdf.set_text_color(*C_MUTED)
-    pdf.cell(0, 5, "DOMAIN SECURITY REPORT", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_x(18)
-    pdf.set_font(FONT_MONO, "B", 18)
-    pdf.set_text_color(*C_TEXT)
-    pdf.cell(0, 9, _pdf_safe(domain), new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(1)
+    pdf.cell(0, 6, "DOMAIN", new_x="LMARGIN", new_y="NEXT")
 
-    # ── Score + label + stats strip ──────────────────────────────────────────
     pdf.set_x(18)
+    pdf.set_font(FONT_MONO, "B", 20)
+    pdf.set_text_color(*C_TEXT)
+    pdf.cell(0, 10, _pdf_safe(domain), new_x="LMARGIN", new_y="NEXT")
+
+    pdf.ln(2)
+
+    # Score + summary row
+    pdf.set_x(18)
+    # Score box
+    pdf.set_fill_color(*C_CARD)
+    pdf.set_draw_color(*C_BORDER)
     pdf.set_font(FONT_MONO, "B", 9)
     pdf.set_text_color(*C_MUTED)
-    pdf.cell(28, 5, "RISK SCORE", new_x="RIGHT", new_y="TOP")
+    pdf.cell(28, 5, "RISK SCORE", border=0, new_x="RIGHT", new_y="TOP")
+
     pdf.set_x(18)
     pdf.ln(5)
-
-    # Large score number
-    pdf.set_font(FONT_MONO, "B", 38)
+    pdf.set_font(FONT_MONO, "B", 36)
     pdf.set_text_color(*score_col)
-    pdf.cell(38, 14, str(risk_score), new_x="RIGHT", new_y="TOP")
-    pdf.set_font(FONT_MONO, "", 12)
+    pdf.cell(35, 14, str(risk_score), new_x="RIGHT", new_y="TOP")
+
+    pdf.set_font(FONT_MONO, "", 13)
     pdf.set_text_color(*C_MUTED)
-    pdf.cell(14, 14, "/100", new_x="RIGHT", new_y="TOP")
+    pdf.cell(12, 14, "/100", new_x="RIGHT", new_y="TOP")
 
-    # Score label (CRITICAL / HIGH / MEDIUM / LOW RISK)
-    pdf.set_x(pdf.get_x() + 4)
-    y_label = pdf.get_y() + 6
-    pdf.set_xy(pdf.get_x(), y_label)
-    pdf.set_fill_color(*score_col)
-    pdf.set_font(FONT_MONO, "B", 8)
-    pdf.set_text_color(*C_DARK)
-    pdf.cell(len(score_label) * 2 + 8, 6, score_label, fill=True, align="C", new_x="RIGHT", new_y="TOP")
-
-    # Stats counters
-    pdf.set_x(pdf.get_x() + 8)
-    y_stats = pdf.get_y() + 2
-    stats = [
-        ("CRITICAL",      criticals,  C_RED),
-        ("WARNING",       warnings,   C_AMBER),
-        ("PASSED",        cleans,     C_LIME),
-        ("INFORMATIONAL", info_count, C_PURPLE),
-    ]
-    for stat_label, count, col in stats:
+    # Summary stats inline
+    pdf.set_x(pdf.get_x() + 10)
+    y_stats = pdf.get_y() + 4
+    for label, count, col in [
+        ("CRITICAL", criticals, C_RED),
+        ("WARNING",  warnings,  C_AMBER),
+        ("PASSED",   cleans,    C_LIME),
+        ("TOTAL",    len(non_ai), C_MUTED),
+    ]:
+        pdf.set_xy(pdf.get_x(), y_stats)
+        pdf.set_fill_color(*C_CARD)
         bx = pdf.get_x()
-        pdf.set_xy(bx, y_stats)
-        pdf.set_font(FONT_MONO, "B", 16)
+        pdf.set_font(FONT_MONO, "B", 18)
         pdf.set_text_color(*col)
-        pdf.cell(16, 7, str(count), new_x="RIGHT", new_y="TOP")
-        pdf.set_xy(bx, y_stats + 7)
-        pdf.set_font(FONT_BODY, "", 6)
-        pdf.set_text_color(*C_MUTED)
-        pdf.cell(16, 3, stat_label, new_x="RIGHT", new_y="TOP")
-        pdf.set_x(pdf.get_x() + 4)
-
-    pdf.ln(22)
-
-    # Informational score note
-    if info_count:
-        pdf.set_x(18)
-        pdf.set_font(FONT_BODY, "", 7)
-        pdf.set_text_color(*C_PURPLE)
-        pdf.cell(0, 4,
-            _pdf_safe(f"* {info_count} informational finding(s) are surface area indicators only — zero score impact."),
-            new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(1)
-
-    # ── Confirmed findings ───────────────────────────────────────────────────
-    _section_rule("SECURITY CHECK RESULTS  —  sorted by severity")
-
-    for c in confirmed:
-        _check_card(c)
-
-    # ── Surface Area Indicators (informational) ──────────────────────────────
-    if info_checks:
-        _section_rule("SURFACE AREA INDICATORS  —  no score impact, manual review recommended", C_PURPLE)
-        pdf.set_x(18)
+        pdf.cell(18, 8, str(count), new_x="RIGHT", new_y="TOP")
+        pdf.set_xy(bx, y_stats + 8)
         pdf.set_font(FONT_BODY, "", 7)
         pdf.set_text_color(*C_MUTED)
-        pdf.cell(0, 4,
-            "These findings indicate potential attack surface but are NOT confirmed vulnerabilities.",
-            new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(2)
-        for c in info_checks:
-            _check_card(c)
+        pdf.cell(18, 4, label, align="L", new_x="RIGHT", new_y="TOP")
+        pdf.set_x(pdf.get_x() + 5)
 
-    # ── AI Threat Assessment ─────────────────────────────────────────────────
+    pdf.ln(20)
+
+    # Thin lime rule under hero
+    pdf.set_draw_color(*C_LIME)
+    pdf.set_line_width(0.3)
+    pdf.line(18, pdf.get_y(), 192, pdf.get_y())
+    pdf.set_line_width(0.2)
+    pdf.ln(6)
+
+    # ── Section title: Security Checks ──────────────────────────────────────
+    pdf.set_x(18)
+    pdf.set_font(FONT_BODY, "", 8)
+    pdf.set_text_color(*C_LIME)
+    pdf.cell(0, 5, "SECURITY CHECKS", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+
+    # ── Checks ──────────────────────────────────────────────────────────────
+    for c in non_ai:
+        status  = c.get("status", "ok")
+        chk_key = c.get("check", "")
+        label   = _pdf_safe(CHECK_LABELS.get(chk_key, chk_key.replace("_", " ").upper()))
+        title   = _pdf_safe(c.get("title", ""))
+        detail  = _pdf_safe(c.get("detail", ""))
+        s_color = STATUS_COLOR.get(status, C_GREY)
+        s_label = STATUS_LABEL.get(status, status.upper())
+
+        card_x = 18
+        card_w = 174
+        row_h  = 8
+
+        # Estimate card height
+        needs_detail = detail and status in ("critical", "warning")
+        card_h = row_h + (10 if needs_detail else 0)
+
+        # Page break guard — add new page and fill background
+        if pdf.get_y() + card_h + 4 > 275:
+            pdf.add_page()
+            pdf.set_fill_color(*C_DARK)
+            pdf.rect(0, 0, 210, 297, style="F")
+            pdf.ln(4)
+
+        card_y = pdf.get_y()
+
+        # Card background
+        pdf.set_fill_color(*C_CARD)
+        pdf.set_draw_color(*C_BORDER)
+        pdf.rect(card_x, card_y, card_w, card_h + 4, style="F")
+
+        # Severity left strip (3px)
+        pdf.set_fill_color(*s_color)
+        pdf.rect(card_x, card_y, 3, card_h + 4, style="F")
+
+        # Status badge
+        pdf.set_xy(card_x + 5, card_y + 1.5)
+        pdf.set_fill_color(*s_color)
+        bw = 18
+        pdf.set_font(FONT_MONO, "B", 6)
+        pdf.set_text_color(*C_DARK)
+        pdf.cell(bw, 5, s_label, fill=True, align="C", new_x="RIGHT", new_y="TOP")
+
+        # Check name (monospace, muted)
+        pdf.set_x(pdf.get_x() + 2)
+        pdf.set_font(FONT_MONO, "", 7)
+        pdf.set_text_color(*C_MUTED)
+        pdf.cell(38, 5, _pdf_safe(chk_key[:20]), new_x="RIGHT", new_y="TOP")
+
+        # Title (inter, white)
+        pdf.set_x(pdf.get_x() + 2)
+        remaining = card_w - bw - 38 - 9
+        pdf.set_font(FONT_BODY, "B", 8)
+        pdf.set_text_color(*C_TEXT)
+        pdf.cell(remaining, 5, title[:80], new_x="LMARGIN", new_y="NEXT")
+
+        # Check label (full name, small muted)
+        pdf.set_x(card_x + 5 + bw + 2)
+        pdf.set_font(FONT_BODY, "", 7)
+        pdf.set_text_color(*C_MUTED)
+        pdf.cell(80, 4, label[:50], new_x="LMARGIN", new_y="NEXT")
+
+        # Detail (critical/warning only)
+        if needs_detail:
+            pdf.set_x(card_x + 5)
+            pdf.set_font(FONT_BODY, "", 7)
+            pdf.set_text_color(*C_MUTED)
+            short = detail.replace("\n", "  ").replace("•", "-")[:280]
+            pdf.multi_cell(card_w - 8, 4, short)
+
+        pdf.set_y(card_y + card_h + 6)
+
+    # ── AI summary (if present) ──────────────────────────────────────────────
     ai = next((c for c in checks if c.get("check") == "ai_summary"), None)
     if ai and ai.get("detail"):
-        _section_rule("AI THREAT ASSESSMENT")
+        if pdf.get_y() > 240:
+            pdf.add_page()
+            pdf.set_fill_color(*C_DARK)
+            pdf.rect(0, 0, 210, 297, style="F")
+            pdf.ln(4)
+
+        pdf.ln(4)
+        pdf.set_draw_color(*C_LIME)
+        pdf.line(18, pdf.get_y(), 192, pdf.get_y())
+        pdf.ln(4)
+        pdf.set_x(18)
+        pdf.set_font(FONT_BODY, "", 8)
+        pdf.set_text_color(*C_LIME)
+        pdf.cell(0, 5, "AI THREAT ASSESSMENT", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(2)
+
         card_x, card_y = 18, pdf.get_y()
         pdf.set_fill_color(*C_CARD)
-        pdf.set_fill_color(*C_CARD)
+        pdf.rect(card_x, card_y, 174, 5, style="F")   # placeholder; multi_cell expands it
+
         pdf.set_x(card_x + 4)
-        pdf.set_y(card_y + 2)
+        pdf.set_y(card_y + 3)
         pdf.set_font(FONT_BODY, "", 8)
         pdf.set_text_color(*C_TEXT)
-        ai_text = _pdf_safe(ai.get("detail", ""))[:1400]
+        ai_text = _pdf_safe(ai.get("detail", ""))[:1200]
         pdf.multi_cell(166, 5, ai_text)
-
-    # ── Remediation priority summary ─────────────────────────────────────────
-    urgent = [c for c in confirmed if c.get("status") == "critical"]
-    if urgent:
-        _section_rule("PRIORITY REMEDIATION — fix these first")
-        for i, c in enumerate(urgent[:8], 1):
-            if pdf.get_y() > 270:
-                _new_page()
-            chk_key = c.get("check", "")
-            title   = _pdf_safe(c.get("title", ""))
-            impact  = c.get("score_impact", 0) or 0
-            pdf.set_x(18)
-            pdf.set_font(FONT_MONO, "B", 8)
-            pdf.set_text_color(*C_RED)
-            pdf.cell(6, 5, f"{i}.", new_x="RIGHT", new_y="TOP")
-            pdf.set_font(FONT_BODY, "B", 8)
-            pdf.set_text_color(*C_TEXT)
-            pdf.cell(130, 5, title[:75], new_x="RIGHT", new_y="TOP")
-            pdf.set_font(FONT_MONO, "", 7)
-            pdf.set_text_color(*C_RED)
-            pdf.cell(0, 5, f"-{impact}pts" if impact else "", new_x="LMARGIN", new_y="NEXT")
-
-            detail = _pdf_safe(c.get("detail", ""))
-            if detail:
-                pdf.set_x(24)
-                pdf.set_font(FONT_BODY, "", 7)
-                pdf.set_text_color(*C_MUTED)
-                short = detail.replace("\n", "  ").replace("\u2022", "-")[:200]
-                pdf.multi_cell(166, 4, short)
-            pdf.ln(1)
 
     return bytes(pdf.output())
 
