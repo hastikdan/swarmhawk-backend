@@ -2085,14 +2085,16 @@ def get_me(authorization: str = Header(None)):
     _uid = u["id"]
     from pipeline import _get_scanner_ip
     return {
-        "id":            _uid,
-        "email":         u["email"],
-        "name":          u.get("name", ""),
-        "avatar":        u.get("avatar", ""),
-        "is_admin":      is_admin(_uid),
-        "is_super_admin": is_super_admin(_uid),
-        "auth_type":     u.get("auth_type", "google"),
-        "scanner_ip":    _get_scanner_ip(),
+        "id":                    _uid,
+        "email":                 u["email"],
+        "name":                  u.get("name", ""),
+        "avatar":                u.get("avatar", ""),
+        "is_admin":              is_admin(_uid),
+        "is_super_admin":        is_super_admin(_uid),
+        "auth_type":             u.get("auth_type", "google"),
+        "scanner_ip":            _get_scanner_ip(),
+        "onboarding_role":       u.get("onboarding_role"),
+        "onboarding_completed":  u.get("onboarding_completed", False),
     }
 
 
@@ -2162,6 +2164,25 @@ def update_profile(body: UpdateProfileRequest, authorization: str = Header(None)
         "auth_type": u2.get("auth_type", ""),
         "created_at": u2.get("created_at", ""),
     }
+
+
+class OnboardingCompleteRequest(BaseModel):
+    role: str  # "domain_holder" | "developer" | "enterprise"
+
+
+@app.post("/onboarding/complete")
+def complete_onboarding(body: OnboardingCompleteRequest, authorization: str = Header(None)):
+    """Save the user's onboarding role and mark onboarding as complete."""
+    VALID_ROLES = {"domain_holder", "developer", "enterprise"}
+    if body.role not in VALID_ROLES:
+        raise HTTPException(400, f"role must be one of {sorted(VALID_ROLES)}")
+    user = get_user_from_header(authorization)
+    db   = get_db()
+    db.table("users").update({
+        "onboarding_role":      body.role,
+        "onboarding_completed": True,
+    }).eq("id", user["sub"]).execute()
+    return {"ok": True, "role": body.role}
 
 
 @app.delete("/me")
@@ -2306,21 +2327,25 @@ def add_domain(body: AddDomainRequest, background_tasks: BackgroundTasks,
     if existing.data:
         raise HTTPException(status_code=409, detail="Domain already added")
 
-    # Free tier: 1 domain max unless user has an active paid plan or is admin
-    FREE_DOMAIN_LIMIT = 1
+    # Plan-based domain limit enforcement
+    PLAN_LIMITS = {"free": 1, "pro": 10, "professional": 10, "business": 100, "enterprise": None, "platform": None}
     if not is_admin(user["sub"]):
         domain_count = db.table("domains").select("id", count="exact").eq("user_id", user["sub"]).execute()
-        if (domain_count.count or 0) >= FREE_DOMAIN_LIMIT:
-            paid = db.table("purchases").select("id")\
-                .eq("user_id", user["sub"])\
-                .is_("cancelled_at", "null")\
-                .not_.is_("paid_at", "null")\
-                .execute()
-            if not paid.data:
-                raise HTTPException(
-                    status_code=403,
-                    detail="Free accounts include 1 domain with 1 free scan. Upgrade to Professional ($49/mo, billed yearly) to monitor up to 10 domains."
-                )
+        current_count = domain_count.count or 0
+        # Determine user's plan limit
+        try:
+            user_plan_info = get_user_plan(authorization)
+            plan_limit = PLAN_LIMITS.get(user_plan_info.get("plan_id", "free"), 1)
+        except Exception:
+            plan_limit = 1
+        if plan_limit is not None and current_count >= plan_limit:
+            limit_msgs = {1: "Free plan includes 1 domain. Upgrade to Pro ($79/mo) to monitor up to 10 domains.",
+                          10: "Pro plan includes up to 10 domains. Upgrade to Business ($299/mo) to monitor up to 100 domains.",
+                          100: "Business plan includes up to 100 domains. Contact sales for Enterprise pricing."}
+            raise HTTPException(
+                status_code=403,
+                detail=limit_msgs.get(plan_limit, f"Your plan allows up to {plan_limit} domains. Upgrade to add more.")
+            )
 
     # Resolve country — use provided value only when it's a real ISO code
     resolved_country = body.country.upper().strip() if body.country else ""
@@ -6640,40 +6665,64 @@ PLANS = [
         "bulk_upload":  False,
         "features": [
             "1 domain",
-            "1 full security scan — free",
-            "Additional scans — $5/scan",
+            "Full security scan",
             "Risk score dashboard",
-            "Basic PDF report",
+            "PDF report download",
+            "22-check scan engine",
         ],
         "cta_label": "Get Started Free",
         "checkout_url": None,
     },
     {
-        "id":           "professional",
-        "name":         "Professional",
-        "price_usd":    49,
+        "id":           "pro",
+        "name":         "Pro",
+        "price_usd":    79,
         "period":       "mo",
-        "billing":      "yearly",
-        "annual_total": 588,
+        "billing":      "monthly",
         "domain_limit": 10,
-        "scan_limit":   10,
+        "scan_limit":   None,
         "api_access":   True,
         "bulk_upload":  True,
         "features": [
-            "2–10 domains",
-            "10 scans per domain per year",
-            "22-check full scan engine",
-            "Risk dashboard & email alerts",
-            "PDF report + email delivery",
-            "Bulk domain upload",
+            "Up to 10 domains",
+            "Unlimited rescans",
+            "Full 22-check scan engine",
+            "PDF reports + email alerts",
+            "API & MCP access",
+            "NIS2 compliance check",
+            "Domain ownership verification",
             "Priority support",
         ],
-        "cta_label": "Upgrade to Professional",
+        "cta_label": "Upgrade to Pro",
+        "checkout_url": None,
+        "highlight": True,
+    },
+    {
+        "id":           "business",
+        "name":         "Business",
+        "price_usd":    299,
+        "period":       "mo",
+        "billing":      "monthly",
+        "domain_limit": 100,
+        "scan_limit":   None,
+        "api_access":   True,
+        "bulk_upload":  True,
+        "features": [
+            "Up to 100 domains",
+            "Everything in Pro",
+            "Shodan attack surface intel",
+            "ParanoidLab breach intel",
+            "Authenticated scan (cookie/session)",
+            "Supply chain monitoring",
+            "Bulk domain import",
+            "Dedicated account manager",
+        ],
+        "cta_label": "Upgrade to Business",
         "checkout_url": None,
     },
     {
-        "id":           "platform",
-        "name":         "Platform",
+        "id":           "enterprise",
+        "name":         "Enterprise",
         "price_usd":    None,
         "period":       None,
         "billing":      None,
@@ -6682,18 +6731,26 @@ PLANS = [
         "api_access":   True,
         "bulk_upload":  True,
         "features": [
-            "Unlimited domains",
-            "Pay per request / domain scan",
-            "Custom scan volume & pricing",
+            "100+ domains (custom volume)",
+            "Everything in Business",
+            "SIEM integration & webhooks",
             "White-label dashboard",
-            "API integration & webhooks",
-            "Dedicated account manager",
-            "Custom SLA",
+            "Custom SLA & uptime guarantee",
+            "SSO / SAML",
+            "On-premise deployment option",
         ],
         "cta_label": "Talk to Sales",
         "checkout_url": None,
     },
 ]
+
+# Backwards-compatible plan ID aliases (legacy Stripe plan names → current plan)
+_PLAN_ALIASES = {
+    "professional": "pro",
+    "platform":     "enterprise",
+    "annual":       "pro",
+    "one_time":     "free",
+}
 
 
 @app.get("/plans")
@@ -6727,16 +6784,17 @@ def get_user_plan(authorization: str = Header(None)):
     purchases = db.table("purchases").select("amount_usd,paid_at,plan").eq("user_id", uid)\
         .not_.is_("paid_at", "null").execute()
 
-    # Prefer explicit plan column if present; fall back to amount heuristic
+    # Prefer explicit plan column; normalise through aliases; fall back to amount heuristic
     plan_ids_paid = {p.get("plan") for p in (purchases.data or []) if p.get("plan")}
-    if "professional" in plan_ids_paid or "platform" in plan_ids_paid:
-        plan_id = "professional" if "platform" not in plan_ids_paid else "platform"
-    elif plan_ids_paid - {"free", None}:
-        # Legacy plan IDs (starter, enterprise, annual, one_time) → treat as professional
-        plan_id = "professional"
+    # Normalise legacy names
+    normalised = {_PLAN_ALIASES.get(pid, pid) for pid in plan_ids_paid if pid}
+    priority = {"enterprise": 4, "business": 3, "pro": 2, "free": 0}
+    active = max(normalised, key=lambda x: priority.get(x, 0), default=None) if normalised else None
+    if active and active != "free":
+        plan_id = active
     else:
         total_paid = sum(p.get("amount_usd") or 0 for p in (purchases.data or []))
-        plan_id = "professional" if total_paid >= 49 else "free"
+        plan_id = "pro" if total_paid >= 49 else "free"
 
     plan = next((p for p in PLANS if p["id"] == plan_id), PLANS[0])
     return {
