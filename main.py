@@ -3371,14 +3371,33 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.ln(6)
 
     # ── Section title: Security Checks ──────────────────────────────────────
-    pdf.set_x(18)
-    pdf.set_font(FONT_BODY, "", 8)
-    pdf.set_text_color(*C_LIME)
-    pdf.cell(0, 5, "SECURITY CHECKS", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
+    # ── Business groups (mirrors domain.html BUSINESS_GROUPS) ───────────────────────
+    PDF_GROUPS = [
+        ("Active Threats",            ["urlhaus","safebrowsing","virustotal","spamhaus","breach","paranoidlab"]),
+        ("Confirmed Vulnerabilities", ["nuclei","cve","cve_exposure","injection","ssrf","auth_security","integrity"]),
+        ("Email & Deliverability",    ["spf","dmarc","dkim","mx","bimi","email_security"]),
+        ("Identity & Encryption",     ["cert_valid","cert_expiry","cert_chain","tls_version","ssl_grade","ssl","hsts","https_redirect"]),
+        ("Configuration Gaps",        ["csp","x_frame_options","x_content_type","referrer_policy","permissions_policy","cors","headers","http_security","www_redirect","dnssec","caa"]),
+        ("Exposure Surface",          ["open_ports","ports","admin_panel","directory_listing","waf","subdomains","software_disclosure","server_header","cms_version","sca","sast","iac","dast"]),
+        ("Infrastructure",            ["dns","whois","cms","typosquat","ip_intel","performance"]),
+    ]
+    _STATUS_SORT = {"critical": 0, "fail": 0, "error": 1, "warning": 2, "ok": 3, "pass": 3}
 
-    # ── Checks ──────────────────────────────────────────────────────────────
-    for c in non_ai:
+    def _check_group(key):
+        for gname, gchecks in PDF_GROUPS:
+            if key in gchecks:
+                return gname
+        return "Infrastructure"
+
+    grouped: dict = {}
+    for _gc in non_ai:
+        _gg = _check_group(_gc.get("check", ""))
+        grouped.setdefault(_gg, []).append(_gc)
+    for _gg in grouped:
+        grouped[_gg].sort(key=lambda _c: _STATUS_SORT.get(_c.get("status", "ok"), 3))
+
+    def _render_card(c):
+        nonlocal pdf
         status  = c.get("status", "ok")
         chk_key = c.get("check", "")
         label   = _pdf_safe(CHECK_LABELS.get(chk_key, chk_key.replace("_", " ").upper()))
@@ -3386,69 +3405,83 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
         detail  = _pdf_safe(c.get("detail", ""))
         s_color = STATUS_COLOR.get(status, C_GREY)
         s_label = STATUS_LABEL.get(status, status.upper())
-
-        card_x = 18
-        card_w = 174
-        row_h  = 8
-
-        # Estimate card height
+        card_x  = 18
+        card_w  = 174
         needs_detail = detail and status in ("critical", "warning")
-        card_h = row_h + (10 if needs_detail else 0)
-
-        # Page break guard — add new page and fill background
+        card_h  = 8 + (10 if needs_detail else 0)
         if pdf.get_y() + card_h + 4 > 275:
             pdf.add_page()
             pdf.set_fill_color(*C_DARK)
             pdf.rect(0, 0, 210, 297, style="F")
             pdf.ln(4)
-
         card_y = pdf.get_y()
-
-        # Card background
         pdf.set_fill_color(*C_CARD)
         pdf.set_draw_color(*C_BORDER)
         pdf.rect(card_x, card_y, card_w, card_h + 4, style="F")
-
-        # Severity left strip (3px)
         pdf.set_fill_color(*s_color)
         pdf.rect(card_x, card_y, 3, card_h + 4, style="F")
-
-        # Status badge
         pdf.set_xy(card_x + 5, card_y + 1.5)
         pdf.set_fill_color(*s_color)
         bw = 18
         pdf.set_font(FONT_MONO, "B", 6)
         pdf.set_text_color(*C_DARK)
         pdf.cell(bw, 5, s_label, fill=True, align="C", new_x="RIGHT", new_y="TOP")
-
-        # Check name (monospace, muted)
         pdf.set_x(pdf.get_x() + 2)
         pdf.set_font(FONT_MONO, "", 7)
         pdf.set_text_color(*C_MUTED)
         pdf.cell(38, 5, _pdf_safe(chk_key[:20]), new_x="RIGHT", new_y="TOP")
-
-        # Title (inter, white)
         pdf.set_x(pdf.get_x() + 2)
-        remaining = card_w - bw - 38 - 9
         pdf.set_font(FONT_BODY, "B", 8)
         pdf.set_text_color(*C_TEXT)
-        pdf.cell(remaining, 5, title[:80], new_x="LMARGIN", new_y="NEXT")
-
-        # Check label (full name, small muted)
+        pdf.cell(card_w - bw - 38 - 9, 5, title[:80], new_x="LMARGIN", new_y="NEXT")
         pdf.set_x(card_x + 5 + bw + 2)
         pdf.set_font(FONT_BODY, "", 7)
         pdf.set_text_color(*C_MUTED)
         pdf.cell(80, 4, label[:50], new_x="LMARGIN", new_y="NEXT")
-
-        # Detail (critical/warning only)
         if needs_detail:
             pdf.set_x(card_x + 5)
             pdf.set_font(FONT_BODY, "", 7)
             pdf.set_text_color(*C_MUTED)
-            short = detail.replace("\n", "  ").replace("•", "-")[:280]
-            pdf.multi_cell(card_w - 8, 4, short)
-
+            pdf.multi_cell(card_w - 8, 4, detail.replace("\n", "  ").replace("•", "-")[:280])
         pdf.set_y(card_y + card_h + 6)
+
+    # ── Render grouped sections ──────────────────────────────────────────
+    for gname, _ in PDF_GROUPS:
+        items = grouped.get(gname)
+        if not items:
+            continue
+        g_crit = sum(1 for c in items if c.get("status") in ("critical","fail","error"))
+        g_warn = sum(1 for c in items if c.get("status") == "warning")
+        g_pass = sum(1 for c in items if c.get("status") in ("ok","pass"))
+        if pdf.get_y() + 16 > 275:
+            pdf.add_page()
+            pdf.set_fill_color(*C_DARK)
+            pdf.rect(0, 0, 210, 297, style="F")
+            pdf.ln(4)
+        hdr_y = pdf.get_y()
+        pdf.set_fill_color(*C_SURFACE)
+        pdf.rect(18, hdr_y, 174, 11, style="F")
+        pdf.set_fill_color(*C_LIME)
+        pdf.rect(18, hdr_y, 3, 11, style="F")
+        pdf.set_xy(24, hdr_y + 2)
+        pdf.set_font(FONT_BODY, "B", 8)
+        pdf.set_text_color(*C_TEXT)
+        pdf.cell(100, 5, _pdf_safe(gname.upper()), new_x="RIGHT", new_y="TOP")
+        pdf.set_xy(130, hdr_y + 2)
+        pdf.set_font(FONT_MONO, "", 7)
+        if g_crit:
+            pdf.set_text_color(*C_RED)
+            pdf.cell(22, 5, f"{g_crit} CRITICAL", new_x="RIGHT", new_y="TOP")
+        if g_warn:
+            pdf.set_text_color(*C_AMBER)
+            pdf.cell(22, 5, f"{g_warn} WARN", new_x="RIGHT", new_y="TOP")
+        if g_pass:
+            pdf.set_text_color(*C_LIME)
+            pdf.cell(18, 5, f"{g_pass} OK", new_x="RIGHT", new_y="TOP")
+        pdf.set_y(hdr_y + 13)
+        for c in items:
+            _render_card(c)
+
 
     # ── AI summary (if present) ──────────────────────────────────────────────
     ai = next((c for c in checks if c.get("check") == "ai_summary"), None)
