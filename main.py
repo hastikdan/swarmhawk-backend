@@ -1152,16 +1152,17 @@ def admin_users(
         uid = d["user_id"]
         domain_counts[uid] = domain_counts.get(uid, 0) + 1
 
+    _plan_aliases = {"professional": "pro", "annual": "pro", "one_time": "pro", "platform": "enterprise"}
     paid_counts: dict = {}
     user_plans:  dict = {}
-    priority = {"platform": 4, "professional": 3, "annual": 2, "one_time": 1, "free": 0}
+    priority = {"enterprise": 5, "platform": 4, "business": 3, "professional": 3, "pro": 2, "annual": 2, "one_time": 1, "free": 0}
     for p in (paid_res.data or []):
         uid  = p["user_id"]
         plan = p.get("plan") or ""
         paid_counts[uid] = paid_counts.get(uid, 0) + 1
         existing = user_plans.get(uid, "free")
         if priority.get(plan, 1) > priority.get(existing, 0):
-            user_plans[uid] = plan if plan else "paid"
+            user_plans[uid] = _plan_aliases.get(plan, plan) if plan else "pro"
 
     rows = []
     for u in (users_res.data or []):
