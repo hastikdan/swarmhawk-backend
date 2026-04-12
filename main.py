@@ -1107,21 +1107,27 @@ def admin_users(
     db = get_admin_db()
     offset = (page - 1) * per_page
 
-    # Fetch paginated user rows (sequential — postgrest-py singleton is not safe for concurrent use)
-    try:
-        users_res = db.table("users")\
-            .select("id,email,name,role,auth_type,created_at,last_login,deleted_at")\
-            .order("created_at", desc=True)\
-            .range(offset, offset + per_page - 1)\
-            .execute()
-    except Exception as e:
-        # Fallback: role column may not exist yet (migration 010 pending)
-        logger.warning(f"admin_users full select failed ({e}), retrying without role column")
-        users_res = db.table("users")\
-            .select("id,email,name,auth_type,created_at,last_login,deleted_at")\
-            .order("created_at", desc=True)\
-            .range(offset, offset + per_page - 1)\
-            .execute()
+    # Fetch paginated user rows — progressively drop optional columns that may not exist yet
+    _base_q = lambda cols: (
+        db.table("users").select(cols)
+        .order("created_at", desc=True)
+        .range(offset, offset + per_page - 1)
+        .execute()
+    )
+    users_res = None
+    for cols in [
+        "id,email,name,role,auth_type,created_at,last_login,deleted_at",
+        "id,email,name,auth_type,created_at,last_login,deleted_at",
+        "id,email,name,auth_type,created_at,last_login",
+        "id,email,name,auth_type,created_at",
+    ]:
+        try:
+            users_res = _base_q(cols)
+            break
+        except Exception as e:
+            logger.warning(f"admin_users select failed with cols='{cols}': {e}")
+    if users_res is None:
+        raise HTTPException(500, "Could not query users table — check DB schema")
 
     # Total count (separate query, safe to fail)
     total = 0
