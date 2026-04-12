@@ -1,7 +1,7 @@
 """
 SwarmHawk Backend API
 =====================
-FastAPI backend for the CEE Cyber Intelligence SaaS platform.
+FastAPI backend for the SwarmHawk Global Cybersecurity Intelligence platform.
 
 Endpoints:
   GET  /domains              — list user's domains
@@ -635,7 +635,7 @@ def send_welcome_and_confirm_email(to_email: str, name: str, token: str):
 
   <!-- Footer -->
   <p style="color:#3a3840;font-size:11px;margin-top:40px;font-family:monospace;line-height:1.8">
-    SwarmHawk · European Cybersecurity Intelligence<br>
+    SwarmHawk · Global Cybersecurity Intelligence<br>
     hello@swarmhawk.com · swarmhawk.com<br>
     You received this because you created an account.
   </p>
@@ -710,7 +710,7 @@ def send_account_deletion_email(to_email: str, name: str):
 
   <!-- Footer -->
   <p style="color:#3a3840;font-size:11px;margin:0;font-family:monospace;line-height:1.8">
-    SwarmHawk · European Cybersecurity Intelligence<br>
+    SwarmHawk · Global Cybersecurity Intelligence<br>
     hello@swarmhawk.com · swarmhawk.com<br>
     You received this because your account was deleted.
   </p>
@@ -778,7 +778,7 @@ def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
     VIEW REPORT →
   </a>
   <p style="color:#3a3840;font-size:11px;margin-top:40px;font-family:monospace;line-height:1.8">
-    SwarmHawk · European Cybersecurity Intelligence<br>
+    SwarmHawk · Global Cybersecurity Intelligence<br>
     hello@swarmhawk.com · swarmhawk.com
   </p>
 </div>
@@ -832,7 +832,7 @@ def send_monthly_pdf_email(to_email: str, domain: str, risk_score: int,
           </div>
           <p style="color:#aaa;font-size:13px;margin-bottom:20px">Your monthly security report is attached. It includes all check results and remediation recommendations.</p>
           <a href="{SITE_URL}/app/" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">OPEN DASHBOARD →</a>
-          <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence · Cancel anytime at swarmhawk.com</p>
+          <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · Global Cybersecurity Intelligence · Cancel anytime at swarmhawk.com</p>
         </div>
         """
         import httpx as _httpx
@@ -1982,7 +1982,7 @@ _REPORT_EMAIL_DEFAULTS = {
         f"Sign up free at <a href=\"{SITE_URL}/new/\" style=\"color:#cbff00\">swarmhawk.com</a> "
         "to monitor this domain continuously, receive alerts on new threats, and access your full interactive dashboard."
     ),
-    "footer":  "SwarmHawk · European Cybersecurity Intelligence · www.swarmhawk.com<br>This report is confidential and intended for the named recipient only.",
+    "footer":  "SwarmHawk · Global Cybersecurity Intelligence · www.swarmhawk.com<br>This report is confidential and intended for the named recipient only.",
 }
 
 _report_email_cache: dict | None = None
@@ -3288,7 +3288,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
             self.rect(0, self.get_y() - 1, 210, 16, style="F")
             self.set_font("Inter", "", 7)
             self.set_text_color(*C_MUTED)
-            self.cell(0, 6, "SwarmHawk - European Cybersecurity Intelligence - www.swarmhawk.com", align="C", new_x="LMARGIN", new_y="NEXT")
+            self.cell(0, 6, "SwarmHawk - Global Cybersecurity Intelligence - www.swarmhawk.com", align="C", new_x="LMARGIN", new_y="NEXT")
             self.cell(0, 5, f"Page {self.page_no()} - Confidential - Scan date: {scan_date}", align="C")
 
     pdf = DarkPDF(format="A4")
@@ -3338,7 +3338,7 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     pdf.set_x(10)
     pdf.set_font(FONT_BODY, "", 8)
     pdf.set_text_color(*C_MUTED)
-    pdf.cell(0, 5, _pdf_safe("Security Intelligence Report  -  European Cybersecurity"), new_x="LMARGIN", new_y="NEXT")
+    pdf.cell(0, 5, _pdf_safe("Security Intelligence Report  -  Global Cybersecurity"), new_x="LMARGIN", new_y="NEXT")
 
     pdf.set_x(10)
     pdf.set_font(FONT_MONO, "", 7)
@@ -3646,7 +3646,7 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
       <!-- Header -->
       <div style="background:#0e0d12;padding:28px 36px;border-bottom:1px solid #1a1a1a">
         <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">&#9679;SWARMHAWK</span>
-        <span style="font-family:monospace;font-size:11px;color:#444;margin-left:12px">European Cybersecurity Intelligence</span>
+        <span style="font-family:monospace;font-size:11px;color:#444;margin-left:12px">Global Cybersecurity Intelligence</span>
       </div>
 
       <!-- Body -->
@@ -7661,11 +7661,12 @@ def submit_contact_form(body: ContactFormRequest):
 
 # ── GTM: Hosting Partner Matrix ───────────────────────────────────────────────
 
-# ASN number → canonical hosting provider name.
-# ASN numbers are stable; org name strings from ip-api.com are not (same company
-# can appear as "Hetzner Online GmbH", "HETZNER-AS", "Hetzner Online AG" etc.).
-# Sources: RIPE NCC, BGPView, PeeringDB.
+# ASN number → canonical hosting provider name (global coverage).
+# ASN numbers are stable RIPE/ARIN identifiers; org name strings from ip-api.com
+# are not (same company can appear under multiple names across different IP blocks).
+# Sources: RIPE NCC, ARIN, BGPView, PeeringDB.
 _KNOWN_HOSTING_ASNS: dict[int, str] = {
+    # ── EUROPE ────────────────────────────────────────────────────────────────
     # Hetzner (DE)
     24940: "Hetzner", 213230: "Hetzner",
     # OVH / Kimsufi / SoYouStart (FR)
@@ -7696,26 +7697,28 @@ _KNOWN_HOSTING_ASNS: dict[int, str] = {
     47583: "Hostinger",
     # Infomaniak (CH)
     29222: "Infomaniak",
+    # Swisscom (CH)
+    3303: "Swisscom",
     # Serverius (NL)
     50673: "Serverius",
+    # TransIP (NL)
+    60404: "TransIP",
+    # ANEXIA (AT)
+    42473: "ANEXIA",
     # M247 (RO/UK)
     9009: "M247",
     # Interxion / Digital Realty (NL)
     8426: "Interxion",
-    # Equinix Metal / Packet (US, EU DCs)
-    54825: "Equinix Metal",
-    # DigitalOcean (US, EU DCs)
-    14061: "DigitalOcean",
-    # Vultr (US, EU DCs)
-    20473: "Vultr",
-    # Linode / Akamai Connected Cloud (US, EU DCs)
-    63949: "Linode",
-    # Amazon AWS (EU regions)
-    16509: "Amazon AWS", 14618: "Amazon AWS",
-    # Google Cloud (EU regions)
-    15169: "Google Cloud",
-    # Microsoft Azure (EU regions)
-    8075: "Microsoft Azure",
+    # Tele2 (SE)
+    1257: "Tele2",
+    # Telia (SE/FI/EU)
+    1299: "Telia",
+    # Deutsche Telekom (DE — many SMB servers on business lines)
+    3320: "Deutsche Telekom",
+    # Orange / France Telecom (FR)
+    3215: "Orange",
+    # SiteGround (BG)
+    35574: "SiteGround",
     # Selectel (RU)
     49505: "Selectel",
     # TimeWeb (RU)
@@ -7724,32 +7727,174 @@ _KNOWN_HOSTING_ASNS: dict[int, str] = {
     47764: "Miran",
     # DataLine (RU)
     50544: "DataLine",
-    # Namecheap (US, EU DCs)
-    22612: "Namecheap",
-    # GoDaddy (US)
+    # Rostelecom (RU)
+    12389: "Rostelecom",
+    # RETN (RU/EU backbone)
+    9002: "RETN",
+
+    # ── NORTH AMERICA ─────────────────────────────────────────────────────────
+    # Amazon AWS (global)
+    16509: "Amazon AWS", 14618: "Amazon AWS", 7224: "Amazon AWS",
+    # Google Cloud (global)
+    15169: "Google Cloud", 396982: "Google Cloud",
+    # Microsoft Azure (global)
+    8075: "Microsoft Azure",
+    # DigitalOcean (global DCs)
+    14061: "DigitalOcean",
+    # Vultr (global DCs)
+    20473: "Vultr",
+    # Linode / Akamai Connected Cloud
+    63949: "Linode",
+    # Equinix Metal / Packet
+    54825: "Equinix Metal",
+    # GoDaddy
     26496: "GoDaddy", 21281: "GoDaddy",
+    # Namecheap
+    22612: "Namecheap",
     # Newfold Digital / Bluehost / HostGator
     46606: "Newfold Digital",
     # DreamHost
     26347: "DreamHost",
-    # SiteGround (BG)
-    35574: "SiteGround",
     # WP Engine
     39823: "WP Engine",
     # A2 Hosting
     55286: "A2 Hosting",
-    # Tele2 (SE)
-    1257: "Tele2",
-    # Cogent (transit + hosting)
+    # Rackspace
+    33070: "Rackspace", 27357: "Rackspace",
+    # Zayo (US backbone + hosting)
+    6461: "Zayo",
+    # Hurricane Electric (US, global DCs)
+    6939: "Hurricane Electric",
+    # Cogent (US, transit + hosting)
     174: "Cogent",
-    # Lumen / CenturyLink (US)
-    3356: "Lumen",
-    # Deutsche Telekom (DE ISP — many SMB servers on consumer lines)
-    3320: "Deutsche Telekom",
-    # Orange / France Telecom (FR ISP)
-    3215: "Orange",
-    # Telia (SE/FI)
-    1299: "Telia",
+    # Lumen / CenturyLink
+    3356: "Lumen", 22773: "Lumen",
+    # NTT Ltd (global)
+    2914: "NTT",
+    # GTT Communications
+    3257: "GTT",
+    # IBM Cloud (SoftLayer)
+    36351: "IBM Cloud", 36459: "IBM Cloud",
+
+    # ── LATIN AMERICA ─────────────────────────────────────────────────────────
+    # Claro Brasil / Embratel
+    4230: "Claro Brasil", 28573: "Claro Brasil",
+    # NET Virtua (Claro)
+    4230: "Claro Brasil",
+    # Oi Telecom (BR)
+    7738: "Oi",
+    # Localweb (BR)
+    262514: "Localweb",
+    # HostGator Brasil
+    262621: "HostGator Brasil",
+    # KingHost (BR)
+    52925: "KingHost",
+    # Telmex / Claro Mexico
+    8151: "Telmex",
+    # Megacable (MX)
+    17072: "Megacable",
+    # Axtel / Alestra (MX)
+    22884: "Axtel",
+    # Fibertel / Cablevision (AR)
+    11664: "Fibertel",
+    # Telecom Argentina
+    10481: "Telecom Argentina",
+    # Entel (CL)
+    27651: "Entel",
+    # Antel (UY)
+    6057: "Antel",
+    # Telefonica (LATAM)
+    3816: "Telefonica",
+
+    # ── ASIA PACIFIC ──────────────────────────────────────────────────────────
+    # Alibaba Cloud (Aliyun)
+    45102: "Alibaba Cloud", 37963: "Alibaba Cloud", 134963: "Alibaba Cloud",
+    # Tencent Cloud
+    45090: "Tencent Cloud", 132203: "Tencent Cloud",
+    # Huawei Cloud
+    55990: "Huawei Cloud", 136907: "Huawei Cloud",
+    # China Telecom
+    4134: "China Telecom", 4809: "China Telecom",
+    # China Unicom
+    4837: "China Unicom", 9929: "China Unicom",
+    # China Mobile
+    9808: "China Mobile", 56040: "China Mobile",
+    # NTT Communications (JP)
+    4713: "NTT Communications",
+    # SoftBank (JP)
+    17676: "SoftBank",
+    # KDDI (JP)
+    7506: "KDDI",
+    # IIJ (JP)
+    2497: "IIJ",
+    # Korea Telecom (KR)
+    4766: "Korea Telecom",
+    # SK Broadband (KR)
+    9318: "SK Broadband",
+    # LG Uplus (KR)
+    17858: "LG Uplus",
+    # Telstra (AU)
+    1221: "Telstra",
+    # Optus (AU)
+    4804: "Optus",
+    # TPG Telecom (AU)
+    7545: "TPG",
+    # Singtel (SG)
+    7473: "Singtel",
+    # StarHub (SG)
+    9506: "StarHub",
+    # PCCW Global (HK)
+    3491: "PCCW",
+    # BSNL (IN)
+    9829: "BSNL",
+    # Reliance Jio (IN)
+    55836: "Jio",
+    # Bharti Airtel (IN)
+    24560: "Airtel",
+    # TATA Communications (IN/global)
+    6453: "TATA Communications",
+    # Exabytes (MY/SG)
+    45839: "Exabytes",
+    # Zenlayer (global edge, Asia-heavy)
+    21859: "Zenlayer",
+
+    # ── MIDDLE EAST ───────────────────────────────────────────────────────────
+    # du Telecom / EITC (UAE)
+    15802: "du Telecom",
+    # Etisalat / e& (UAE)
+    5384: "Etisalat",
+    # STC (Saudi Arabia)
+    25019: "STC",
+    # Mobily (Saudi Arabia)
+    39386: "Mobily",
+    # Bezeq International (IL)
+    8551: "Bezeq",
+    # Partner Communications (IL)
+    12400: "Partner",
+    # Hot Mobile (IL)
+    6845: "Hot",
+    # Qatar Telecom (QA)
+    8781: "Qatar Telecom",
+    # Turk Telekom (TR)
+    9121: "Turk Telekom",
+    # Türk Telekomunikasyon (TR)
+    34984: "Superonline",
+
+    # ── AFRICA ────────────────────────────────────────────────────────────────
+    # MTN (ZA/Africa)
+    20294: "MTN",
+    # Hetzner South Africa
+    37153: "Hetzner SA",
+    # Afrihost (ZA)
+    36937: "Afrihost",
+    # SEACOM (EA/SA)
+    37100: "SEACOM",
+    # Liquid Telecom / Liquid Intelligent
+    30844: "Liquid Telecom",
+    # Safaricom (KE)
+    33771: "Safaricom",
+    # Maroc Telecom (MA)
+    6713: "Maroc Telecom",
 }
 
 # Pure CDN/proxy ASNs — these mask the real hosting provider and should be
@@ -7764,6 +7909,10 @@ _CDN_ASNS: frozenset[int] = frozenset({
     23455,  # Akamai Technologies
     17334,  # Akamai Technologies
     12222,  # Akamai Technologies
+    32787,  # Internap / Instart Logic (CDN)
+    60068,  # CDN77
+    136165, # PCCW CDN
+    209242, # Cloudflare CDN (additional range)
 })
 
 
@@ -7802,12 +7951,8 @@ def _resolve_hoster(ip_asn: str | None, ip_org: str | None) -> str | None:
     return cleaned
 
 
-_GTM_EUROPEAN_COUNTRIES = frozenset({
-    "DE","FR","NL","PL","CZ","SK","AT","HU","RO","BG","HR","SI","LT","LV",
-    "EE","SE","NO","DK","FI","BE","CH","PT","ES","IT","IE","GR","CY","MT",
-    "LU","IS","LI","MC","AD","SM","UA","RS","ME","MK","AL","BA","XK","BY",
-    "MD","GE","AM","AZ","RU",
-})
+# No country filter — GTM matrix is now global. All ISO country codes are valid.
+_GTM_KNOWN_COUNTRIES: frozenset[int] = frozenset()  # reserved for future allow-list
 
 
 @app.get("/gtm/hosting-matrix")
@@ -7817,8 +7962,8 @@ def gtm_hosting_matrix(authorization: str = Header(None)):
     Matches each domain to its canonical hosting provider via ASN number lookup
     (stable identifier from ip-api.com's 'as' field), with ip_org string fallback.
     Pure CDN proxies (Cloudflare, Fastly, Akamai) are excluded — they mask the
-    real datacenter. Use this to identify which hosting partners have the most
-    vulnerable customer domains, driving targeted B2B outreach.
+    real datacenter. Global scope — all countries. Use this to identify which
+    hosting partners worldwide have the most vulnerable customer domains.
     """
     require_admin(authorization)
     db = get_admin_db()
@@ -7839,8 +7984,6 @@ def gtm_hosting_matrix(authorization: str = Header(None)):
     matrix: dict[str, dict[str, dict]] = {}
     for r in data:
         cc = (r.get("country") or "GLOBAL").upper()
-        if cc not in _GTM_EUROPEAN_COUNTRIES:
-            continue
 
         hoster = _resolve_hoster(r.get("ip_asn"), r.get("ip_org"))
         if not hoster:

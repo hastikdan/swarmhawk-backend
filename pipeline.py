@@ -536,13 +536,25 @@ def fetch_ct_logs_recent(tlds: list[str] | None = None, limit: int = CT_LIMIT) -
     Covers newly registered domains that appear in certificate transparency logs.
     """
     if tlds is None:
-        # gTLDs with high registration volume + key ccTLDs
-        tlds = ["com", "net", "org", "io", "ai", "de", "uk", "fr", "pl", "cz"]
+        # Global TLD rotation: gTLDs + key ccTLDs across all regions.
+        # Rotated across 6 runs (~daily) so each TLD gets coverage over time.
+        tlds = [
+            # Global gTLDs (highest volume)
+            "com", "net", "org", "io", "ai", "app", "dev", "co",
+            # EU/EMEA ccTLDs
+            "de", "uk", "fr", "nl", "pl", "cz", "es", "it", "se", "ch",
+            # APAC ccTLDs
+            "au", "jp", "in", "sg", "kr", "cn", "nz", "hk",
+            # LATAM ccTLDs
+            "br", "mx", "ar", "cl", "co",
+            # MEA ccTLDs
+            "za", "ae", "il",
+        ]
 
     domains: set[str] = set()
     domain_re = re.compile(r'^[a-z0-9][a-z0-9\-\.]{1,253}[a-z0-9]$')
 
-    for tld in tlds[:5]:  # cap at 5 TLDs per run to respect rate limits
+    for tld in tlds[:6]:  # cap at 6 TLDs per run to respect crt.sh rate limits
         try:
             r = req.get(
                 "https://crt.sh/",
