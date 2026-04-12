@@ -7661,50 +7661,200 @@ def submit_contact_form(body: ContactFormRequest):
 
 # ── GTM: Hosting Partner Matrix ───────────────────────────────────────────────
 
+# ASN number → canonical hosting provider name.
+# ASN numbers are stable; org name strings from ip-api.com are not (same company
+# can appear as "Hetzner Online GmbH", "HETZNER-AS", "Hetzner Online AG" etc.).
+# Sources: RIPE NCC, BGPView, PeeringDB.
+_KNOWN_HOSTING_ASNS: dict[int, str] = {
+    # Hetzner (DE)
+    24940: "Hetzner", 213230: "Hetzner",
+    # OVH / Kimsufi / SoYouStart (FR)
+    16276: "OVH", 35540: "OVH",
+    # Contabo (DE)
+    51167: "Contabo",
+    # Ionos / 1&1 (DE)
+    8560: "Ionos",
+    # Strato (DE, Ionos-owned)
+    6724: "Strato",
+    # Scaleway / Online SAS / Iliad (FR)
+    12876: "Scaleway",
+    # LeaseWeb (NL)
+    28753: "LeaseWeb", 60781: "LeaseWeb",
+    # Host Europe / GoDaddy (DE)
+    20773: "Host Europe",
+    # Aruba (IT)
+    31034: "Aruba",
+    # myLoc (DE)
+    24961: "myLoc",
+    # netcup (DE)
+    197540: "netcup",
+    # vshosting (CZ)
+    197019: "vshosting",
+    # Master Internet (CZ)
+    24971: "Master Internet",
+    # Hostinger (LT)
+    47583: "Hostinger",
+    # Infomaniak (CH)
+    29222: "Infomaniak",
+    # Serverius (NL)
+    50673: "Serverius",
+    # M247 (RO/UK)
+    9009: "M247",
+    # Interxion / Digital Realty (NL)
+    8426: "Interxion",
+    # Equinix Metal / Packet (US, EU DCs)
+    54825: "Equinix Metal",
+    # DigitalOcean (US, EU DCs)
+    14061: "DigitalOcean",
+    # Vultr (US, EU DCs)
+    20473: "Vultr",
+    # Linode / Akamai Connected Cloud (US, EU DCs)
+    63949: "Linode",
+    # Amazon AWS (EU regions)
+    16509: "Amazon AWS", 14618: "Amazon AWS",
+    # Google Cloud (EU regions)
+    15169: "Google Cloud",
+    # Microsoft Azure (EU regions)
+    8075: "Microsoft Azure",
+    # Selectel (RU)
+    49505: "Selectel",
+    # TimeWeb (RU)
+    9123: "TimeWeb",
+    # Miran (RU)
+    47764: "Miran",
+    # DataLine (RU)
+    50544: "DataLine",
+    # Namecheap (US, EU DCs)
+    22612: "Namecheap",
+    # GoDaddy (US)
+    26496: "GoDaddy", 21281: "GoDaddy",
+    # Newfold Digital / Bluehost / HostGator
+    46606: "Newfold Digital",
+    # DreamHost
+    26347: "DreamHost",
+    # SiteGround (BG)
+    35574: "SiteGround",
+    # WP Engine
+    39823: "WP Engine",
+    # A2 Hosting
+    55286: "A2 Hosting",
+    # Tele2 (SE)
+    1257: "Tele2",
+    # Cogent (transit + hosting)
+    174: "Cogent",
+    # Lumen / CenturyLink (US)
+    3356: "Lumen",
+    # Deutsche Telekom (DE ISP — many SMB servers on consumer lines)
+    3320: "Deutsche Telekom",
+    # Orange / France Telecom (FR ISP)
+    3215: "Orange",
+    # Telia (SE/FI)
+    1299: "Telia",
+}
+
+# Pure CDN/proxy ASNs — these mask the real hosting provider and should be
+# excluded from the hosting matrix (the domain's actual server is elsewhere).
+_CDN_ASNS: frozenset[int] = frozenset({
+    13335,  # Cloudflare
+    54113,  # Fastly
+    20940,  # Akamai Technologies
+    16625,  # Akamai Technologies
+    35994,  # Akamai Technologies
+    22207,  # Akamai Technologies
+    23455,  # Akamai Technologies
+    17334,  # Akamai Technologies
+    12222,  # Akamai Technologies
+})
+
+
+import re as _gtm_re
+
+def _resolve_hoster(ip_asn: str | None, ip_org: str | None) -> str | None:
+    """Return canonical hosting provider name from ASN, or None for CDN/unknown.
+
+    Resolution order:
+    1. Parse ASN number from ip_asn field (e.g. "AS24940 Hetzner Online GmbH")
+    2. If ASN is in _CDN_ASNS → return None (pure proxy, skip)
+    3. If ASN is in _KNOWN_HOSTING_ASNS → return canonical name
+    4. Fall back to cleaned ip_org string (strip "ASxxxxx " prefix)
+    5. CDN name-string fallback check on ip_org
+    """
+    asn_num: int | None = None
+    if ip_asn:
+        m = _gtm_re.match(r"AS(\d+)", ip_asn.strip(), _gtm_re.IGNORECASE)
+        if m:
+            asn_num = int(m.group(1))
+
+    if asn_num is not None:
+        if asn_num in _CDN_ASNS:
+            return None
+        if asn_num in _KNOWN_HOSTING_ASNS:
+            return _KNOWN_HOSTING_ASNS[asn_num]
+
+    # Fallback: clean ip_org text
+    raw = (ip_org or "").strip()
+    cleaned = _gtm_re.sub(r"^AS\d+\s+", "", raw).strip()[:80]
+    if not cleaned:
+        return None
+    low = cleaned.lower()
+    if any(cdn in low for cdn in ("cloudflare", "fastly", "akamai technologies")):
+        return None
+    return cleaned
+
+
+_GTM_EUROPEAN_COUNTRIES = frozenset({
+    "DE","FR","NL","PL","CZ","SK","AT","HU","RO","BG","HR","SI","LT","LV",
+    "EE","SE","NO","DK","FI","BE","CH","PT","ES","IT","IE","GR","CY","MT",
+    "LU","IS","LI","MC","AD","SM","UA","RS","ME","MK","AL","BA","XK","BY",
+    "MD","GE","AM","AZ","RU",
+})
+
+
 @app.get("/gtm/hosting-matrix")
 def gtm_hosting_matrix(authorization: str = Header(None)):
     """Admin only. Returns Country × Hosting Provider matrix from scan_results.
 
-    For each country, shows which hosting organisations have the most
-    vulnerable customer domains — the core data for B2B partner outreach.
+    Matches each domain to its canonical hosting provider via ASN number lookup
+    (stable identifier from ip-api.com's 'as' field), with ip_org string fallback.
+    Pure CDN proxies (Cloudflare, Fastly, Akamai) are excluded — they mask the
+    real datacenter. Use this to identify which hosting partners have the most
+    vulnerable customer domains, driving targeted B2B outreach.
     """
     require_admin(authorization)
     db = get_admin_db()
 
-    # Pull every scanned domain that has ip_org set — lightweight columns only
+    # ip_asn stores "AS24940 Hetzner Online GmbH" — we need it for ASN lookup.
+    # ip_org stores the raw org string — fallback when ASN not in known map.
     try:
         rows = db.table("scan_results")\
-            .select("country,ip_org,risk_score,dmarc_status,spf_status,outreach_status")\
-            .not_.is_("ip_org", "null")\
-            .neq("ip_org", "")\
+            .select("country,ip_asn,ip_org,risk_score,outreach_status")\
+            .not_.is_("ip_asn", "null")\
+            .neq("ip_asn", "")\
             .execute()
         data = rows.data or []
     except Exception as e:
         raise HTTPException(500, f"DB query failed: {e}")
 
-    import re as _re
-
-    def _clean_org(raw: str) -> str:
-        """Strip leading 'ASxxxxx ' prefix and normalise."""
-        return _re.sub(r"^AS\d+\s+", "", raw).strip()[:80]
-
-    # Build: { country: { org: { domains, critical, warning, clean, outreach_ready } } }
+    # Build: { country: { canonical_hoster: { domains, critical, warning, clean, outreach_ready } } }
     matrix: dict[str, dict[str, dict]] = {}
     for r in data:
-        cc  = (r.get("country") or "GLOBAL").upper()
-        org = _clean_org(r.get("ip_org") or "")
-        if not org or org.lower() in ("cloudflare", "cloudflare, inc.", "fastly"):
-            # Skip pure CDN proxies — they don't indicate real hosting
+        cc = (r.get("country") or "GLOBAL").upper()
+        if cc not in _GTM_EUROPEAN_COUNTRIES:
             continue
+
+        hoster = _resolve_hoster(r.get("ip_asn"), r.get("ip_org"))
+        if not hoster:
+            continue  # CDN proxy or unresolvable
+
         score  = r.get("risk_score") or 0
         status = r.get("outreach_status") or ""
 
         if cc not in matrix:
             matrix[cc] = {}
-        if org not in matrix[cc]:
-            matrix[cc][org] = {"domains": 0, "critical": 0, "warning": 0,
-                                "clean": 0, "outreach_ready": 0}
-        b = matrix[cc][org]
+        if hoster not in matrix[cc]:
+            matrix[cc][hoster] = {"domains": 0, "critical": 0, "warning": 0,
+                                   "clean": 0, "outreach_ready": 0}
+        b = matrix[cc][hoster]
         b["domains"] += 1
         if score >= 70:
             b["critical"] += 1
@@ -7715,33 +7865,22 @@ def gtm_hosting_matrix(authorization: str = Header(None)):
         if status in ("pending", "approved"):
             b["outreach_ready"] += 1
 
-    # Reshape to sorted list per country, hosters sorted by critical desc
-    EUROPEAN_COUNTRIES = {
-        "DE","FR","NL","PL","CZ","SK","AT","HU","RO","BG","HR","SI","LT","LV",
-        "EE","SE","NO","DK","FI","BE","CH","PT","ES","IT","IE","GR","CY","MT",
-        "LU","IS","LI","MC","AD","SM","UA","RS","ME","MK","AL","BA","XK","BY",
-        "MD","GE","AM","AZ","RU",
-    }
     result = []
     for cc, hosters in matrix.items():
-        if cc not in EUROPEAN_COUNTRIES:
-            continue
-        hoster_list = []
-        for org, stats in hosters.items():
-            if stats["domains"] < 2:  # skip noise
-                continue
-            hoster_list.append({"hoster": org, **stats})
+        hoster_list = [
+            {"hoster": h, **s}
+            for h, s in hosters.items()
+            if s["domains"] >= 2  # suppress single-domain noise
+        ]
         hoster_list.sort(key=lambda x: (x["critical"], x["domains"]), reverse=True)
         if hoster_list:
             result.append({
-                "country": cc,
-                "hosters": hoster_list[:20],  # top 20 per country
-                "total_domains":   sum(h["domains"] for h in hoster_list),
-                "total_critical":  sum(h["critical"] for h in hoster_list),
-                "total_outreach":  sum(h["outreach_ready"] for h in hoster_list),
+                "country":       cc,
+                "hosters":       hoster_list[:20],
+                "total_domains":  sum(h["domains"] for h in hoster_list),
+                "total_critical": sum(h["critical"] for h in hoster_list),
+                "total_outreach": sum(h["outreach_ready"] for h in hoster_list),
             })
 
     result.sort(key=lambda x: x["total_critical"], reverse=True)
     return {"countries": result, "generated_at": datetime.now(timezone.utc).isoformat()}
-
-    return {"ok": True, "delivered_to": to_email}
