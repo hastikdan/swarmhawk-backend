@@ -1318,38 +1318,52 @@ def admin_stats(authorization: str = Header(None)):
                 check_counts[name] = {"critical": 0, "warning": 0, "ok": 0, "error": 0}
             check_counts[name][st] = check_counts[name].get(st, 0) + 1
 
-    # Industry × risk breakdown
-    # domain_id → industry (only domains that have an industry tag)
-    domain_industry = {d["id"]: d["industry"] for d in domains.data if d.get("industry")}
-    industry_stats: dict[str, dict] = {}
-    for s in scanned_domains:
-        ind = domain_industry.get(s.get("domain_id", ""))
-        if not ind:
-            continue
-        if ind not in industry_stats:
-            industry_stats[ind] = {"industry": ind, "domains": 0, "critical": 0, "warning": 0, "clean": 0, "total_score": 0}
-        score = s.get("risk_score") or 0
-        industry_stats[ind]["domains"]     += 1
-        industry_stats[ind]["total_score"] += score
-        if score >= 70:
-            industry_stats[ind]["critical"] += 1
-        elif score >= 30:
-            industry_stats[ind]["warning"]  += 1
-        else:
-            industry_stats[ind]["clean"]    += 1
-    # Compute avg and sort by critical desc, then total domains desc
+    # Industry × risk breakdown — dedicated lightweight query (no limit, no checks column)
+    # so all tagged domains are counted regardless of how many total scans exist.
     industry_risk = []
-    for ind, s in industry_stats.items():
-        n = s["domains"]
-        industry_risk.append({
-            "industry": ind,
-            "domains":  n,
-            "critical": s["critical"],
-            "warning":  s["warning"],
-            "clean":    s["clean"],
-            "avg_risk": round(s["total_score"] / n, 1) if n else 0,
-        })
-    industry_risk.sort(key=lambda x: (x["critical"], x["domains"]), reverse=True)
+    domain_industry = {d["id"]: d["industry"] for d in domains.data if d.get("industry")}
+    if domain_industry:
+        try:
+            ind_scans = db.table("scans")\
+                .select("domain_id,risk_score")\
+                .in_("domain_id", list(domain_industry.keys()))\
+                .order("scanned_at", desc=True)\
+                .execute()
+            # Keep only the latest scan per domain
+            latest_ind: dict = {}
+            for s in (ind_scans.data or []):
+                did = s["domain_id"]
+                if did not in latest_ind:
+                    latest_ind[did] = s.get("risk_score") or 0
+            # Bucket by industry
+            ind_stats: dict = {}
+            for did, score in latest_ind.items():
+                ind = domain_industry.get(did)
+                if not ind:
+                    continue
+                if ind not in ind_stats:
+                    ind_stats[ind] = {"domains": 0, "critical": 0, "warning": 0, "clean": 0, "total_score": 0}
+                ind_stats[ind]["domains"]     += 1
+                ind_stats[ind]["total_score"] += score
+                if score >= 70:
+                    ind_stats[ind]["critical"] += 1
+                elif score >= 30:
+                    ind_stats[ind]["warning"]  += 1
+                else:
+                    ind_stats[ind]["clean"]    += 1
+            for ind, s in ind_stats.items():
+                n = s["domains"]
+                industry_risk.append({
+                    "industry": ind,
+                    "domains":  n,
+                    "critical": s["critical"],
+                    "warning":  s["warning"],
+                    "clean":    s["clean"],
+                    "avg_risk": round(s["total_score"] / n, 1) if n else 0,
+                })
+            industry_risk.sort(key=lambda x: (x["critical"], x["domains"]), reverse=True)
+        except Exception as e:
+            print(f"[admin/stats] industry_risk build failed: {e}")
 
     # Top 10 riskiest domains
     domain_map = {d["id"]: d["domain"] for d in domains.data}
