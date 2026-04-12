@@ -848,17 +848,17 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
                 reachable_queue.append(row)  # on error assume reachable
 
     if dead_ids:
-        # Park dead domains 30 days out instead of deleting.
+        # Park dead domains 7 days out instead of deleting.
         # Deleting causes daily discovery to immediately re-add them (skip_scan_check=True
         # for bulk sources), creating an infinite dead-domain recycling loop.
         # With queued_at far in future, ON CONFLICT DO NOTHING keeps them parked,
-        # and the priority/queued_at ordering won't surface them for 30 days.
-        snooze_until = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        # and the priority/queued_at ordering won't surface them for 7 days.
+        snooze_until = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
         try:
             db.table("domain_queue").update({"queued_at": snooze_until}).in_("id", dead_ids).execute()
         except Exception:
             pass
-        log.info(f"[tier1_batch] pre-filter: {len(dead_ids)} dead domains parked 30d, "
+        log.info(f"[tier1_batch] pre-filter: {len(dead_ids)} dead domains parked 7d, "
                  f"{len(reachable_queue)} reachable queued")
     queue = reachable_queue
     if not queue:
@@ -1112,14 +1112,26 @@ def run_bulk_discovery_job():
 
 
 def run_pipeline_daily():
-    """Combined daily pipeline job (02:00 Prague).
+    """Tier 1 batch job — runs every PIPELINE_TIER1_INTERVAL_MINUTES (default 10).
 
-    Runs after run_discovery_job has populated the queue.
-    Processes domain_queue with Tier 1 scans.
+    Auto-triggers discovery when the queue drops below 10K so the pipeline
+    never starves — no manual intervention needed.
     """
     global _last_tier1_run, _last_tier1_scanned
-    log.info("[pipeline_daily] starting Tier 1 batch processing")
     db = _get_db()
+
+    # Auto-refill: if queue is nearly empty, run discovery first so we always
+    # have a supply of fresh domains to scan.
+    try:
+        queue_count = db.table("domain_queue").select("id", count="exact")\
+            .lte("queued_at", datetime.now(timezone.utc).isoformat()).execute().count or 0
+        if queue_count < 10_000:
+            log.info(f"[pipeline_daily] queue low ({queue_count:,}) — running discovery first")
+            run_discovery_job()
+    except Exception as e:
+        log.warning(f"[pipeline_daily] queue check failed: {e}")
+
+    log.info("[pipeline_daily] starting Tier 1 batch processing")
     scanned = run_tier1_batch(db=db, batch_size=TIER1_BATCH_SIZE)
     _last_tier1_run = datetime.now(timezone.utc).isoformat()
     _last_tier1_scanned = scanned

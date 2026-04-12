@@ -371,20 +371,20 @@ async def lifespan(app):
             _pipeline_scheduler = _BGS3(timezone="Europe/Prague")
             # Daily: Radar + CT logs + Majestic at 01:00
             _pipeline_scheduler.add_job(run_discovery_job,      "cron", hour=1,  minute=0,  id="pipeline_discovery")
-            # Every 30 minutes: Tier 1 batch scan (configurable via PIPELINE_TIER1_INTERVAL_MINUTES, default 30)
+            # Every 10 minutes: Tier 1 batch scan (configurable via PIPELINE_TIER1_INTERVAL_MINUTES, default 10)
             # next_run_time=datetime.now(timezone.utc) fires the first run immediately on startup
             # instead of waiting a full interval — critical after Render cold starts.
-            _tier1_interval = int(os.getenv("PIPELINE_TIER1_INTERVAL_MINUTES", "30"))
+            _tier1_interval = int(os.getenv("PIPELINE_TIER1_INTERVAL_MINUTES", "10"))
             _pipeline_scheduler.add_job(run_pipeline_daily, "interval", minutes=_tier1_interval,
                                         id="pipeline_tier1", next_run_time=datetime.now(timezone.utc))
-            # Weekly Sunday: full 22-check Tier 2 enrichment
-            _pipeline_scheduler.add_job(run_enrichment_weekly,  "cron", day_of_week="sun",  hour=3,  minute=0,  id="pipeline_tier2")
+            # Daily: Tier 2 full enrichment on a rolling batch (was weekly Sunday — too slow)
+            _pipeline_scheduler.add_job(run_enrichment_weekly,  "interval", hours=24,  id="pipeline_tier2")
             # Weekly Saturday: bulk discovery — Tranco + Umbrella (~2M domains)
             _pipeline_scheduler.add_job(run_bulk_discovery_job, "cron", day_of_week="sat",  hour=0,  minute=0,  id="pipeline_bulk_discovery")
             # Daily: CISA KEV refresh + immediate re-scoring of affected domains
             _pipeline_scheduler.add_job(run_kev_refresh_job,    "cron", hour=6,  minute=0,  id="kev_refresh")
             _pipeline_scheduler.start()
-            print(f"✓ Pipeline scheduler started (Tier1 every {_tier1_interval}min, daily discovery 01:00, Tier2 Sun 03:00, bulk Sat 00:00, KEV refresh 06:00)")
+            print(f"✓ Pipeline scheduler started (Tier1 every {_tier1_interval}min, daily discovery 01:00, Tier2 every 24h, bulk Sat 00:00, KEV refresh 06:00)")
         except Exception as e:
             print(f"Pipeline scheduler init failed: {e}")
     else:
