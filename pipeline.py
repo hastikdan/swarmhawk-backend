@@ -359,6 +359,7 @@ def upsert_scan_result(result: dict, db=None, user_id: Optional[str] = None):
         "urlhaus_status":   enrichment.get("urlhaus_status")  or result.get("urlhaus_status"),
         "ip_reputation":    enrichment.get("ip_reputation")   or result.get("ip_reputation"),
         "waf_detected":     enrichment.get("waf_detected",    result.get("waf_detected", False)),
+        "kev_matched":      bool(result.get("kev_cves")),
     }
 
     try:
@@ -1226,8 +1227,9 @@ def run_kev_refresh_job() -> int:
         })
         try:
             db.table("scan_results").update({
-                "risk_score":    boosted["risk_score"],
-                "priority":      boosted["priority"],
+                "risk_score":      boosted["risk_score"],
+                "priority":        boosted["priority"],
+                "kev_matched":     True,
                 "last_scanned_at": datetime.now(timezone.utc).isoformat(),
             }).eq("id", row["id"]).execute()
             rescored += 1
@@ -1281,9 +1283,9 @@ def get_pipeline_status(db=None) -> dict:
     except Exception:
         by_source = {}
 
-    # Intel feed metrics
+    # Intel feed metrics — count domains explicitly marked as KEV-matched
     try:
-        kev_boosted = db.table("scan_results").select("id", count="exact").gte("risk_score", 95).execute().count or 0
+        kev_boosted = db.table("scan_results").select("id", count="exact").eq("kev_matched", True).execute().count or 0
     except Exception:
         kev_boosted = -1
 
