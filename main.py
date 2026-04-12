@@ -1965,7 +1965,7 @@ _REPORT_EMAIL_DEFAULTS = {
     "body":    (
         "Your full security report for <strong>{domain}</strong> is attached as a PDF. "
         "It includes {checks_count} security checks, {criticals} critical findings, and remediation recommendations.<br><br>"
-        "Sign up free at <a href=\"https://www.swarmhawk.com\" style=\"color:#cbff00\">swarmhawk.com</a> "
+        f"Sign up free at <a href=\"{SITE_URL}/new/\" style=\"color:#cbff00\">swarmhawk.com</a> "
         "to monitor this domain continuously, receive alerts on new threats, and access your full interactive dashboard."
     ),
     "footer":  "SwarmHawk · European Cybersecurity Intelligence · www.swarmhawk.com<br>This report is confidential and intended for the named recipient only.",
@@ -2048,7 +2048,7 @@ def send_test_report_email(body: ReportEmailTestRequest, authorization: str = He
     # Build a preview using placeholder values
     tpl_vars = dict(
         domain="example.com", risk_score=72, score_label="HIGH RISK",
-        criticals=3, warnings=5, checks_count=22, scanned_at="2026-03-15",
+        criticals=3, warnings=5, checks_count=27, scanned_at="2026-03-15",
     )
     subject_tpl = body.subject or _REPORT_EMAIL_DEFAULTS["subject"]
     body_tpl    = body.body    or _REPORT_EMAIL_DEFAULTS["body"]
@@ -3667,8 +3667,8 @@ def send_report_email(body: SendReportRequest, authorization: str = Header(None)
 
         <!-- CTAs -->
         <div style="margin-bottom:28px">
-          <a href="https://www.swarmhawk.com" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:13px 26px;border-radius:6px;text-decoration:none;margin-right:12px;margin-bottom:10px">Get Free Account &#8594;</a>
-          <a href="https://www.swarmhawk.com" style="display:inline-block;background:transparent;color:#cbff00;font-family:monospace;font-weight:700;font-size:13px;padding:12px 26px;border-radius:6px;text-decoration:none;border:1px solid #cbff00;margin-bottom:10px">Full Paid Report &#8594;</a>
+          <a href="{SITE_URL}/new/" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:13px 26px;border-radius:6px;text-decoration:none;margin-right:12px;margin-bottom:10px">Get Free Account &#8594;</a>
+          <a href="{SITE_URL}/app/" style="display:inline-block;background:transparent;color:#cbff00;font-family:monospace;font-weight:700;font-size:13px;padding:12px 26px;border-radius:6px;text-decoration:none;border:1px solid #cbff00;margin-bottom:10px">Full Paid Report &#8594;</a>
         </div>
 
         <!-- Feature bullets -->

@@ -1192,7 +1192,7 @@ def send_admin_digest(found_count: int, db=None):
     </div>
     {"<h3 style='font-size:14px;margin:0 0 10px 0'>Top " + str(len(top)) + " by CVSS (all-time)</h3><table style='width:100%;border-collapse:collapse;font-size:13px'><thead><tr style='background:#f5f5f5'><th style='padding:6px 10px;text-align:left'>Domain</th><th style='padding:6px 10px'>Country</th><th style='padding:6px 10px'>CVSS</th><th style='padding:6px 10px'>Contact</th><th style='padding:6px 10px'>Status</th></tr></thead><tbody>" + rows_html + "</tbody></table>" if top else "<p style='color:#888'>No prospects in database yet.</p>"}
     <div style="margin-top:24px;text-align:center">
-      <a href="{site}?admin=1#marketing" style="display:inline-block;background:#CBFF00;color:#0E0D12;font-weight:700;font-family:monospace;padding:12px 28px;border-radius:6px;text-decoration:none;font-size:14px">▸ Open Marketing Dashboard</a>
+      <a href="{site}/app/" style="display:inline-block;background:#CBFF00;color:#0E0D12;font-weight:700;font-family:monospace;padding:12px 28px;border-radius:6px;text-decoration:none;font-size:14px">▸ Open Marketing Dashboard</a>
     </div>
     <p style="font-size:11px;color:#aaa;margin-top:20px;text-align:center">
       SwarmHawk automated digest · Sent after daily 08:00 scan · <a href="{site}" style="color:#aaa">swarmhawk.com</a>
