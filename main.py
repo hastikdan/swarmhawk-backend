@@ -163,9 +163,11 @@ def _send_breach_monday():
         now     = datetime.now(timezone.utc)
         week_ago = (now - timedelta(days=7)).isoformat()
 
-        users = _db.table("users").select("id,email,name").execute()
+        users = _db.table("users").select("id,email,name,deleted_at").execute()
         sent  = 0
         for u in (users.data or []):
+            if u.get("deleted_at"):  # skip soft-deleted accounts
+                continue
             uid   = u["id"]
             email = u.get("email", "")
             name  = u.get("name") or "there"
@@ -243,7 +245,7 @@ def _send_breach_monday():
   </tr>
   {rows_html}
 </table>
-<p style="margin-top:20px"><a href="{SITE_URL}" style="background:#CBFF00;color:#000;padding:10px 20px;text-decoration:none;font-family:monospace;font-weight:700;border-radius:6px;font-size:12px">View Full Reports →</a></p>
+<p style="margin-top:20px"><a href="{SITE_URL}/app/" style="background:#CBFF00;color:#000;padding:10px 20px;text-decoration:none;font-family:monospace;font-weight:700;border-radius:6px;font-size:12px">VIEW DASHBOARD →</a></p>
 <hr style="border:none;border-top:1px solid #1a1a2e;margin:24px 0">
 <p style="font-size:11px;color:#555">SwarmHawk Security Intelligence · swarmhawk.com · Unsubscribe by replying "unsubscribe"</p>
 </body></html>""",
@@ -259,20 +261,24 @@ def _send_breach_monday():
 
 
 def _run_monthly_scans():
-    """Daily job: scan any annual subscriber whose last scan is ≥30 days ago, then email PDF."""
+    """Daily job: scan any paid subscriber whose last scan is ≥30 days ago, then email PDF."""
     try:
         from datetime import timedelta
         _db = get_admin_db()
         now = datetime.now(timezone.utc)
         cutoff = (now - timedelta(days=30)).isoformat()
 
-        purchases = _db.table("purchases").select("domain_id, domain")\
-            .eq("plan", "annual")\
+        # Fetch all active (non-cancelled) paid purchases across all plan tiers
+        all_purchases = _db.table("purchases").select("domain_id,domain,plan,user_id")\
             .is_("cancelled_at", "null")\
             .not_.is_("paid_at", "null")\
             .execute()
+        PAID_PLANS = {"pro", "business", "enterprise", "annual", "one_time", "professional", "platform"}
+        purchases_filtered = type("R", (), {
+            "data": [p for p in (all_purchases.data or []) if p.get("plan", "").lower() in PAID_PLANS]
+        })()
 
-        for p in (purchases.data or []):
+        for p in (purchases_filtered.data or []):
             domain_id = p.get("domain_id")
             domain    = p.get("domain", "")
             if not domain_id or not domain:
@@ -284,7 +290,7 @@ def _run_monthly_scans():
             if not last_at or last_at < cutoff:
                 from threading import Thread
                 Thread(target=run_scan_background, args=(domain_id, domain), daemon=True).start()
-                print(f"[monthly-scheduler] Queued scan for {domain}")
+                print(f"[monthly-scheduler] Queued scan for {domain} (plan={p.get('plan')})")
     except Exception as e:
         import traceback
         print(f"[monthly-scheduler] Error: {e}\n{traceback.format_exc()}")
@@ -605,7 +611,7 @@ def send_welcome_and_confirm_email(to_email: str, name: str, token: str):
   <div style="background:#16151e;border-radius:8px;padding:20px;margin-bottom:32px">
     <div style="margin-bottom:16px">
       <span style="color:#cbff00;font-family:monospace;font-size:12px;font-weight:700">1. ADD YOUR DOMAIN</span><br>
-      <span style="color:#6b6880;font-size:13px">Dashboard → Domains → Add Domain. 22 security checks run automatically.</span>
+      <span style="color:#6b6880;font-size:13px">Dashboard → Domains → Add Domain. 27 security checks run automatically.</span>
     </div>
     <div style="margin-bottom:16px">
       <span style="color:#cbff00;font-family:monospace;font-size:12px;font-weight:700">2. GET YOUR FREE REPORT</span><br>
@@ -622,7 +628,7 @@ def send_welcome_and_confirm_email(to_email: str, name: str, token: str):
   </div>
 
   <!-- CTA -->
-  <a href="{SITE_URL}"
+  <a href="{SITE_URL}/app/"
      style="display:inline-block;background:rgba(203,255,0,.08);color:#cbff00;border:1px solid rgba(203,255,0,.25);font-family:monospace;font-weight:700;font-size:12px;letter-spacing:1px;padding:11px 24px;border-radius:6px;text-decoration:none">
     OPEN DASHBOARD →
   </a>
@@ -731,7 +737,7 @@ def send_account_deletion_email(to_email: str, name: str):
 
 
 def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
-                     new_threats: list[str]):
+                     new_threats: list[str], domain_id: str = ""):
     """Send risk-change or new-threat alert email."""
     if not RESEND_API_KEY:
         return
@@ -740,36 +746,44 @@ def send_alert_email(to_email: str, domain: str, old_score: int, new_score: int,
     threat_rows = "".join(
         f'<li style="color:#E74C3C;margin-bottom:4px">{t}</li>' for t in new_threats
     )
-    html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0a0a0a;color:#fff;padding:40px;border-radius:8px">
-      <div style="margin-bottom:20px">
-        <span style="font-family:monospace;font-size:18px;font-weight:700;color:#cbff00">●SWARMHAWK</span>
+    report_url = f"{SITE_URL}/app/domain.html?id={domain_id}" if domain_id else f"{SITE_URL}/app/"
+    sc_color = "#C0392B" if new_score >= 70 else "#D4850A" if new_score >= 30 else "#2ECC71"
+    html = f"""<!DOCTYPE html>
+<html>
+<body style="margin:0;padding:0;background:#0e0d12;font-family:Arial,sans-serif">
+<div style="max-width:580px;margin:0 auto;padding:48px 24px">
+  <div style="margin-bottom:28px">
+    <span style="font-family:monospace;font-size:20px;font-weight:700;color:#cbff00;letter-spacing:1px">&#9679;SWARMHAWK</span>
+  </div>
+  <h2 style="color:#E74C3C;font-size:18px;margin:0 0 4px">Security Alert</h2>
+  <h3 style="color:#f0eef8;font-weight:400;font-size:15px;margin:0 0 24px;font-family:monospace">{domain}</h3>
+  <div style="background:#16151e;border:1px solid rgba(192,57,43,.3);border-radius:8px;padding:20px;margin-bottom:20px">
+    <div style="display:flex;gap:24px;align-items:center;margin-bottom:{'16px' if new_threats else '0'}">
+      <div style="text-align:center">
+        <div style="font-size:32px;font-weight:700;color:#6b6880">{old_score}</div>
+        <div style="font-size:10px;color:#555;font-family:monospace;letter-spacing:1px">PREVIOUS</div>
       </div>
-      <h2 style="color:#E74C3C;margin-bottom:6px">Security Alert</h2>
-      <h3 style="color:#fff;font-weight:400;margin-bottom:20px">{domain}</h3>
-      <div style="background:#1a0a0a;border:1px solid rgba(192,57,43,.4);border-radius:8px;padding:20px;margin-bottom:20px">
-        <div style="display:flex;gap:24px;align-items:center;margin-bottom:{'16px' if new_threats else '0'}">
-          <div style="text-align:center">
-            <div style="font-size:28px;font-weight:700;color:#888">{old_score}</div>
-            <div style="font-size:10px;color:#555;font-family:monospace">PREVIOUS</div>
-          </div>
-          <div style="font-size:24px;color:#E74C3C">→</div>
-          <div style="text-align:center">
-            <div style="font-size:28px;font-weight:700;color:#E74C3C">{new_score}</div>
-            <div style="font-size:10px;color:#555;font-family:monospace">NOW</div>
-          </div>
-        </div>
-        {f'<ul style="margin:0;padding-left:18px">{threat_rows}</ul>' if new_threats else ""}
+      <div style="font-size:20px;color:#E74C3C;font-weight:700">→</div>
+      <div style="text-align:center">
+        <div style="font-size:32px;font-weight:700;color:{sc_color}">{new_score}</div>
+        <div style="font-size:10px;color:#555;font-family:monospace;letter-spacing:1px">NOW</div>
       </div>
-      <p style="color:#888;font-size:13px;margin-bottom:20px">
-        Log in to your dashboard to view the full report and remediation recommendations.
-      </p>
-      <a href="{SITE_URL}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">
-        View Full Report →
-      </a>
-      <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence</p>
     </div>
-    """
+    {f'<ul style="margin:8px 0 0;padding-left:18px">{threat_rows}</ul>' if new_threats else ""}
+  </div>
+  <p style="color:#6b6880;font-size:13px;line-height:1.6;margin:0 0 24px">
+    Open your domain report to see full details and remediation steps.
+  </p>
+  <a href="{report_url}" style="display:inline-block;background:#cbff00;color:#0e0d12;font-family:monospace;font-weight:700;font-size:13px;letter-spacing:1px;padding:12px 24px;border-radius:6px;text-decoration:none">
+    VIEW REPORT →
+  </a>
+  <p style="color:#3a3840;font-size:11px;margin-top:40px;font-family:monospace;line-height:1.8">
+    SwarmHawk · European Cybersecurity Intelligence<br>
+    hello@swarmhawk.com · swarmhawk.com
+  </p>
+</div>
+</body>
+</html>"""
     try:
         import httpx as _httpx
         _httpx.post(
@@ -817,7 +831,7 @@ def send_monthly_pdf_email(to_email: str, domain: str, risk_score: int,
             </div>
           </div>
           <p style="color:#aaa;font-size:13px;margin-bottom:20px">Your monthly security report is attached. It includes all check results and remediation recommendations.</p>
-          <a href="{SITE_URL}" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">Open Dashboard →</a>
+          <a href="{SITE_URL}/app/" style="display:inline-block;background:#cbff00;color:#000;font-family:monospace;font-weight:700;font-size:13px;padding:12px 24px;border-radius:5px;text-decoration:none">OPEN DASHBOARD →</a>
           <p style="color:#555;font-size:11px;margin-top:28px">SwarmHawk · European Cybersecurity Intelligence · Cancel anytime at swarmhawk.com</p>
         </div>
         """
@@ -4199,24 +4213,26 @@ def run_scan_background(domain_id: str, domain: str):
                     try: prev_raw = json.loads(prev_raw)
                     except: prev_raw = []
                 prev_checks = {c["check"]: c["status"] for c in prev_raw}
-                THREAT_CHECKS = {"urlhaus", "spamhaus", "virustotal", "safebrowsing"}
+                # Alert on any check that newly became critical (not just threat feeds)
                 new_threats = [
                     c["title"] for c in result["checks"]
-                    if c.get("check") in THREAT_CHECKS
-                    and c.get("status") == "critical"
+                    if c.get("status") == "critical"
+                    and c.get("check") not in ("ai_summary",)
                     and prev_checks.get(c.get("check")) != "critical"
                 ]
                 if new_score - prev_score >= 15 or new_threats:
                     from threading import Thread
                     Thread(target=send_alert_email,
-                           args=(user_email, domain, prev_score, new_score, new_threats),
+                           args=(user_email, domain, prev_score, new_score, new_threats, domain_id),
                            daemon=True).start()
 
-            # ── Monthly PDF: send to annual subscribers ──────────────────────
-            active_sub = db.table("purchases").select("id")\
-                .eq("user_id", user_id).eq("plan", "annual")\
+            # ── Monthly PDF: send to all paid subscribers ────────────────────
+            _PAID = {"pro", "business", "enterprise", "annual", "one_time", "professional", "platform"}
+            active_sub = db.table("purchases").select("id,plan")\
+                .eq("user_id", user_id)\
                 .is_("cancelled_at", "null").not_.is_("paid_at", "null").execute()
-            if active_sub.data:
+            active_sub_data = [p for p in (active_sub.data or []) if p.get("plan", "").lower() in _PAID]
+            if active_sub_data:
                 from threading import Thread
                 Thread(target=send_monthly_pdf_email,
                        args=(user_email, domain, result["risk_score"],
