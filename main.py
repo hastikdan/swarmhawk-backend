@@ -17,6 +17,7 @@ Run locally:
 """
 
 import os
+import time
 import json
 import hmac
 import hashlib
@@ -7660,6 +7661,11 @@ def submit_contact_form(body: ContactFormRequest):
 
 
 # ── GTM: Hosting Partner Matrix ───────────────────────────────────────────────
+# Cache: the matrix aggregates potentially millions of scan_results rows. At
+# global scale this query can take seconds. Cache for 15 minutes — fresh enough
+# for admin decision-making, fast enough to not time out on Render's free tier.
+_gtm_cache: dict = {"payload": None, "expires_at": 0.0}
+_GTM_CACHE_TTL = 900  # 15 minutes
 
 # ASN number → canonical hosting provider name (global coverage).
 # ASN numbers are stable RIPE/ARIN identifiers; org name strings from ip-api.com
@@ -7966,6 +7972,12 @@ def gtm_hosting_matrix(authorization: str = Header(None)):
     hosting partners worldwide have the most vulnerable customer domains.
     """
     require_admin(authorization)
+
+    # Serve from cache if still fresh
+    now = time.time()
+    if _gtm_cache["payload"] is not None and now < _gtm_cache["expires_at"]:
+        return _gtm_cache["payload"]
+
     db = get_admin_db()
 
     # ip_asn stores "AS24940 Hetzner Online GmbH" — we need it for ASN lookup.
@@ -8026,4 +8038,7 @@ def gtm_hosting_matrix(authorization: str = Header(None)):
             })
 
     result.sort(key=lambda x: x["total_critical"], reverse=True)
-    return {"countries": result, "generated_at": datetime.now(timezone.utc).isoformat()}
+    payload = {"countries": result, "generated_at": datetime.now(timezone.utc).isoformat()}
+    _gtm_cache["payload"] = payload
+    _gtm_cache["expires_at"] = time.time() + _GTM_CACHE_TTL
+    return payload

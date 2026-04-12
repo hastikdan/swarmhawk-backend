@@ -30,7 +30,7 @@ Over time: scan_results grows into world's largest domain security database.
 Every domain ever discovered gets weekly vulnerability tracking.
 """
 
-import os, re, json, time, logging, io, zipfile, socket
+import os, re, json, time, logging, io, zipfile, socket, threading
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional, Callable
@@ -151,12 +151,16 @@ def register_alert_callback(fn: Callable[[dict], None]) -> None:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 CLOUDFLARE_TOKEN      = os.getenv("CLOUDFLARE_API_TOKEN", "")
-PIPELINE_WORKERS      = int(os.getenv("PIPELINE_WORKERS", "15"))     # 50 causes OOM on Render free tier
-TIER1_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER1_BATCH", "500"))  # safe default; scale up on paid tier
-TIER2_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER2_BATCH", "200"))
-RADAR_LIMIT           = int(os.getenv("PIPELINE_RADAR_LIMIT", "200"))    # 2× from Phase 1
+PIPELINE_WORKERS      = int(os.getenv("PIPELINE_WORKERS", "15"))       # 50 causes OOM on Render free tier
+TIER1_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER1_BATCH", "500"))   # safe default; raise on paid tier
+TIER2_BATCH_SIZE      = int(os.getenv("PIPELINE_TIER2_BATCH", "500"))   # raised from 200 — 500 deep scans/day
+RADAR_LIMIT           = int(os.getenv("PIPELINE_RADAR_LIMIT", "200"))   # per country; 200 × 80 countries = 16K
 CT_LIMIT              = int(os.getenv("PIPELINE_CT_LIMIT", "1000"))
-BULK_LIMIT            = int(os.getenv("PIPELINE_BULK_LIMIT", "250000"))  # domains per bulk source
+BULK_LIMIT            = int(os.getenv("PIPELINE_BULK_LIMIT", "250000")) # domains per bulk source
+# Refill threshold: spawn discovery when queue drops below this.
+# 50K gives ~16h of Tier 1 headroom (500 domains × 6/h × 16h) before discovery
+# is needed again — prevents discovery running every cycle on a full global queue.
+PIPELINE_REFILL_THRESHOLD = int(os.getenv("PIPELINE_REFILL_THRESHOLD", "50000"))
 CVSS_THRESHOLD        = float(os.getenv("OUTREACH_CVSS_MIN", "7.0"))
 RISK_THRESHOLD        = float(os.getenv("OUTREACH_RISK_MIN", "40"))
 TIMEOUT               = 15
@@ -164,6 +168,11 @@ UA                    = {"User-Agent": "Mozilla/5.0 (compatible; SwarmHawk-Pipel
 
 # Scan tier-to-reschedule interval mapping
 TIER_RESCAN_DAYS = {1: 7, 2: 7}
+
+# ── Concurrency guards ────────────────────────────────────────────────────────
+# Prevent overlapping discovery runs when Tier 1 triggers a background refill
+# while a scheduled discovery is already in progress.
+_discovery_lock = threading.Lock()
 
 # ── Runtime diagnostics ───────────────────────────────────────────────────────
 _last_tier1_run:  Optional[str] = None   # ISO timestamp of last successful tier1 batch
@@ -913,12 +922,19 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
 
     log.info(f"[tier1_batch] done — {scanned}/{len(queue)} scanned successfully")
 
-    # Geo-enrich newly scanned domains with datacenter-level coordinates
+    # Geo-enrich in a background daemon thread — ip-api.com has 45-req/min rate
+    # limits and 0.5s inter-chunk sleeps that previously blocked the next Tier 1
+    # batch from starting. Fire-and-forget: if Render restarts mid-enrichment the
+    # domains will be picked up on the next run (only updates existing rows).
     scanned_domains = [row["domain"] for row in queue if row["domain"] not in already_scanned]
-    try:
-        _geo_enrich_domains(scanned_domains, db)
-    except Exception as e:
-        log.debug(f"[tier1_batch] geo enrich skipped: {e}")
+    if scanned_domains:
+        t = threading.Thread(
+            target=_geo_enrich_domains,
+            args=(scanned_domains, db),
+            daemon=True,
+            name="geo-enrich",
+        )
+        t.start()
 
     return scanned
 
@@ -1063,37 +1079,46 @@ def _dual_write_outreach(result: dict, db):
 # ── Cron job entrypoints ──────────────────────────────────────────────────────
 
 def run_discovery_job():
-    """Daily discovery job (01:00 Prague).
+    """Daily discovery job (01:00 Prague) — also triggered as background refill.
+
+    Uses _discovery_lock to prevent overlapping runs (scheduled + background refill
+    could otherwise both execute simultaneously, wasting Radar/Majestic quota).
 
     Sources: Cloudflare Radar (all countries), CT logs, Majestic Million (daily).
     Bulk sources (Tranco, Umbrella) run separately on Saturdays via run_bulk_discovery_job().
     """
+    if not _discovery_lock.acquire(blocking=False):
+        log.info("[discovery] already running — skipping concurrent trigger")
+        return 0
     log.info("[discovery] starting daily domain discovery")
     db = _get_db()
     total_queued = 0
 
-    # ── Source 1: Cloudflare Radar (primary, country-aware) ─────────────────
-    radar_results = fetch_radar_global(limit_per_country=RADAR_LIMIT)
-    if radar_results:
-        by_country: dict[str, list[str]] = {}
-        for domain, cc in radar_results:
-            by_country.setdefault(cc, []).append(domain)
-        for cc, domains in by_country.items():
-            total_queued += ingest_domains(domains, source="radar", country=cc, db=db)
+    try:
+        # ── Source 1: Cloudflare Radar (primary, country-aware) ──────────────
+        radar_results = fetch_radar_global(limit_per_country=RADAR_LIMIT)
+        if radar_results:
+            by_country: dict[str, list[str]] = {}
+            for domain, cc in radar_results:
+                by_country.setdefault(cc, []).append(domain)
+            for cc, domains in by_country.items():
+                total_queued += ingest_domains(domains, source="radar", country=cc, db=db)
 
-    # ── Source 2: Certificate Transparency logs ──────────────────────────────
-    ct_domains = fetch_ct_logs_recent(limit=CT_LIMIT)
-    if ct_domains:
-        total_queued += ingest_domains(ct_domains, source="ct_logs", db=db)
+        # ── Source 2: Certificate Transparency logs ──────────────────────────
+        ct_domains = fetch_ct_logs_recent(limit=CT_LIMIT)
+        if ct_domains:
+            total_queued += ingest_domains(ct_domains, source="ct_logs", db=db)
 
-    # ── Source 3: Majestic Million (daily updated) ───────────────────────────
-    majestic_domains = fetch_majestic_million(limit=BULK_LIMIT)
-    if majestic_domains:
-        total_queued += ingest_domains(majestic_domains, source="majestic",
-                                       db=db, skip_scan_check=True)
+        # ── Source 3: Majestic Million (daily updated) ───────────────────────
+        majestic_domains = fetch_majestic_million(limit=BULK_LIMIT)
+        if majestic_domains:
+            total_queued += ingest_domains(majestic_domains, source="majestic",
+                                           db=db, skip_scan_check=True)
 
-    log.info(f"[discovery] done — {total_queued:,} new domains queued")
-    return total_queued
+        log.info(f"[discovery] done — {total_queued:,} new domains queued")
+        return total_queued
+    finally:
+        _discovery_lock.release()
 
 
 def run_bulk_discovery_job():
@@ -1132,14 +1157,21 @@ def run_pipeline_daily():
     global _last_tier1_run, _last_tier1_scanned
     db = _get_db()
 
-    # Auto-refill: if queue is nearly empty, run discovery first so we always
-    # have a supply of fresh domains to scan.
+    # Auto-refill: spawn discovery in the background if the queue is running low.
+    # We do NOT block Tier 1 on discovery — discovery downloads 50MB+ files and
+    # hits 80+ Radar endpoints, which would delay every 10-min Tier 1 cycle.
+    # A background thread refills the queue while Tier 1 keeps scanning.
+    # _discovery_lock prevents overlapping runs (e.g. scheduled + triggered).
     try:
         queue_count = db.table("domain_queue").select("id", count="exact")\
             .lte("queued_at", datetime.now(timezone.utc).isoformat()).execute().count or 0
-        if queue_count < 10_000:
-            log.info(f"[pipeline_daily] queue low ({queue_count:,}) — running discovery first")
-            run_discovery_job()
+        if queue_count < PIPELINE_REFILL_THRESHOLD:
+            if _discovery_lock.locked():
+                log.info(f"[pipeline_daily] queue low ({queue_count:,}) but discovery already running — skipping")
+            else:
+                log.info(f"[pipeline_daily] queue low ({queue_count:,}) — spawning discovery in background")
+                t = threading.Thread(target=run_discovery_job, daemon=True, name="bg-discovery")
+                t.start()
     except Exception as e:
         log.warning(f"[pipeline_daily] queue check failed: {e}")
 
