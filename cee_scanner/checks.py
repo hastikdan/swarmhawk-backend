@@ -1365,6 +1365,32 @@ def check_llm_security(domain: str) -> CheckResult:
     return _check(domain)
 
 
+# ── Agent-Reach OSINT checks ──────────────────────────────────────────────────
+
+def check_github_poc(domain: str) -> CheckResult:
+    """Search GitHub for public PoC / exploit repos matching the detected tech stack."""
+    from cee_scanner.skills.osint import check_github_poc as _check
+    return _check(domain)
+
+
+def check_contact_discovery(domain: str) -> CheckResult:
+    """Discover security contact via RFC 9116 security.txt and website scan (Jina Reader)."""
+    from cee_scanner.skills.osint import check_contact_discovery as _check
+    return _check(domain)
+
+
+def check_threat_feeds(domain: str) -> CheckResult:
+    """Match detected software against the CISA Known Exploited Vulnerabilities catalog."""
+    from cee_scanner.skills.osint import check_threat_feeds as _check
+    return _check(domain)
+
+
+def check_github_leaks(domain: str) -> CheckResult:
+    """Search GitHub public code for credential leaks referencing this domain."""
+    from cee_scanner.skills.osint import check_github_leaks as _check
+    return _check(domain)
+
+
 ALL_CHECKS = [
     check_ssl,
     check_headers,
@@ -1407,6 +1433,11 @@ ALL_CHECKS = [
     check_default_creds,        # A02/A07: default credential testing on login forms
     check_rate_limiting,        # A06: missing rate limits on login/reset/register
     check_llm_security,         # LLM01-LLM10: AI chatbot risks, exposed API keys
+    # ── Agent-Reach OSINT ──
+    check_github_poc,           # GitHub PoC/exploit repos for detected tech stack
+    check_contact_discovery,    # RFC 9116 security.txt + Jina Reader contact scan
+    check_threat_feeds,         # CISA Known Exploited Vulnerabilities feed matching
+    check_github_leaks,         # GitHub public code credential leak search
 ]
 
 

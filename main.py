@@ -3216,6 +3216,11 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
         "jwt_security": "A08/A04: JWT Security", "deserialization": "A08: Deserialization",
         "default_creds": "A02/A07: Default Creds", "rate_limiting": "A06: Rate Limiting",
         "llm_security": "LLM01-10: AI Security",
+        # Agent-Reach OSINT
+        "github_poc":        "GitHub PoC Exploit Hunter",
+        "contact_discovery": "Security Contact / RFC 9116",
+        "threat_feeds":      "CISA Known Exploited Vulns",
+        "github_leaks":      "GitHub Credential Leak Scan",
     }
 
     # ── Date formatting ──────────────────────────────────────────────────────
@@ -3373,13 +3378,13 @@ def _generate_pdf(domain: str, risk_score: int, scanned_at: str, checks: list) -
     # ── Section title: Security Checks ──────────────────────────────────────
     # ── Business groups (mirrors domain.html BUSINESS_GROUPS) ───────────────────────
     PDF_GROUPS = [
-        ("Active Threats",            ["urlhaus","safebrowsing","virustotal","spamhaus","breach","paranoidlab"]),
-        ("Confirmed Vulnerabilities", ["nuclei","cve","cve_exposure","injection","ssrf","auth_security","integrity"]),
+        ("Active Threats",            ["urlhaus","safebrowsing","virustotal","spamhaus","breach","paranoidlab","github_leaks","threat_feeds"]),
+        ("Confirmed Vulnerabilities", ["nuclei","cve","cve_exposure","injection","ssrf","auth_security","integrity","github_poc"]),
         ("Email & Deliverability",    ["spf","dmarc","dkim","mx","bimi","email_security"]),
         ("Identity & Encryption",     ["cert_valid","cert_expiry","cert_chain","tls_version","ssl_grade","ssl","hsts","https_redirect"]),
         ("Configuration Gaps",        ["csp","x_frame_options","x_content_type","referrer_policy","permissions_policy","cors","headers","http_security","www_redirect","dnssec","caa"]),
         ("Exposure Surface",          ["open_ports","ports","admin_panel","directory_listing","waf","subdomains","software_disclosure","server_header","cms_version","sca","sast","iac","dast"]),
-        ("Infrastructure",            ["dns","whois","cms","typosquat","ip_intel","performance"]),
+        ("Infrastructure",            ["dns","whois","cms","typosquat","ip_intel","performance","contact_discovery"]),
     ]
     _STATUS_SORT = {"critical": 0, "fail": 0, "error": 1, "warning": 2, "ok": 3, "pass": 3}
 
