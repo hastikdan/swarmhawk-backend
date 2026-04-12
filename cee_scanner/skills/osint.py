@@ -145,7 +145,7 @@ def check_github_poc(domain: str):
         )
         try:
             resp = requests.get(url, headers=headers, timeout=12)
-            if resp.status_code == 403:
+            if resp.status_code in (401, 403):
                 return result.info(
                     "GitHub rate limited — add GITHUB_TOKEN for PoC scanning",
                     "Set the GITHUB_TOKEN environment variable to remove rate limits.",
@@ -377,10 +377,10 @@ def check_github_leaks(domain: str):
     try:
         resp = requests.get(url, headers=headers, timeout=12)
 
-        if resp.status_code == 403:
+        if resp.status_code in (401, 403):
             return result.info(
-                "GitHub rate limited — add GITHUB_TOKEN for leak scanning",
-                "Set the GITHUB_TOKEN environment variable to remove rate limits.",
+                "GitHub token required — add GITHUB_TOKEN for credential scanning",
+                "GitHub Code Search requires authentication. Set the GITHUB_TOKEN environment variable.",
             )
         if resp.status_code == 422:
             return result.ok(
