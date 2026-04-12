@@ -7029,6 +7029,111 @@ def admin_activity(days: int = 30, authorization: str = Header(None)):
     return {"activity": list(buckets.values())}
 
 
+@app.get("/admin/pipeline-daily-stats")
+def admin_pipeline_daily_stats(days: int = 14, authorization: str = Header(None)):
+    """Admin: pipeline engine stats — daily scan/outreach/geo counts + live queue metrics.
+
+    Uses a server-side SQL aggregation (migration 016) so Render never pulls
+    millions of timestamp rows into Python memory.
+    """
+    require_admin(authorization)
+    db = get_admin_db()
+    from datetime import timedelta
+
+    now        = datetime.now(timezone.utc)
+    today_str  = now.strftime("%Y-%m-%d")
+    yest_str   = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ── Daily breakdown (RPC function, server-side GROUP BY) ─────────────────
+    daily: list[dict] = []
+    try:
+        rows = db.rpc("pipeline_daily_stats", {"days_back": days}).execute()
+        daily = rows.data or []
+    except Exception:
+        # Fallback: empty — migration 016 may not have been run yet
+        pass
+
+    # Fill missing days with zero so the chart has a complete x-axis
+    existing = {r["scan_date"]: r for r in daily}
+    full_daily = []
+    for i in range(days):
+        d = (now - timedelta(days=days - 1 - i)).strftime("%Y-%m-%d")
+        row = existing.get(d, {})
+        full_daily.append({
+            "date":             d,
+            "pipeline_scanned": int(row.get("pipeline_scanned") or 0),
+            "outreach_found":   int(row.get("outreach_found") or 0),
+            "geo_enriched":     int(row.get("geo_enriched") or 0),
+        })
+
+    # ── Live / today metrics (fast indexed queries) ───────────────────────────
+    today_scanned    = 0
+    yesterday_scanned = 0
+    queue_depth      = 0
+    total_pipeline   = 0
+    geo_coverage_pct = 0.0
+    outreach_pending = 0
+    countries_active = 0
+
+    try:
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+        yest_start  = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+        today_scanned = db.table("scan_results").select("id", count="exact")\
+            .gte("last_scanned_at", today_start).execute().count or 0
+
+        yesterday_scanned = db.table("scan_results").select("id", count="exact")\
+            .gte("last_scanned_at", yest_start)\
+            .lt("last_scanned_at", today_start).execute().count or 0
+
+        queue_depth = db.table("domain_queue").select("id", count="exact")\
+            .lte("queued_at", now.isoformat()).execute().count or 0
+
+        total_pipeline = db.table("scan_results").select("id", count="exact")\
+            .not_.is_("last_scanned_at", "null").execute().count or 0
+
+        geo_enriched = db.table("scan_results").select("id", count="exact")\
+            .not_.is_("ip_asn", "null").neq("ip_asn", "").execute().count or 0
+        if total_pipeline > 0:
+            geo_coverage_pct = round(geo_enriched / total_pipeline * 100, 1)
+
+        outreach_pending = db.table("scan_results").select("id", count="exact")\
+            .eq("outreach_status", "pending").execute().count or 0
+
+        countries_active = 0
+        try:
+            cc_rows = db.table("scan_results").select("country")\
+                .not_.is_("country", "null").neq("country", "GLOBAL")\
+                .neq("country", "").execute()
+            countries_active = len({r["country"] for r in (cc_rows.data or [])})
+        except Exception:
+            pass
+
+    except Exception as e:
+        pass  # non-fatal — live metrics are best-effort
+
+    # ── Pipeline engine status (last batch info from in-process state) ────────
+    pipeline_live: dict = {}
+    try:
+        from pipeline import get_pipeline_status
+        pipeline_live = get_pipeline_status()
+    except Exception:
+        pass
+
+    return {
+        "daily":              full_daily,
+        "today_scanned":      today_scanned,
+        "yesterday_scanned":  yesterday_scanned,
+        "queue_depth":        queue_depth,
+        "total_pipeline":     total_pipeline,
+        "geo_coverage_pct":   geo_coverage_pct,
+        "outreach_pending":   outreach_pending,
+        "countries_active":   countries_active,
+        "pipeline_live":      pipeline_live,
+        "generated_at":       now.isoformat(),
+    }
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN LOGS — recent scan events
 # ══════════════════════════════════════════════════════════════════════════════
