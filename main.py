@@ -7658,4 +7658,90 @@ def submit_contact_form(body: ContactFormRequest):
     except requests.RequestException as e:
         raise HTTPException(502, f"Email service unreachable: {e}")
 
+
+# ── GTM: Hosting Partner Matrix ───────────────────────────────────────────────
+
+@app.get("/gtm/hosting-matrix")
+def gtm_hosting_matrix(authorization: str = Header(None)):
+    """Admin only. Returns Country × Hosting Provider matrix from scan_results.
+
+    For each country, shows which hosting organisations have the most
+    vulnerable customer domains — the core data for B2B partner outreach.
+    """
+    require_admin(authorization)
+    db = get_admin_db()
+
+    # Pull every scanned domain that has ip_org set — lightweight columns only
+    try:
+        rows = db.table("scan_results")\
+            .select("country,ip_org,risk_score,dmarc_status,spf_status,outreach_status")\
+            .not_.is_("ip_org", "null")\
+            .neq("ip_org", "")\
+            .execute()
+        data = rows.data or []
+    except Exception as e:
+        raise HTTPException(500, f"DB query failed: {e}")
+
+    import re as _re
+
+    def _clean_org(raw: str) -> str:
+        """Strip leading 'ASxxxxx ' prefix and normalise."""
+        return _re.sub(r"^AS\d+\s+", "", raw).strip()[:80]
+
+    # Build: { country: { org: { domains, critical, warning, clean, outreach_ready } } }
+    matrix: dict[str, dict[str, dict]] = {}
+    for r in data:
+        cc  = (r.get("country") or "GLOBAL").upper()
+        org = _clean_org(r.get("ip_org") or "")
+        if not org or org.lower() in ("cloudflare", "cloudflare, inc.", "fastly"):
+            # Skip pure CDN proxies — they don't indicate real hosting
+            continue
+        score  = r.get("risk_score") or 0
+        status = r.get("outreach_status") or ""
+
+        if cc not in matrix:
+            matrix[cc] = {}
+        if org not in matrix[cc]:
+            matrix[cc][org] = {"domains": 0, "critical": 0, "warning": 0,
+                                "clean": 0, "outreach_ready": 0}
+        b = matrix[cc][org]
+        b["domains"] += 1
+        if score >= 70:
+            b["critical"] += 1
+        elif score >= 30:
+            b["warning"] += 1
+        else:
+            b["clean"] += 1
+        if status in ("pending", "approved"):
+            b["outreach_ready"] += 1
+
+    # Reshape to sorted list per country, hosters sorted by critical desc
+    EUROPEAN_COUNTRIES = {
+        "DE","FR","NL","PL","CZ","SK","AT","HU","RO","BG","HR","SI","LT","LV",
+        "EE","SE","NO","DK","FI","BE","CH","PT","ES","IT","IE","GR","CY","MT",
+        "LU","IS","LI","MC","AD","SM","UA","RS","ME","MK","AL","BA","XK","BY",
+        "MD","GE","AM","AZ","RU",
+    }
+    result = []
+    for cc, hosters in matrix.items():
+        if cc not in EUROPEAN_COUNTRIES:
+            continue
+        hoster_list = []
+        for org, stats in hosters.items():
+            if stats["domains"] < 2:  # skip noise
+                continue
+            hoster_list.append({"hoster": org, **stats})
+        hoster_list.sort(key=lambda x: (x["critical"], x["domains"]), reverse=True)
+        if hoster_list:
+            result.append({
+                "country": cc,
+                "hosters": hoster_list[:20],  # top 20 per country
+                "total_domains":   sum(h["domains"] for h in hoster_list),
+                "total_critical":  sum(h["critical"] for h in hoster_list),
+                "total_outreach":  sum(h["outreach_ready"] for h in hoster_list),
+            })
+
+    result.sort(key=lambda x: x["total_critical"], reverse=True)
+    return {"countries": result, "generated_at": datetime.now(timezone.utc).isoformat()}
+
     return {"ok": True, "delivered_to": to_email}
