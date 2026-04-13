@@ -1406,44 +1406,52 @@ async def get_scan_progress(authorization: str = Header(None)):
 
 @router.get("/prospects/stats")
 async def prospects_stats(authorization: str = Header(None)):
-    """Per-country breakdown: count, top CVSS, last scanned."""
+    """Per-country breakdown: count, top CVSS, last scanned.
+    Reads from scan_results (primary) — the single source of truth for outreach status.
+    """
     require_admin(authorization)
     db = get_db()
-    rows = db.table("outreach_prospects").select("country,status,max_cvss,scanned_at").execute()
 
     stats: dict = {}
-    last_scan = None
-    for r in (rows.data or []):
-        c = r.get("country", "??")
-        if c not in stats:
-            stats[c] = {"country": c, "total": 0, "pending": 0, "approved": 0,
-                        "sent": 0, "skipped": 0, "top_cvss": 0, "last_scanned": None}
-        stats[c]["total"] += 1
-        stats[c][r.get("status", "pending")] = stats[c].get(r.get("status", "pending"), 0) + 1
-        if (r.get("max_cvss") or 0) > stats[c]["top_cvss"]:
-            stats[c]["top_cvss"] = r.get("max_cvss", 0)
-        if r.get("scanned_at"):
-            if not stats[c]["last_scanned"] or r["scanned_at"] > stats[c]["last_scanned"]:
-                stats[c]["last_scanned"] = r["scanned_at"]
-            if not last_scan or r["scanned_at"] > last_scan:
-                last_scan = r["scanned_at"]
+
+    # ── Primary: scan_results (pipeline + auto-discover results) ─────────────
+    try:
+        sr_rows = db.table("scan_results")\
+            .select("country,outreach_status,max_cvss,last_scanned_at")\
+            .not_.is_("outreach_status", "null")\
+            .execute()
+        for r in (sr_rows.data or []):
+            c = r.get("country") or "??"
+            if c not in stats:
+                stats[c] = {"country": c, "total": 0, "pending": 0, "approved": 0,
+                            "sent": 0, "skipped": 0, "top_cvss": 0, "last_scanned": None}
+            stats[c]["total"] += 1
+            key = r.get("outreach_status") or "pending"
+            stats[c][key] = stats[c].get(key, 0) + 1
+            if (r.get("max_cvss") or 0) > stats[c]["top_cvss"]:
+                stats[c]["top_cvss"] = r.get("max_cvss", 0)
+            ts = r.get("last_scanned_at")
+            if ts and (not stats[c]["last_scanned"] or ts > stats[c]["last_scanned"]):
+                stats[c]["last_scanned"] = ts
+    except Exception as e:
+        log.warning(f"[prospects_stats] scan_results query failed: {e}")
 
     # Last scan log entry
+    last_scan = None
     try:
-        log = db.table("outreach_log").select("ran_at").eq("event", "daily_scan")\
+        lg = db.table("outreach_log").select("ran_at").eq("event", "daily_scan")\
             .order("ran_at", desc=True).limit(1).execute()
-        if log.data:
-            last_scan = log.data[0]["ran_at"]
+        if lg.data:
+            last_scan = lg.data[0]["ran_at"]
     except Exception:
         pass
 
-    # Count prospects whose scanned_at is today (UTC date)
     today = datetime.now(timezone.utc).date().isoformat()
     scanned_today = 0
     try:
-        today_rows = db.table("outreach_prospects")\
-            .select("id", count="exact")\
-            .gte("scanned_at", today)\
+        today_rows = db.table("scan_results").select("id", count="exact")\
+            .not_.is_("outreach_status", "null")\
+            .gte("last_scanned_at", today)\
             .execute()
         scanned_today = today_rows.count or 0
     except Exception:
@@ -1871,11 +1879,43 @@ def _send_approved_job():
         print("[outreach] RESEND_API_KEY not set — skipping send")
         return
 
-    db       = get_db()
-    approved = db.table("outreach_prospects").select("*").eq("status", "approved").limit(DAILY_SEND_LIMIT).execute()
-    sent     = 0
+    db = get_db()
 
-    for row in (approved.data or []):
+    # Collect approved prospects — scan_results is primary (pipeline + auto-discover),
+    # supplement with outreach_prospects for legacy rows not yet in scan_results.
+    to_send: list[dict] = []
+    seen_domains: set[str] = set()
+
+    try:
+        sr_rows = db.table("scan_results")\
+            .select("id,domain,email_body,contact_email,sent_to,sent_at,outreach_status")\
+            .eq("outreach_status", "approved")\
+            .limit(DAILY_SEND_LIMIT)\
+            .execute()
+        for row in (sr_rows.data or []):
+            to_send.append({**row, "status": "approved", "_source": "scan_results"})
+            seen_domains.add(row["domain"])
+    except Exception as e:
+        print(f"[outreach] approved query from scan_results failed: {e}")
+
+    remaining = DAILY_SEND_LIMIT - len(to_send)
+    if remaining > 0:
+        try:
+            op_rows = db.table("outreach_prospects")\
+                .select("*")\
+                .eq("status", "approved")\
+                .limit(remaining + len(seen_domains))\
+                .execute()
+            for row in (op_rows.data or []):
+                if row["domain"] not in seen_domains:
+                    to_send.append({**row, "_source": "outreach_prospects"})
+                    if len(to_send) >= DAILY_SEND_LIMIT:
+                        break
+        except Exception as e:
+            print(f"[outreach] approved query from outreach_prospects failed: {e}")
+
+    sent = 0
+    for row in to_send:
         domain     = row["domain"]
         email_body = row["email_body"] or ""
         to_email   = row.get("contact_email") or f"security@{domain}"
@@ -1901,17 +1941,20 @@ def _send_approved_job():
                 timeout=15,
             )
             if r.status_code in (200, 201):
-                db.table("outreach_prospects").update({
-                    "status":  "sent",
-                    "sent_at": datetime.now(timezone.utc).isoformat(),
-                    "sent_to": to_email,
-                }).eq("id", row["id"]).execute()
-                db.table("outreach_log").insert({
-                    "event":  "email_sent",
-                    "domain": domain,
-                    "to":     to_email,
-                    "ran_at": datetime.now(timezone.utc).isoformat(),
-                }).execute()
+                now = datetime.now(timezone.utc).isoformat()
+                _prospect_update(db, row["id"],
+                    sr_data={"outreach_status": "sent", "sent_at": now, "sent_to": to_email},
+                    op_data={"status": "sent", "sent_at": now, "sent_to": to_email},
+                )
+                try:
+                    db.table("outreach_log").insert({
+                        "event":  "email_sent",
+                        "domain": domain,
+                        "to":     to_email,
+                        "ran_at": now,
+                    }).execute()
+                except Exception:
+                    pass
                 sent += 1
                 print(f"[outreach] sent → {to_email}")
             else:

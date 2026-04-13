@@ -925,13 +925,6 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
                 result = fut.result(timeout=60)  # hard per-domain cap — no single scan hangs the batch
                 if result:
                     upsert_scan_result(result, db)
-                    # Dual-write to outreach_prospects for backward compat (Phase 1)
-                    # Flatten enrichment fields to top level so _domain_qualifies can
-                    # read spf_status, dmarc_status, blacklisted directly.
-                    enrichment = result.get("enrichment") or {}
-                    flat = {**result, **enrichment}
-                    if _domain_qualifies(flat.get("max_cvss", 0), flat.get("risk_score", 0), flat):
-                        _dual_write_outreach(flat, db)
                     scanned += 1
             except Exception as e:
                 log.warning(f"[tier1_batch] {row['domain']}: {e}")
@@ -1086,19 +1079,6 @@ def backfill_outreach_prospects(db=None, limit: int = 2000) -> int:
 
 
 # ── Dual-write helper (Phase 1 backward compat) ───────────────────────────────
-
-def _dual_write_outreach(result: dict, db):
-    """Write qualifying scan result to outreach_prospects (backward compat for Phase 1).
-
-    Phase 2 will remove this and migrate outreach tab to read from scan_results.
-    """
-    try:
-        from outreach import upsert_prospect
-        # upsert_prospect expects email_body; we pass empty string if none
-        upsert_prospect(result, result.get("email_body") or "", db=db)
-    except Exception as e:
-        log.debug(f"[dual_write] {result.get('domain')}: {e}")
-
 
 # ── Cron job entrypoints ──────────────────────────────────────────────────────
 
