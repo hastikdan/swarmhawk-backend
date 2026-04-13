@@ -820,24 +820,29 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
     """
     db = db or _get_db()
 
+    # Prefetch up to 10× the batch window so we can bulk-purge stale entries in
+    # one pass.  This prevents a rebuilt queue (skip_scan_check=True) from
+    # stalling for dozens of cycles when its head is dominated by domains that
+    # are already in scan_results.
+    _prefetch = min(batch_size * 10, 20_000)
     try:
         rows = db.table("domain_queue")\
             .select("id,domain,country,source")\
             .order("priority", desc=False)\
             .order("queued_at", desc=False)\
-            .limit(batch_size)\
+            .limit(_prefetch)\
             .execute()
-        queue = rows.data or []
+        candidate_pool = rows.data or []
     except Exception as e:
         log.error(f"[tier1_batch] failed to fetch queue: {e}")
         return 0
 
-    if not queue:
+    if not candidate_pool:
         log.info("[tier1_batch] queue is empty")
         return 0
 
     # Discard domains already in scan_results — Tier 2 will handle re-enrichment
-    domain_list = [row["domain"] for row in queue]
+    domain_list = [row["domain"] for row in candidate_pool]
     already_scanned: set[str] = set()
     for i in range(0, len(domain_list), 500):
         chunk = domain_list[i:i + 500]
@@ -847,13 +852,17 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
         except Exception:
             pass
     if already_scanned:
-        stale_ids = [r["id"] for r in queue if r["domain"] in already_scanned]
-        try:
-            db.table("domain_queue").delete().in_("id", stale_ids).execute()
-        except Exception:
-            pass
-        queue = [r for r in queue if r["domain"] not in already_scanned]
-        log.info(f"[tier1_batch] skipped {len(stale_ids)} already-scanned domains")
+        stale_ids = [r["id"] for r in candidate_pool if r["domain"] in already_scanned]
+        for i in range(0, len(stale_ids), 500):
+            try:
+                db.table("domain_queue").delete().in_("id", stale_ids[i:i+500]).execute()
+            except Exception:
+                pass
+        candidate_pool = [r for r in candidate_pool if r["domain"] not in already_scanned]
+        log.info(f"[tier1_batch] bulk-purged {len(stale_ids)} already-scanned domains from queue head")
+
+    # Take only batch_size from the clean candidates
+    queue = candidate_pool[:batch_size]
 
     if not queue:
         log.info("[tier1_batch] all queued domains already scanned")
