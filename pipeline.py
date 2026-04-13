@@ -262,6 +262,10 @@ def _is_domain_reachable(domain: str, timeout: float = 3.0) -> bool:
     domains still have valid DNS/SPF/DMARC data worth scanning.
     A domain is "alive" if it responds on TCP *or* resolves in DNS.
     Only truly non-existent domains (NXDOMAIN) return False.
+
+    IMPORTANT: socket.getaddrinfo() has no built-in timeout and can hang
+    up to 30s on unresponsive DNS servers. We enforce a hard 4s cap using
+    a Future so the pre-filter phase never stalls the batch.
     """
     for port in (443, 80):
         try:
@@ -269,11 +273,14 @@ def _is_domain_reachable(domain: str, timeout: float = 3.0) -> bool:
                 return True
         except (socket.timeout, socket.error, OSError):
             continue
-    # TCP failed — Render's datacenter IP may be blocked; fall back to DNS
+    # TCP failed — Render's datacenter IP may be blocked; fall back to DNS.
+    # Wrap in a Future with a hard timeout so slow DNS doesn't stall the batch.
     try:
-        socket.getaddrinfo(domain, None, socket.AF_INET)
+        with ThreadPoolExecutor(max_workers=1) as _ex:
+            fut = _ex.submit(socket.getaddrinfo, domain, None, socket.AF_INET)
+            fut.result(timeout=4.0)  # hard 4s cap — no hanging
         return True
-    except (socket.gaierror, OSError):
+    except Exception:
         return False
 
 
@@ -852,11 +859,14 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
         log.info("[tier1_batch] all queued domains already scanned")
         return 0
 
-    # Pre-filter dead domains with fast TCP check (3s vs 10s HTTP timeout)
-    # Runs at 2× workers since socket checks are near-zero CPU
+    # Pre-filter dead domains with fast TCP/DNS check.
+    # Cap at 50 concurrent threads regardless of PIPELINE_WORKERS — on Render
+    # free tier, more than 50 concurrent socket+DNS calls exhausts file
+    # descriptors and causes all checks to fail (returns 0 scanned).
+    _REACH_WORKERS = min(PIPELINE_WORKERS, 50)
     reachable_queue = []
     dead_ids = []
-    with ThreadPoolExecutor(max_workers=min(PIPELINE_WORKERS * 2, 200)) as ex:
+    with ThreadPoolExecutor(max_workers=_REACH_WORKERS) as ex:
         reach_futures = {ex.submit(_is_domain_reachable, row["domain"]): row for row in queue}
         for fut in as_completed(reach_futures):
             row = reach_futures[fut]
@@ -886,11 +896,15 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
         log.info("[tier1_batch] no reachable domains in batch")
         return 0
 
-    log.info(f"[tier1_batch] processing {len(queue)} domains with {PIPELINE_WORKERS} workers")
+    # Cap scan workers at 25 on Render free tier (512 MB RAM, shared CPU).
+    # Each worker holds an HTTP connection + Supabase client + Python overhead.
+    # 100 workers cause OOM and hang; env var still allows tuning on paid tiers.
+    _SCAN_WORKERS = min(PIPELINE_WORKERS, 25)
+    log.info(f"[tier1_batch] processing {len(queue)} domains with {_SCAN_WORKERS} workers (configured: {PIPELINE_WORKERS})")
     scanned = 0
     ids_to_delete = []
 
-    with ThreadPoolExecutor(max_workers=PIPELINE_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=_SCAN_WORKERS) as ex:
         futures = {
             ex.submit(_tier1_scan_one, row["domain"], row["country"] or infer_country(row["domain"]), row["source"] or "queue"): row
             for row in queue
@@ -899,7 +913,7 @@ def run_tier1_batch(db=None, batch_size: int = TIER1_BATCH_SIZE) -> int:
             row = futures[fut]
             ids_to_delete.append(row["id"])
             try:
-                result = fut.result()
+                result = fut.result(timeout=60)  # hard per-domain cap — no single scan hangs the batch
                 if result:
                     upsert_scan_result(result, db)
                     # Dual-write to outreach_prospects for backward compat (Phase 1)
@@ -966,10 +980,11 @@ def run_tier2_enrichment(db=None, batch_size: int = TIER2_BATCH_SIZE) -> int:
         log.info("[tier2_enrichment] no domains due for enrichment")
         return 0
 
-    log.info(f"[tier2_enrichment] enriching {len(targets)} domains with full 22-check scan")
+    _T2_WORKERS = min(PIPELINE_WORKERS, 10)  # Tier 2 is heavier per domain — cap lower
+    log.info(f"[tier2_enrichment] enriching {len(targets)} domains with {_T2_WORKERS} workers")
     scanned = 0
 
-    with ThreadPoolExecutor(max_workers=PIPELINE_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=_T2_WORKERS) as ex:
         futures = {
             ex.submit(_tier2_scan_one, row["domain"], row["country"] or infer_country(row["domain"])): row
             for row in targets
