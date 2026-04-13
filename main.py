@@ -7135,6 +7135,86 @@ def admin_pipeline_daily_stats(days: int = 14, authorization: str = Header(None)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADMIN GEO DISTRIBUTION — world map data
+# ══════════════════════════════════════════════════════════════════════════════
+
+_geo_dist_cache: dict = {"payload": None, "expires_at": 0.0}
+_GEO_DIST_CACHE_TTL = 600  # 10 min
+
+@app.get("/admin/geo-distribution")
+def admin_geo_distribution(authorization: str = Header(None)):
+    """Admin: lat/lon clusters of geo-tagged scan_results for the world map.
+
+    Clusters points to 1° grid (round to 1dp) so the map stays readable even
+    with millions of domains.  Results cached for 10 minutes.
+    """
+    require_admin(authorization)
+
+    global _geo_dist_cache
+    now_ts = time.time()
+    if _geo_dist_cache["payload"] and now_ts < _geo_dist_cache["expires_at"]:
+        return _geo_dist_cache["payload"]
+
+    db = get_admin_db()
+    try:
+        rows = db.table("scan_results")\
+            .select("ip_lat,ip_lon,ip_city,ip_asn,ip_org")\
+            .not_.is_("ip_lat", "null")\
+            .not_.is_("ip_lon", "null")\
+            .execute().data or []
+
+        from collections import defaultdict, Counter
+        clusters: dict = defaultdict(lambda: {"count": 0, "city": "", "hoster": ""})
+        hoster_counter: Counter = Counter()
+
+        for r in rows:
+            lat = r.get("ip_lat")
+            lon = r.get("ip_lon")
+            if lat is None or lon is None:
+                continue
+            key = (round(float(lat), 1), round(float(lon), 1))
+            clusters[key]["count"] += 1
+            if r.get("ip_city") and not clusters[key]["city"]:
+                clusters[key]["city"] = r["ip_city"]
+            if not clusters[key]["hoster"]:
+                h = _resolve_hoster(r.get("ip_asn") or "", r.get("ip_org") or "")
+                if h:
+                    clusters[key]["hoster"] = h
+                    hoster_counter[h] += clusters[key]["count"]
+
+        points = sorted(
+            [{"lat": k[0], "lon": k[1], "count": v["count"],
+              "city": v["city"], "hoster": v["hoster"]}
+             for k, v in clusters.items()],
+            key=lambda p: p["count"], reverse=True
+        )
+
+        top_hosters = [{"name": h, "count": c} for h, c in hoster_counter.most_common(8)]
+
+        total_pipeline = 0
+        try:
+            total_pipeline = db.table("scan_results").select("id", count="exact")\
+                .not_.is_("last_scanned_at", "null").execute().count or 0
+        except Exception:
+            pass
+
+        coverage_pct = round(len(rows) / total_pipeline * 100, 1) if total_pipeline > 0 else 0.0
+
+        payload = {
+            "points":          points,
+            "total_geotagged": len(rows),
+            "unique_clusters": len(clusters),
+            "top_hosters":     top_hosters,
+            "coverage_pct":    coverage_pct,
+        }
+        _geo_dist_cache = {"payload": payload, "expires_at": now_ts + _GEO_DIST_CACHE_TTL}
+        return payload
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN LOGS — recent scan events
 # ══════════════════════════════════════════════════════════════════════════════
 
